@@ -57,9 +57,12 @@ class Config(QConfig):
     # 【设置像素点偏差】
     # 用于判断是不是非字幕区域(一般认为字幕文本框的长度是要大于宽度的，如果字幕框的高大于宽，且大于的幅度超过指定像素点大小，则认为是错误检测)
     subtitleYXAxisDifferencePixel = RangeConfigItem("Main", "SubtitleYXAxisDifferencePixel", 10, RangeValidator(0, 300))
-    # 用于放大mask大小，防止自动检测的文本框过小，inpaint阶段出现文字边，有残留
+    # [deprecated] 已由 subtitleAreaDeviationPixelX / Y 替代。create_mask 不再读取本字段。
+    # 保留仅用于兼容旧版 config.json，UI 层 follow-up 会移除对应控件。
     subtitleAreaDeviationPixel = RangeConfigItem("Main", "SubtitleAreaDeviationPixel", 10, RangeValidator(1, 300))
-    # X / Y 方向独立的 mask 外扩像素。Y 默认 22 覆盖 3-8px 残 + 抗锯齿 + 安全余量。
+    # X / Y 方向独立的 mask 外扩像素。
+    # X 保持 10 与旧 subtitleAreaDeviationPixel 一致；Y 提升至 22 以覆盖 3-8px 残 + 抗锯齿 + 安全余量。
+    # 详见 docs/superpowers/specs/2026-06-10-subtitle-edge-residual-design.md
     subtitleAreaDeviationPixelX = RangeConfigItem("Main", "SubtitleAreaDeviationPixelX", 10, RangeValidator(0, 300))
     subtitleAreaDeviationPixelY = RangeConfigItem("Main", "SubtitleAreaDeviationPixelY", 22, RangeValidator(0, 300))
     # 同于判断两个文本框是否为同一行字幕，高度差距指定像素点以内认为是同一行
