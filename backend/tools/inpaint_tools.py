@@ -29,21 +29,37 @@ def batch_generator(data, max_batch_size):
         yield data[last_batch_start:]
 
 def create_mask(size, coords_list):
+    """Build inpaint mask from detected subtitle bboxes.
+
+    Two phases:
+      1. Axis-aware rectangle expansion using independent X / Y deviation pixels,
+         with frame-edge clipping.
+      2. Vertical morphology (cv2.dilate with a (1, 3) kernel) to absorb
+         anti-aliased edge pixels and ascender/descender artifacts that the
+         OCR bbox did not cover.
+
+    Phase 2 is skipped when dev_y == 0 to avoid unnecessary expansion.
+    """
     mask = np.zeros(size, dtype="uint8")
-    if coords_list:
-        for coords in coords_list:
-            xmin, xmax, ymin, ymax = coords
-            # 为了避免框过小，放大10个像素
-            x1 = xmin - config.subtitleAreaDeviationPixel.value
-            if x1 < 0:
-                x1 = 0
-            y1 = ymin - config.subtitleAreaDeviationPixel.value
-            if y1 < 0:
-                y1 = 0
-            x2 = xmax + config.subtitleAreaDeviationPixel.value
-            y2 = ymax + config.subtitleAreaDeviationPixel.value
-            cv2.rectangle(mask, (x1, y1),
-                          (x2, y2), (255, 255, 255), thickness=-1)
+    if not coords_list:
+        return mask
+
+    dev_x = config.subtitleAreaDeviationPixelX.value
+    dev_y = config.subtitleAreaDeviationPixelY.value
+
+    h, w = mask.shape[:2]
+    for coords in coords_list:
+        xmin, xmax, ymin, ymax = coords
+        x1 = max(0, xmin - dev_x)
+        y1 = max(0, ymin - dev_y)
+        x2 = min(w - 1, xmax + dev_x)
+        y2 = min(h - 1, ymax + dev_y)
+        cv2.rectangle(mask, (x1, y1), (x2, y2), (255, 255, 255), thickness=-1)
+
+    # 垂直形态学：额外吸收抗锯齿 / 紧贴字形外沿的像素残留
+    if dev_y > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+        mask = cv2.dilate(mask, kernel, iterations=1)
     return mask
 
 def get_inpaint_area_by_mask(W, H, h, mask, multiple=1):
