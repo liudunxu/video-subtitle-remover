@@ -121,3 +121,57 @@ class CreateMaskTest(unittest.TestCase):
         self.assertEqual(mask.shape, (50, 80, 3))
         self.assertTrue(np.all(mask == 0))
         mock_dilate.assert_not_called()
+
+    def test_boundary_clipping(self):
+        """bbox that would expand past frame edges gets clipped to [0, h-1] / [0, w-1]."""
+        config.set(config.subtitleAreaDeviationPixelX, 10)
+        config.set(config.subtitleAreaDeviationPixelY, 22)
+
+        # bbox right at top-left corner
+        coords = [(0, 50, 0, 30)]
+        mask = create_mask((100, 200, 3), coords)
+
+        # After dev_y=22: y1 would be -22, clipped to 0; y2 = 30+22=52.
+        # After dilate (1,3): y range stays 0..52 (already at top, can't extend above 0).
+        # X: x1=0 (clipped), x2=50+10=60. Dilate doesn't extend X.
+        # So filled region: rows 0..52, cols 0..60.
+        self.assertTrue(np.all(mask[0:53, 0:61, 0] == 255))
+        # col 61 should be all 0
+        self.assertFalse(np.any(mask[0:53, 61, 0] == 255))
+        # row 53 should be all 0 in cols 0..60
+        self.assertFalse(np.any(mask[53, 0:61, 0] == 255))
+
+    def test_y_zero_skips_morphology(self):
+        """dev_y=0 skips cv2.dilate entirely."""
+        from unittest.mock import patch
+
+        config.set(config.subtitleAreaDeviationPixelX, 10)
+        config.set(config.subtitleAreaDeviationPixelY, 0)
+
+        coords = [(100, 200, 50, 80)]
+        with patch("backend.tools.inpaint_tools.cv2.dilate") as mock_dilate:
+            mask = create_mask((200, 300, 3), coords)
+
+        mock_dilate.assert_not_called()
+        # X range: 90..210. Y range: 50..80 (no expansion, no morphology).
+        self.assertTrue(np.all(mask[50:81, 90:211, 0] == 255))
+        # Y=49 and Y=81 should be 0
+        self.assertFalse(np.any(mask[49, 90:211, 0] == 255))
+        self.assertFalse(np.any(mask[81, 90:211, 0] == 255))
+
+    def test_morphology_does_not_affect_x(self):
+        """Kernel (1, 3) is 1 col wide; X is not affected by dilate."""
+        config.set(config.subtitleAreaDeviationPixelX, 10)
+        config.set(config.subtitleAreaDeviationPixelY, 22)
+
+        coords = [(100, 200, 50, 80)]
+        mask = create_mask((200, 300, 3), coords)
+
+        # X: dev_x=10 → x1=90, x2=210. With (1,3) kernel, X range unchanged.
+        # col 89 must be 0 across the Y range
+        self.assertFalse(np.any(mask[:, 89, 0] == 255))
+        # col 211 must be 0 across the Y range
+        self.assertFalse(np.any(mask[:, 211, 0] == 255))
+        # but col 90 and col 210 are filled in the Y range
+        self.assertTrue(np.any(mask[:, 90, 0] == 255))
+        self.assertTrue(np.any(mask[:, 210, 0] == 255))
