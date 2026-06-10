@@ -1189,10 +1189,12 @@ def _run_post_verify_blur(video_path, area, options, progress_callback=None, sta
         if crop.size == 0:
             continue
         try:
-            dt_boxes, _ = detector.detect_subtitle(crop)
+            coords = detector.detect_subtitle(crop)
         except Exception:
             continue
-        coords = detector.get_coordinates(dt_boxes.tolist())
+        # `detect_subtitle` returns a list of (xmin, xmax, ymin, ymax)
+        # tuples already in crop-local pixel space — no further
+        # `get_coordinates` conversion needed.
         # Validity-only filter. The earlier 50%-of-crop sanity check
         # was based on the wrong assumption that get_coordinates()
         # returns un-rescaled bbox coords — PaddleOCR's text_detector
@@ -1274,10 +1276,9 @@ def _run_post_verify_blur(video_path, area, options, progress_callback=None, sta
         if frame_no in candidate_set:
             crop = frame[ay_min:ay_max, ax_min:ax_max]
             try:
-                dt_boxes, _ = detector.detect_subtitle(crop)
+                coords = detector.detect_subtitle(crop)
             except Exception:
-                dt_boxes = []
-            coords = detector.get_coordinates(dt_boxes.tolist())
+                coords = []
             # Validity-only filter. See Phase 1 comment for why the
             # earlier 50%-of-crop sanity check was wrong.
             crop_h = ay_max - ay_min
@@ -2492,17 +2493,17 @@ def _detect_subtitle_on_frame(detector, frame, width, height, max_detection_edge
         scale = edge_limit / max_edge
         detect_frame = cv2.resize(frame, None, fx=scale, fy=scale)
     try:
-        dt_boxes, _ = detector.detect_subtitle(detect_frame)
+        coords = detector.detect_subtitle(detect_frame)
     except OSError:
         # cuDNN 对大尺寸输入可能报 CUDNN_STATUS_NOT_SUPPORTED；再缩一半重试
         if max_edge > edge_limit:
             scale = (edge_limit // 2) / max_edge
             detect_frame = cv2.resize(frame, None, fx=scale, fy=scale)
-            dt_boxes, _ = detector.detect_subtitle(detect_frame)
+            coords = detector.detect_subtitle(detect_frame)
         else:
             raise
-    raw_boxes = dt_boxes.tolist() if hasattr(dt_boxes, "tolist") else dt_boxes
-    coords = detector.get_coordinates(raw_boxes)
+    # `detect_subtitle` already returns (xmin, xmax, ymin, ymax) tuples
+    # in `detect_frame` pixel space — no raw-box conversion needed.
     if coords:
         print(f"INFO: _detect_subtitle_on_frame found {len(coords)} boxes (scale={scale:.3f}, edge_limit={edge_limit}, frame={width}x{height})")
     if scale < 1.0:
