@@ -55,7 +55,9 @@ class SubtitleDetect:
         # PaddlePaddle 自带的 CUDA 探测。注意：不能用 torch.cuda.is_available()，
         # PyTorch 有 CUDA 不代表 PaddlePaddle 也有——两者依赖各自绑定的 libcudart。
         # 只有装了 paddlepaddle-gpu（而非 paddlepaddle）时，is_compiled_with_cuda() 才为 True。
-        use_gpu = paddle.device.is_compiled_with_cuda() and paddle.device.is_available()
+        # paddle 2.6.x 没有 paddle.device.is_available()，改用 paddle.device.cuda.device_count() > 0
+        # 来探测运行时 GPU 是否真的可见（编译期有 CUDA ≠ 运行时能找到设备）。
+        use_gpu = paddle.device.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0
         device = "gpu" if use_gpu else "cpu"
         return TextDetection(
             model_name=model_config.DET_MODEL_NAME,
