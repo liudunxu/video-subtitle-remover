@@ -107,3 +107,17 @@ class CreateMaskTest(unittest.TestCase):
         self.assertFalse(np.any(mask[expected_y_start:expected_y_end + 1, 89, 0] == 255))
         # col 211 should NOT be 255 in the Y range
         self.assertFalse(np.any(mask[expected_y_start:expected_y_end + 1, 211, 0] == 255))
+
+    def test_empty_coords_returns_zero_mask_without_morphology(self):
+        """Empty coords_list returns all-zero mask. cv2.dilate must NOT be called."""
+        from unittest.mock import patch
+
+        config.set(config.subtitleAreaDeviationPixelX, 10)
+        config.set(config.subtitleAreaDeviationPixelY, 22)
+
+        with patch("backend.tools.inpaint_tools.cv2.dilate") as mock_dilate:
+            mask = create_mask((50, 80, 3), [])
+
+        self.assertEqual(mask.shape, (50, 80, 3))
+        self.assertTrue(np.all(mask == 0))
+        mock_dilate.assert_not_called()
