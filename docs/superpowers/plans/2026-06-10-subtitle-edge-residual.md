@@ -474,6 +474,17 @@ git commit -m "docs(config): mark subtitleAreaDeviationPixel as deprecated"
   - Anchor `.gitignore:367` `test*.py` rule (`/test*.py`) or add `!tests/` exception so test files don't need `git add -f`.
   - Move the qfluentwidgets stub from the test file to a shared `tests/_stubs/qfluentwidgets.py` (or `conftest.py`) when a second test file is added.
 
+- **Dilate iterations 1 → 2 (manual QA on user's 1182×882 frame, 2026-06-10)**:
+  User report (`@~/Downloads/a.png`): every subtitle line still showed ~3-8 px of residual at the
+  descender / cap-top edges after this plan shipped. The mask was correctly covering the text
+  (dev_y=22 + 1-row dilate = 23 px padding), so the bug was not mask-size but the STTN model's
+  reduced inpainting quality right at the mask's vertical boundary — descenders / ascenders sit
+  at the very edge of the OCR bbox (PaddleOCR's "DB shrink" returns a cap-height-tight bbox), and
+  the model can't reliably hallucinate content in the last 1-2 mask rows. Fix: bump
+  `cv2.dilate(..., iterations=1) → iterations=2` in `create_mask` (single-line change,
+  +1 row each side). Tests `test_basic_xy_split_and_morphology` and `test_boundary_clipping`
+  updated to assert the new ±2 row range. All 5 tests pass.
+
 ## Self-Review
 
 **1. Spec coverage:**

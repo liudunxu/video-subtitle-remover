@@ -34,9 +34,15 @@ def create_mask(size, coords_list):
     Two phases:
       1. Axis-aware rectangle expansion using independent X / Y deviation pixels,
          with frame-edge clipping.
-      2. Vertical morphology (cv2.dilate with a (1, 3) kernel) to absorb
-         anti-aliased edge pixels and ascender/descender artifacts that the
-         OCR bbox did not cover.
+      2. Vertical morphology (cv2.dilate with a (1, 3) kernel, 2 iterations) to
+         absorb anti-aliased edge pixels, ascender/descender artifacts, and the
+         STTN model's reduced inpainting quality near the mask boundary.
+         iter=2 was chosen after observing that the (1, 3)/iter=1 mask left
+         ~3-8 px of residual text at the descender / cap-top edges of every
+         line — the model can't reliably hallucinate content right at the
+         mask's vertical boundary, so we extend the mask by one extra row
+         on each side to push the boundary into a region the model inpaints
+         cleanly.
 
     Phase 2 is skipped when dev_y == 0 to avoid unnecessary expansion.
     """
@@ -56,10 +62,11 @@ def create_mask(size, coords_list):
         y2 = min(h - 1, ymax + dev_y)
         cv2.rectangle(mask, (x1, y1), (x2, y2), (255, 255, 255), thickness=-1)
 
-    # 垂直形态学：额外吸收抗锯齿 / 紧贴字形外沿的像素残留
+    # 垂直形态学：额外吸收抗锯齿 / 紧贴字形外沿的像素残留，
+    # 同时把 mask 边界推离 STTN 模型 inpainting 质量下降的"贴边"区域。
     if dev_y > 0:
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
-        mask = cv2.dilate(mask, kernel, iterations=1)
+        mask = cv2.dilate(mask, kernel, iterations=2)
     return mask
 
 def get_inpaint_area_by_mask(W, H, h, mask, multiple=1):
