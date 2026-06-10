@@ -2721,9 +2721,11 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                 # can see main pass / STTN 修边 pass / done in the log. The
                 # dub web app gets the structured data via /api/progress;
                 # this print is for the server log only. Throttle to phase
-                # changes + 10% steps + terminal states to avoid noise.
+                # changes + 2% steps + terminal states. 2% (50 lines/phase)
+                # is the sweet spot — 10% felt jumpy, 1% (100 lines/phase)
+                # is too noisy in journalctl / docker logs.
                 pct_int = int(round(percent))
-                bucket = pct_int // 10
+                bucket = pct_int // 2
                 terminal = phase in ("done", "error")
                 with _last_logged_progress_LOCK:
                     last = _last_logged_progress.get(job_id)
