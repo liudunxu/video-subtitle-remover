@@ -59,6 +59,9 @@ class Config(QConfig):
     subtitleYXAxisDifferencePixel = RangeConfigItem("Main", "SubtitleYXAxisDifferencePixel", 10, RangeValidator(0, 300))
     # 用于放大mask大小，防止自动检测的文本框过小，inpaint阶段出现文字边，有残留
     subtitleAreaDeviationPixel = RangeConfigItem("Main", "SubtitleAreaDeviationPixel", 10, RangeValidator(1, 300))
+    # X / Y 方向独立的 mask 外扩像素。Y 默认 22 覆盖 3-8px 残 + 抗锯齿 + 安全余量。
+    subtitleAreaDeviationPixelX = RangeConfigItem("Main", "SubtitleAreaDeviationPixelX", 10, RangeValidator(0, 300))
+    subtitleAreaDeviationPixelY = RangeConfigItem("Main", "SubtitleAreaDeviationPixelY", 22, RangeValidator(0, 300))
     # 同于判断两个文本框是否为同一行字幕，高度差距指定像素点以内认为是同一行
     subtitleAreaYAxisDifferencePixel = RangeConfigItem("Main", "SubtitleAreaYAxisDifferencePixel", 20, RangeValidator(0, 300))
     # 用于判断两个字幕文本的矩形框是否相似，如果X轴和Y轴偏差都在指定阈值内，则认为时同一个文本框
