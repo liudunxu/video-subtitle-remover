@@ -32,11 +32,13 @@ from tqdm import tqdm
 import numpy as np
 
 class SubtitleRemover:
-    def __init__(self, vd_path, gui_mode=False):
+    def __init__(self, vd_path, gui_mode=False, sub_area=None):
         # 线程锁
         self.lock = threading.RLock()
         # 用户指定的字幕区域位置
         self.sub_areas = []
+        if sub_area is not None:
+            self.sub_areas = [sub_area]
         # 是否为gui运行，gui运行需要显示预览
         self.gui_mode = gui_mode
         self.hardware_accelerator = HardwareAccelerator.instance()
