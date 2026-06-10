@@ -64,22 +64,6 @@ class SubtitleDetect:
             enable_hpi=enable_hpi,
         )
 
-
-def _hpi_plugin_available() -> bool:
-    """Detect whether the PaddlePaddle high-performance inference plugin is installed.
-
-    PaddleOCR 3.x's ``enable_hpi=True`` path goes through PaddleX's HPIP, which is
-    a separate C++ binding (shipped via the ``paddle_inference`` wheel) — *not* the
-    same as the regular ``paddlepaddle`` / ``paddlepaddle-gpu`` wheel. If it isn't
-    installed, enabling HPI raises ``paddlex.utils.deps.DependencyError: The
-    high-performance inference plugin is not available``.
-    """
-    try:
-        from paddle import inference  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
     def detect_subtitle(self, img):
         temp_list = []
         results = self.text_detector.predict(img)
@@ -318,3 +302,19 @@ def _hpi_plugin_available() -> bool:
             else:
                 merged.append((start, end))
         return merged
+
+
+def _hpi_plugin_available() -> bool:
+    """Detect whether the PaddlePaddle high-performance inference plugin is installed.
+
+    PaddleOCR 3.x's ``enable_hpi=True`` path goes through PaddleX's HPIP, which is
+    a separate C++ binding (shipped via the ``paddle_inference`` wheel) — *not* the
+    same as the regular ``paddlepaddle`` / ``paddlepaddle-gpu`` wheel. If it isn't
+    installed, enabling HPI raises ``paddlex.utils.deps.DependencyError: The
+    high-performance inference plugin is not available``.
+    """
+    try:
+        from paddle import inference  # noqa: F401
+    except ImportError:
+        return False
+    return True
