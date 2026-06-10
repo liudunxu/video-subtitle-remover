@@ -497,32 +497,53 @@ def _stage_video(video_url, job_dir, filename_hint):
 
 
 def _apply_config_options(config, options):
+    # 适配当前项目 qfluentwidgets 配置系统（属性名为驼峰命名）
     mode_map = {
-        "sttn": config.InpaintMode.STTN,
+        "sttn": config.InpaintMode.STTN_DET,
         "lama": config.InpaintMode.LAMA,
         "propainter": config.InpaintMode.PROPAINTER,
     }
-    overrides = {
-        "MODE": mode_map.get(options["mode"], config.InpaintMode.STTN),
-        "SUBTITLE_AREA_DEVIATION_PIXEL": options["subtitle_area_deviation_pixel"],
-        "STTN_SKIP_DETECTION": options["sttn_skip_detection"],
-        "STTN_NEIGHBOR_STRIDE": options["sttn_neighbor_stride"],
-        "STTN_REFERENCE_LENGTH": options["sttn_reference_length"],
-        "STTN_MAX_LOAD_NUM": max(options["sttn_max_load_num"], options["sttn_neighbor_stride"] * options["sttn_reference_length"]),
-        "LAMA_SUPER_FAST": options["lama_super_fast"],
-        "PROPAINTER_MAX_LOAD_NUM": options["propainter_max_load_num"],
+    if options.get("mode") == "sttn" and options.get("sttn_skip_detection", False):
+        mode_map["sttn"] = config.InpaintMode.STTN_AUTO
+
+    config_overrides = {
+        "inpaintMode": mode_map.get(options["mode"], config.InpaintMode.STTN_DET),
+        "subtitleAreaDeviationPixel": options["subtitle_area_deviation_pixel"],
+        "sttnNeighborStride": options["sttn_neighbor_stride"],
+        "sttnReferenceLength": options["sttn_reference_length"],
+        "sttnMaxLoadNum": max(
+            options["sttn_max_load_num"],
+            options["sttn_neighbor_stride"] * options["sttn_reference_length"],
+        ),
+        "propainterMaxLoadNum": options["propainter_max_load_num"],
     }
+    # 当前 Config 类没有的属性，作为动态属性设置
+    dynamic_overrides = {
+        "STTN_SKIP_DETECTION": options["sttn_skip_detection"],
+        "LAMA_SUPER_FAST": options["lama_super_fast"],
+    }
+
     old_values = {}
-    for name, value in overrides.items():
-        if hasattr(config, name):
-            old_values[name] = getattr(config, name)
-            setattr(config, name, value)
+    for name, value in config_overrides.items():
+        item = getattr(config, name, None)
+        if item is not None and hasattr(item, "value"):
+            old_values[name] = (item, item.value)
+            config.set(item, value)
+
+    for name, value in dynamic_overrides.items():
+        old_values[name] = getattr(config, name, None)
+        setattr(config, name, value)
+
     return old_values
 
 
 def _restore_config_options(config, old_values):
-    for name, value in old_values.items():
-        setattr(config, name, value)
+    for name, entry in old_values.items():
+        if isinstance(entry, tuple) and len(entry) == 2:
+            item, old_value = entry
+            config.set(item, old_value)
+        else:
+            setattr(config, name, entry)
 
 
 def _run_lama_area_remover(remover, area):

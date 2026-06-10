@@ -21,9 +21,12 @@ class SubtitleDetect:
     # 采样间隔，根据视频帧率在 _init_sample_step 中自适应设置
     SAMPLE_STEP = 3
 
-    def __init__(self, video_path, sub_areas=[]):
+    def __init__(self, video_path, sub_areas=[], sub_area=None, **kwargs):
         self.video_path = video_path
         self.sub_areas = sub_areas
+        if sub_area is not None:
+            self.sub_areas = [sub_area]
+        self._kwargs = kwargs
         self._init_sample_step()
 
     def _init_sample_step(self):

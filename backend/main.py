@@ -69,6 +69,7 @@ class SubtitleRemover:
         except Exception:
             self.video_writer = cv2.VideoWriter(get_readable_path(self.video_temp_file.name), cv2.VideoWriter_fourcc(*'mp4v'), self.fps, self.size)
         self.video_out_path = os.path.abspath(os.path.join(os.path.dirname(self.video_path), f'{self.vd_name}_no_sub.mp4'))
+        self.video_out_name = self.video_out_path
         self.propainter_inpaint = None
         self.ext = os.path.splitext(vd_path)[-1]
         if self.is_picture:
@@ -76,6 +77,7 @@ class SubtitleRemover:
             if not os.path.exists(pic_dir):
                 os.makedirs(pic_dir)
             self.video_out_path = os.path.join(pic_dir, f'{self.vd_name}{self.ext}')
+            self.video_out_name = self.video_out_path
 
         # 总处理进度
         self.progress_total = 0
@@ -159,7 +161,7 @@ class SubtitleRemover:
         pass
 
     def propainter_mode(self, tbar):
-        sub_detector = SubtitleDetect(self.video_path, self.sub_areas)
+        sub_detector = getattr(self, 'sub_detector', None) or SubtitleDetect(self.video_path, self.sub_areas)
         sub_list = sub_detector.find_subtitle_frame_no(sub_remover=self)
         if len(sub_list) == 0:
             raise Exception(tr['Main']['NoSubtitleDetected'].format(self.video_path))
@@ -260,7 +262,7 @@ class SubtitleRemover:
         sttn_video_inpaint(input_mask=mask, input_sub_remover=self, tbar=tbar)
 
     def video_inpaint(self, tbar, model):
-        sub_detector = SubtitleDetect(self.video_path, self.sub_areas)
+        sub_detector = getattr(self, 'sub_detector', None) or SubtitleDetect(self.video_path, self.sub_areas)
         sub_list = sub_detector.find_subtitle_frame_no(sub_remover=self)
         if len(sub_list) == 0:
             raise Exception(tr['Main']['NoSubtitleDetected'].format(self.video_path))
@@ -357,7 +359,7 @@ class SubtitleRemover:
             if original_frame is None:
                 self.append_output(tr['Main']['ReadImageFailed'].format(self.video_path))
                 return
-            sub_detector = SubtitleDetect(self.video_path, self.sub_areas)
+            sub_detector = getattr(self, 'sub_detector', None) or SubtitleDetect(self.video_path, self.sub_areas)
             sub_list = sub_detector.detect_subtitle(original_frame)
             del sub_detector
             gc.collect()
