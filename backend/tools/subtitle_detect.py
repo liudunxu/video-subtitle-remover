@@ -5,7 +5,6 @@ import cv2
 from tqdm import tqdm
 
 from .model_config import ModelConfig
-from .hardware_accelerator import HardwareAccelerator
 from .common_tools import get_readable_path
 from .ocr import get_coordinates
 from backend.config import config, tr
@@ -46,15 +45,35 @@ class SubtitleDetect:
         import paddle
         paddle.disable_signal_handler()
         from paddleocr import TextDetection
-        hardware_accelerator = HardwareAccelerator.instance()
-        onnx_providers = hardware_accelerator.onnx_providers
         model_config = ModelConfig()
+        # 仅在 paddle_inference 插件（HPIP）已安装时启用 HPI。
+        # 旧版本使用 onnxruntime 跑检测，升级到 paddleocr 3.x 后，enable_hpi 走的是
+        # PaddleX 的 C++ HPIP 路径（与 inpaint 用的标准 torch 推理不同），需要单独安装
+        # paddle_inference 才会可用。未安装时必须置为 False，否则 PaddleX 的
+        # require_hpip() 会抛 DependencyError。
+        enable_hpi = _hpi_plugin_available()
         return TextDetection(
             model_name=model_config.DET_MODEL_NAME,
             model_dir=model_config.DET_MODEL_DIR,
             device="cpu",
-            enable_hpi=len(onnx_providers) > 0,
+            enable_hpi=enable_hpi,
         )
+
+
+def _hpi_plugin_available() -> bool:
+    """Detect whether the PaddlePaddle high-performance inference plugin is installed.
+
+    PaddleOCR 3.x's ``enable_hpi=True`` path goes through PaddleX's HPIP, which is
+    a separate C++ binding (shipped via the ``paddle_inference`` wheel) — *not* the
+    same as the regular ``paddlepaddle`` / ``paddlepaddle-gpu`` wheel. If it isn't
+    installed, enabling HPI raises ``paddlex.utils.deps.DependencyError: The
+    high-performance inference plugin is not available``.
+    """
+    try:
+        from paddle import inference  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
     def detect_subtitle(self, img):
         temp_list = []
