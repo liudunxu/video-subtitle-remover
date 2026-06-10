@@ -2760,6 +2760,7 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
             _set_job_progress(job_id, "done", 100.0, "completed")
 
             download_url = _download_url(self, job_id, output_path.name)
+            print(f"INFO: job={job_id} download_url={download_url}")
             self._send_json(
                 HTTPStatus.OK,
                 {
