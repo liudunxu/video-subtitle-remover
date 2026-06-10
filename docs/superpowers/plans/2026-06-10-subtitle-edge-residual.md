@@ -8,6 +8,10 @@
 
 **Tech Stack:** Python 3, OpenCV (`cv2`), NumPy, `unittest` (stdlib, no new dependency). Test runner: `python3 -m unittest`.
 
+**Environment note:** `backend/config.py` imports `qfluentwidgets` at module level. In environments where the GUI library is not installed (e.g. CI without UI deps, headless dev envs), the test file installs a minimal `qfluentwidgets` stub via `sys.modules` injection **before** importing `backend.config`. The stub exposes only the names `backend.config` touches: `qconfig` (with `load` / `set`), `ConfigItem`, `OptionsConfigItem`, `RangeConfigItem`, `QConfig`, `OptionsValidator`, `BoolValidator`, `EnumSerializer`, `RangeValidator`, `ConfigValidator`. This keeps tests runnable in any env that has `numpy` + `opencv-python` (the project already requires these).
+
+**`.gitignore` note:** The repo's `.gitignore` line 367 reads `test*.py` (unanchored), which recursively matches `tests/test_*.py`. To commit files under `tests/`, use `git add -f <path>` for now. A follow-up PR should anchor that rule (e.g. `/test*.py`) or add `!tests/` exception. Out of scope for this plan.
+
 ---
 
 ## File Structure
@@ -363,7 +367,7 @@ characters with descenders/ascenders (g, p, y, ā, ě, ó, etc.)."
 ## Task 6: Sanity-Check Existing Call Sites Are Unchanged
 
 **Files:**
-- Verify (no edit): `backend/main.py:223, 232, 236, 260, 325`
+- Verify (no edit): `backend/main.py:223, 232, 236, 260, 325, 367` and `api.py:565`
 
 - [ ] **Step 1: Import-check the orchestrator and the inpaint tool**
 
@@ -460,6 +464,15 @@ git commit -m "docs(config): mark subtitleAreaDeviationPixel as deprecated"
 ```
 
 ---
+
+## Follow-ups (out of scope for this plan, captured during execution)
+
+- **Code quality review nits (Tasks 2, 3)**:
+  - Hoist `from unittest.mock import patch` from inside test methods to module-level imports alongside `MagicMock`.
+  - Add `self.assertEqual(mask.dtype, np.uint8)` to the empty-coords test to lock the dtype contract.
+  - Promote shared `patch("backend.tools.inpaint_tools.cv2.dilate")` calls into a class-level `setUp` when the test count grows beyond 2-3.
+  - Anchor `.gitignore:367` `test*.py` rule (`/test*.py`) or add `!tests/` exception so test files don't need `git add -f`.
+  - Move the qfluentwidgets stub from the test file to a shared `tests/_stubs/qfluentwidgets.py` (or `conftest.py`) when a second test file is added.
 
 ## Self-Review
 
