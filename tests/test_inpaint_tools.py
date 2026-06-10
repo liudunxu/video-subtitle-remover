@@ -75,7 +75,7 @@ from backend.tools.inpaint_tools import create_mask  # noqa: E402
 
 class CreateMaskTest(unittest.TestCase):
     def test_basic_xy_split_and_morphology(self):
-        """dev_x=10 / dev_y=22: rectangle (90,28)-(210,102) filled, then dilate (1,3) iter=2 extends ±2 rows in Y."""
+        """dev_x=10 / dev_y=22: rectangle (90,28)-(210,102) filled, then dilate (1,5) iter=2 extends ±4 rows in Y."""
         config.set(config.subtitleAreaDeviationPixelX, 10)
         config.set(config.subtitleAreaDeviationPixelY, 22)
 
@@ -85,10 +85,10 @@ class CreateMaskTest(unittest.TestCase):
         mask = create_mask((200, 300, 3), coords)
 
         # Phase 1: rectangle (90, 28) - (210, 102) inclusive on both endpoints.
-        # Phase 2: dilate with (1, 3) kernel, 2 iterations extends 2 rows above and 2 below.
-        # Final Y range: 26..104 (2 extra above and below).
+        # Phase 2: dilate with (1, 5) kernel, 2 iterations extends 4 rows above and 4 below.
+        # Final Y range: 24..106 (4 extra above and below).
         # Final X range: 90..210 (unchanged — kernel width is 1).
-        expected_y_start, expected_y_end = 26, 104
+        expected_y_start, expected_y_end = 24, 106
         expected_x_start, expected_x_end = 90, 210
 
         for y in range(expected_y_start, expected_y_end + 1):
@@ -99,10 +99,10 @@ class CreateMaskTest(unittest.TestCase):
             )
 
         # Just outside the morph-extended Y range:
-        # row 25 should NOT be 255 in the X range
-        self.assertFalse(np.any(mask[25, expected_x_start:expected_x_end + 1, 0] == 255))
-        # row 105 should NOT be 255 in the X range
-        self.assertFalse(np.any(mask[105, expected_x_start:expected_x_end + 1, 0] == 255))
+        # row 23 should NOT be 255 in the X range
+        self.assertFalse(np.any(mask[23, expected_x_start:expected_x_end + 1, 0] == 255))
+        # row 107 should NOT be 255 in the X range
+        self.assertFalse(np.any(mask[107, expected_x_start:expected_x_end + 1, 0] == 255))
         # col 89 should NOT be 255 in the Y range
         self.assertFalse(np.any(mask[expected_y_start:expected_y_end + 1, 89, 0] == 255))
         # col 211 should NOT be 255 in the Y range
@@ -132,14 +132,14 @@ class CreateMaskTest(unittest.TestCase):
         mask = create_mask((100, 200, 3), coords)
 
         # After dev_y=22: y1 would be -22, clipped to 0; y2 = 30+22=52.
-        # After dilate (1,3) iter=2: top can't extend above 0 (clipped), but bottom extends
-        # 2 rows down to 54. So filled region: rows 0..54, cols 0..60.
+        # After dilate (1,5) iter=2: top can't extend above 0 (clipped), but bottom extends
+        # 4 rows down to 56. So filled region: rows 0..56, cols 0..60.
         # X: x1=0 (clipped), x2=50+10=60. Dilate doesn't extend X.
-        self.assertTrue(np.all(mask[0:55, 0:61, 0] == 255))
+        self.assertTrue(np.all(mask[0:57, 0:61, 0] == 255))
         # col 61 should be all 0 across the filled Y range
-        self.assertFalse(np.any(mask[0:55, 61, 0] == 255))
-        # row 55 should be all 0 in cols 0..60
-        self.assertFalse(np.any(mask[55, 0:61, 0] == 255))
+        self.assertFalse(np.any(mask[0:57, 61, 0] == 255))
+        # row 57 should be all 0 in cols 0..60
+        self.assertFalse(np.any(mask[57, 0:61, 0] == 255))
 
     def test_y_zero_skips_morphology(self):
         """dev_y=0 skips cv2.dilate entirely."""
@@ -160,14 +160,14 @@ class CreateMaskTest(unittest.TestCase):
         self.assertFalse(np.any(mask[81, 90:211, 0] == 255))
 
     def test_morphology_does_not_affect_x(self):
-        """Kernel (1, 3) is 1 col wide; X is not affected by dilate."""
+        """Kernel (1, 5) is 1 col wide; X is not affected by dilate."""
         config.set(config.subtitleAreaDeviationPixelX, 10)
         config.set(config.subtitleAreaDeviationPixelY, 22)
 
         coords = [(100, 200, 50, 80)]
         mask = create_mask((200, 300, 3), coords)
 
-        # X: dev_x=10 → x1=90, x2=210. With (1,3) kernel, X range unchanged.
+        # X: dev_x=10 → x1=90, x2=210. With (1,5) kernel, X range unchanged.
         # col 89 must be 0 across the Y range
         self.assertFalse(np.any(mask[:, 89, 0] == 255))
         # col 211 must be 0 across the Y range

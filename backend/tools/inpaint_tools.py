@@ -34,15 +34,16 @@ def create_mask(size, coords_list):
     Two phases:
       1. Axis-aware rectangle expansion using independent X / Y deviation pixels,
          with frame-edge clipping.
-      2. Vertical morphology (cv2.dilate with a (1, 3) kernel, 2 iterations) to
+      2. Vertical morphology (cv2.dilate with a (1, 5) kernel, 2 iterations) to
          absorb anti-aliased edge pixels, ascender/descender artifacts, and the
          STTN model's reduced inpainting quality near the mask boundary.
-         iter=2 was chosen after observing that the (1, 3)/iter=1 mask left
-         ~3-8 px of residual text at the descender / cap-top edges of every
-         line — the model can't reliably hallucinate content right at the
-         mask's vertical boundary, so we extend the mask by one extra row
-         on each side to push the boundary into a region the model inpaints
-         cleanly.
+         (1, 5)/iter=2 was reached in two steps: iter=1 still left 3-8 px of
+         residual text at descender / cap-top edges (the model can't reliably
+         hallucinate content right at the mask's vertical boundary), so iter
+         was bumped 1→2 (+1 row each side). That still wasn't enough on
+         1182x882 frames (user report @b.png, 2026-06-10), so the kernel was
+         widened (1,3)→(1,5) for +2 more rows each side. Total padding:
+         dev_y + 4 rows of morphology on each side.
 
     Phase 2 is skipped when dev_y == 0 to avoid unnecessary expansion.
     """
@@ -65,7 +66,7 @@ def create_mask(size, coords_list):
     # 垂直形态学：额外吸收抗锯齿 / 紧贴字形外沿的像素残留，
     # 同时把 mask 边界推离 STTN 模型 inpainting 质量下降的"贴边"区域。
     if dev_y > 0:
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))
         mask = cv2.dilate(mask, kernel, iterations=2)
     return mask
 

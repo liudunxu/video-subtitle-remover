@@ -485,6 +485,18 @@ git commit -m "docs(config): mark subtitleAreaDeviationPixel as deprecated"
   +1 row each side). Tests `test_basic_xy_split_and_morphology` and `test_boundary_clipping`
   updated to assert the new ±2 row range. All 5 tests pass.
 
+- **Dilate kernel (1, 3) → (1, 5) (manual QA on same frame, 2026-06-10)**:
+  Re-ran the user's 1182×882 frame after the iter bump. Residual at the descender / cap-top
+  edges was *reduced* (smaller ghost text fragments) but still visible — bottom of "lingerie,
+  maby." and the BOTTOM half of the upper line's "I'm" / "I" / "m" fragments. The iter=2 mask
+  added 1 row of padding inside a context zone where the model is still lossy. Fix: widen the
+  kernel `(1, 3) → (1, 5)` in `create_mask` (single-line change, +2 more rows each side on top
+  of iter=2's contribution = 4 rows of morphology per side). Total padding on a default
+  config now: dev_y=22 + 4 morph = 26 px each side of the OCR bbox. Tests
+  `test_basic_xy_split_and_morphology` (Y 26..104 → 24..106),
+  `test_boundary_clipping` (rows 0..54 → 0..56), and `test_morphology_does_not_affect_x`
+  (comment) updated. All 5 tests pass.
+
 ## Self-Review
 
 **1. Spec coverage:**
