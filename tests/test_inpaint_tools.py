@@ -132,14 +132,14 @@ class CreateMaskTest(unittest.TestCase):
         mask = create_mask((100, 200, 3), coords)
 
         # After dev_y=22: y1 would be -22, clipped to 0; y2 = 30+22=52.
-        # After dilate (1,3): y range stays 0..52 (already at top, can't extend above 0).
+        # After dilate (1,3): top can't extend above 0 (clipped), but bottom extends
+        # 1 row down to 53. So filled region: rows 0..53, cols 0..60.
         # X: x1=0 (clipped), x2=50+10=60. Dilate doesn't extend X.
-        # So filled region: rows 0..52, cols 0..60.
-        self.assertTrue(np.all(mask[0:53, 0:61, 0] == 255))
-        # col 61 should be all 0
-        self.assertFalse(np.any(mask[0:53, 61, 0] == 255))
-        # row 53 should be all 0 in cols 0..60
-        self.assertFalse(np.any(mask[53, 0:61, 0] == 255))
+        self.assertTrue(np.all(mask[0:54, 0:61, 0] == 255))
+        # col 61 should be all 0 across the filled Y range
+        self.assertFalse(np.any(mask[0:54, 61, 0] == 255))
+        # row 54 should be all 0 in cols 0..60
+        self.assertFalse(np.any(mask[54, 0:61, 0] == 255))
 
     def test_y_zero_skips_morphology(self):
         """dev_y=0 skips cv2.dilate entirely."""
