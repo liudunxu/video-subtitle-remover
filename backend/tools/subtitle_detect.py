@@ -52,10 +52,15 @@ class SubtitleDetect:
         # paddle_inference 才会可用。未安装时必须置为 False，否则 PaddleX 的
         # require_hpip() 会抛 DependencyError。
         enable_hpi = _hpi_plugin_available()
+        # PaddlePaddle 自带的 CUDA 探测。注意：不能用 torch.cuda.is_available()，
+        # PyTorch 有 CUDA 不代表 PaddlePaddle 也有——两者依赖各自绑定的 libcudart。
+        # 只有装了 paddlepaddle-gpu（而非 paddlepaddle）时，is_compiled_with_cuda() 才为 True。
+        use_gpu = paddle.device.is_compiled_with_cuda() and paddle.device.is_available()
+        device = "gpu" if use_gpu else "cpu"
         return TextDetection(
             model_name=model_config.DET_MODEL_NAME,
             model_dir=model_config.DET_MODEL_DIR,
-            device="cpu",
+            device=device,
             enable_hpi=enable_hpi,
         )
 
