@@ -185,6 +185,7 @@ def _normalize_options(payload):
         "mode",
         "inpaint_mode",
         "subtitle_area_deviation_pixel",
+        "subtitle_area_deviation_pixel_y",
         "mask_deviation",
         "sttn_skip_detection",
         "sttn_neighbor_stride",
@@ -244,6 +245,13 @@ def _normalize_options(payload):
             44,
             0,
             180,
+        ),
+        "subtitle_area_deviation_pixel_y": _bounded_int(
+            merged.get("subtitle_area_deviation_pixel_y"),
+            "subtitle_area_deviation_pixel_y",
+            44,
+            0,
+            300,
         ),
         "sttn_skip_detection": _to_bool(merged.get("sttn_skip_detection", False)),
         "sttn_neighbor_stride": _bounded_int(merged.get("sttn_neighbor_stride"), "sttn_neighbor_stride", 5, 1, 30),
@@ -517,7 +525,7 @@ def _apply_config_options(config, options):
         # option actually expands the STTN mask, which matters most on
         # taller three-line subtitles.
         "subtitleAreaDeviationPixelX": options["subtitle_area_deviation_pixel"],
-        "subtitleAreaDeviationPixelY": options["subtitle_area_deviation_pixel"],
+        "subtitleAreaDeviationPixelY": options["subtitle_area_deviation_pixel_y"],
         "sttnNeighborStride": options["sttn_neighbor_stride"],
         "sttnReferenceLength": options["sttn_reference_length"],
         "sttnMaxLoadNum": max(

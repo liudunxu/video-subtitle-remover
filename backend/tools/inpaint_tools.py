@@ -34,16 +34,15 @@ def create_mask(size, coords_list):
     Two phases:
       1. Axis-aware rectangle expansion using independent X / Y deviation pixels,
          with frame-edge clipping.
-      2. Vertical morphology (cv2.dilate with a (1, 5) kernel, 2 iterations) to
-         absorb anti-aliased edge pixels, ascender/descender artifacts, and the
-         STTN model's reduced inpainting quality near the mask boundary.
-         (1, 5)/iter=2 was reached in two steps: iter=1 still left 3-8 px of
-         residual text at descender / cap-top edges (the model can't reliably
-         hallucinate content right at the mask's vertical boundary), so iter
-         was bumped 1→2 (+1 row each side). That still wasn't enough on
-         1182x882 frames (user report @b.png, 2026-06-10), so the kernel was
-         widened (1,3)→(1,5) for +2 more rows each side. Total padding:
-         dev_y + 4 rows of morphology on each side.
+      2. Vertical morphology (cv2.dilate) to absorb anti-aliased edge pixels,
+         ascender/descender artifacts, and the STTN model's reduced inpainting
+         quality near the mask boundary.  Kernel height and iterations scale
+         with dev_y so that taller (3+ line) subtitles — which need a larger
+         dev_y — automatically get wider morphology:
+           dev_y ≤ 30  →  kernel (1, 1+2*(dev_y//10)), iter=2
+           dev_y > 30  →  kernel (1, 1+2*(dev_y//10)), iter=3
+         At dev_y=22 (backend default): (1,5)/iter=2 — same as the old
+         hardcoded values.
 
     Phase 2 is skipped when dev_y == 0 to avoid unnecessary expansion.
     """
@@ -65,9 +64,14 @@ def create_mask(size, coords_list):
 
     # 垂直形态学：额外吸收抗锯齿 / 紧贴字形外沿的像素残留，
     # 同时把 mask 边界推离 STTN 模型 inpainting 质量下降的"贴边"区域。
+    # Kernel 高度和迭代次数随 dev_y 自适应缩放：字幕行数越多 → dev_y 越
+    # 大 → 形态学扩展越宽，覆盖上/下边缘残留。dev_y=22 时与旧版
+    # (1,5)/iter=2 行为完全一致。
     if dev_y > 0:
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))
-        mask = cv2.dilate(mask, kernel, iterations=2)
+        morph_h = min(1 + 2 * (dev_y // 10), 11)
+        morph_iters = 2 if dev_y <= 30 else 3
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, morph_h))
+        mask = cv2.dilate(mask, kernel, iterations=morph_iters)
     return mask
 
 def get_inpaint_area_by_mask(W, H, h, mask, multiple=1):
