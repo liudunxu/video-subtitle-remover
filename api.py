@@ -511,6 +511,13 @@ def _apply_config_options(config, options):
     config_overrides = {
         "inpaintMode": mode_map.get(options["mode"], config.InpaintMode.STTN_DET),
         "subtitleAreaDeviationPixel": options["subtitle_area_deviation_pixel"],
+        # api.py runs against a backend where create_mask() reads the newer
+        # axis-specific deviation fields, not the legacy
+        # subtitleAreaDeviationPixel. Keep all three in sync so the API
+        # option actually expands the STTN mask, which matters most on
+        # taller three-line subtitles.
+        "subtitleAreaDeviationPixelX": options["subtitle_area_deviation_pixel"],
+        "subtitleAreaDeviationPixelY": options["subtitle_area_deviation_pixel"],
         "sttnNeighborStride": options["sttn_neighbor_stride"],
         "sttnReferenceLength": options["sttn_reference_length"],
         "sttnMaxLoadNum": max(
@@ -1324,7 +1331,26 @@ def _run_post_verify_blur(video_path, area, options, progress_callback=None, sta
                 blurred_roi = roi
                 for _ in range(blur_passes):
                     blurred_roi = cv2.GaussianBlur(blurred_roi, (blur_kernel, blur_kernel), 0)
-                frame[fymin:fymax, fxmin:fxmax] = blurred_roi
+                # Hard ROI replacement leaves a visible rectangular patch on
+                # some footage. Feather only the bbox edge; the center remains
+                # fully blurred so residual text is still suppressed.
+                h, w = roi.shape[:2]
+                feather_px = min(12, max(0, min(h, w) // 4))
+                if feather_px > 0:
+                    alpha = np.ones((h, w), dtype=np.float32)
+                    ramp = np.linspace(0.0, 1.0, feather_px, dtype=np.float32)
+                    alpha[:feather_px, :] *= ramp[:, np.newaxis]
+                    alpha[-feather_px:, :] *= ramp[::-1, np.newaxis]
+                    alpha[:, :feather_px] *= ramp[np.newaxis, :]
+                    alpha[:, -feather_px:] *= ramp[::-1][np.newaxis, :]
+                    frame_roi = frame[fymin:fymax, fxmin:fxmax].astype(np.float32)
+                    blended = (
+                        blurred_roi.astype(np.float32) * alpha[:, :, np.newaxis]
+                        + frame_roi * (1.0 - alpha[:, :, np.newaxis])
+                    ).astype(np.uint8)
+                    frame[fymin:fymax, fxmin:fxmax] = blended
+                else:
+                    frame[fymin:fymax, fxmin:fxmax] = blurred_roi
             if coords:
                 blurred_count += 1
         writer.write(frame)
