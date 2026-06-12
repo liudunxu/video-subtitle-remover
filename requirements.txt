@@ -7,7 +7,11 @@ numpy==2.2.5
 av==17.0.0
 einops==0.8.1
 paddleocr==3.4.0
-matplotlib
+# Pin matplotlib < 3.8 — newer versions removed `_is_pandas_dataframe`
+# from `cbook`, which breaks `paddlex`'s `analyse_dataset` import chain
+# (`matplotlib.table` -> `cbook` -> ImportError) and surfaces in the
+# subtitle-detection endpoint.
+matplotlib<3.8
 Pillow
 scipy
 requests
