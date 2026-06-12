@@ -1,0 +1,118 @@
+[project]
+name = "video-subtitle-remover"
+version = "1.4.0"
+description = "基于AI技术，将视频中的硬字幕去除的软件"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [
+    { name = "YaoFANGUK", email = "yao.fang.uk@gmail.com" },
+]
+keywords = ["video", "subtitle", "remover", "ai", "ocr", "inpainting"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+    "filesplit==3.0.2",
+    "opencv-python==4.11.0.86",
+    "scikit-image==0.25.2",
+    "tqdm==4.67.1",
+    "pyside6-fluent-widgets==1.7.7",
+    "numpy==2.2.5",
+    "av==17.0.0",
+    "einops==0.8.1",
+    "paddleocr==3.4.0",
+    "matplotlib<3.8",
+    "Pillow",
+    "scipy",
+    "requests",
+    "darkdetect",
+    "je-showinfilemanager==1.1.6a4",
+]
+
+[project.optional-dependencies]
+# Training dependencies
+train = [
+    "lpips",
+    "tensorboardX",
+]
+
+# Hardware acceleration - NVIDIA GPU (CUDA 11.8)
+cuda11 = [
+    "paddlepaddle-gpu==3.0.0",
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+    "onnxruntime-gpu==1.20.1",
+]
+
+# Hardware acceleration - NVIDIA GPU (CUDA 12.x)
+cuda12 = [
+    "paddlepaddle-gpu==3.0.0",
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+    "onnxruntime-gpu==1.22.0",
+]
+
+# Hardware acceleration - DirectML (AMD/Intel GPU on Windows)
+directml = [
+    "paddlepaddle==3.0.0",
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+    "torch_directml==0.2.5.dev240914",
+]
+
+# CPU only
+cpu = [
+    "paddlepaddle==3.0.0",
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+]
+
+# macOS (Apple Silicon)
+macos = [
+    "paddlepaddle==3.0.0",
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/YaoFANGUK/video-subtitle-remover"
+Repository = "https://github.com/YaoFANGUK/video-subtitle-remover"
+Issues = "https://github.com/YaoFANGUK/video-subtitle-remover/issues"
+Documentation = "https://github.com/YaoFANGUK/video-subtitle-remover#readme"
+
+[project.gui-scripts]
+vsr = "gui:main"
+
+[project.scripts]
+vsr-cli = "backend.main:main"
+vsr-api = "api:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend", "."]
+
+[tool.hatch.build.targets.wheel.force-include]
+"gui.py" = "gui.py"
+"api.py" = "api.py"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]

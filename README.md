@@ -90,6 +90,64 @@ options:
 
 ## 源码使用说明
 
+### 方式一：使用 uv（推荐）
+
+[uv](https://github.com/astral-sh/uv) 是一个超快速的 Python 包管理器，推荐使用。
+
+#### 1. 安装 uv
+
+```shell
+# macOS/Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+#### 2. 克隆项目并进入目录
+
+```shell
+git clone https://github.com/YaoFANGUK/video-subtitle-remover.git
+cd video-subtitle-remover
+```
+
+#### 3. 安装依赖
+
+根据您的硬件环境选择对应的安装命令：
+
+```shell
+# NVIDIA GPU (CUDA 11.8)
+uv sync --extra cuda11
+
+# NVIDIA GPU (CUDA 12.x)
+uv sync --extra cuda12
+
+# AMD/Intel GPU (Windows DirectML)
+uv sync --extra directml
+
+# CPU only
+uv sync --extra cpu
+
+# macOS (Apple Silicon)
+uv sync --extra macos
+```
+
+#### 4. 运行程序
+
+```shell
+# 运行图形化界面
+uv run gui.py
+
+# 运行命令行版本
+uv run python ./backend/main.py
+
+# 运行 API 服务
+uv run python api.py
+```
+
+---
+
+### 方式二：使用传统 pip
 
 #### 1. 安装 Python
 
