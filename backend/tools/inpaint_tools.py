@@ -34,17 +34,18 @@ def create_mask(size, coords_list):
     Two phases:
       1. Axis-aware rectangle expansion using independent X / Y deviation pixels,
          with frame-edge clipping.
-      2. Vertical morphology (cv2.dilate) to absorb anti-aliased edge pixels,
+      2. Per-axis morphology (cv2.dilate) to absorb anti-aliased edge pixels,
          ascender/descender artifacts, and the STTN model's reduced inpainting
-         quality near the mask boundary.  Kernel height and iterations scale
-         with dev_y so that taller (3+ line) subtitles — which need a larger
-         dev_y — automatically get wider morphology:
-           dev_y ≤ 30  →  kernel (1, 1+2*(dev_y//10)), iter=2
-           dev_y > 30  →  kernel (1, 1+2*(dev_y//10)), iter=3
-         At dev_y=22 (backend default): (1,5)/iter=2 — same as the old
-         hardcoded values.
+         quality near the mask boundary.  Kernel size and iterations scale with
+         deviation so taller (3+ line) subtitles — which need a larger dev_y —
+         automatically get wider morphology:
+           vertical: kernel (1, 1 + 2*max(1, dev_y//8)), iter=2 (dev_y<=30)
+                     or iter=3 (dev_y>30).  At dev_y=22 → (1,5)/iter=2, the
+                     same as the previous hardcoded values.
+           horizontal: kernel (1 + 2*max(1, dev_x//8), 1), iter=1.  Catches
+                     CJK stroke-end and ā/ě/ó fringe on the left/right edges.
 
-    Phase 2 is skipped when dev_y == 0 to avoid unnecessary expansion.
+    Both phases are skipped when the corresponding dev is 0.
     """
     mask = np.zeros(size, dtype="uint8")
     if not coords_list:
@@ -62,16 +63,21 @@ def create_mask(size, coords_list):
         y2 = min(h - 1, ymax + dev_y)
         cv2.rectangle(mask, (x1, y1), (x2, y2), (255, 255, 255), thickness=-1)
 
-    # 垂直形态学：额外吸收抗锯齿 / 紧贴字形外沿的像素残留，
-    # 同时把 mask 边界推离 STTN 模型 inpainting 质量下降的"贴边"区域。
-    # Kernel 高度和迭代次数随 dev_y 自适应缩放：字幕行数越多 → dev_y 越
-    # 大 → 形态学扩展越宽，覆盖上/下边缘残留。dev_y=22 时与旧版
-    # (1,5)/iter=2 行为完全一致。
+    # Per-axis morphology.  Each axis is gated on its own dev so a user
+    # who sets dev_x=0 to keep the mask tight horizontally isn't paying
+    # for an unwanted horizontal dilate.  Growth is continuous in `dev`
+    # (no upper cap) — at very large dev values the morphology extends
+    # further, which is desirable for tall multi-line subtitles whose
+    # descender/ascender edges need proportionally more padding.
     if dev_y > 0:
-        morph_h = min(1 + 2 * (dev_y // 10), 11)
+        morph_h = 1 + 2 * max(1, dev_y // 8)
         morph_iters = 2 if dev_y <= 30 else 3
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, morph_h))
         mask = cv2.dilate(mask, kernel, iterations=morph_iters)
+    if dev_x > 0:
+        morph_w = 1 + 2 * max(1, dev_x // 8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_w, 1))
+        mask = cv2.dilate(mask, kernel, iterations=1)
     return mask
 
 def get_inpaint_area_by_mask(W, H, h, mask, multiple=1):

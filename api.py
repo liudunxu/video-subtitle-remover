@@ -217,15 +217,17 @@ def _normalize_options(payload):
         "residual_dilate_iters",
         "residual_bright_threshold",
         "residual_early_stop_ratio",
-        "residual_top_extra_px",
-        "residual_bottom_extra_px",
+        "residual_v_extra_px",
         "residual_vertical_close_px",
         "residual_dark_vertical_strip_px",
         "residual_dark_nbhd_radius",
     }}}
     mode = str(merged.get("mode") or merged.get("inpaint_mode") or "sttn").strip().lower().replace("-", "_")
     post_lama_refine = _to_bool(merged.get("post_lama_refine", False))
-    if mode in {"sttn_lama", "sttn_lama_refine", "sttn_then_lama"}:
+    # Historical aliases for the STTN+LaMa refine mode. `sttn_lama` /
+    # `sttn_lama_refine` were folded into `sttn_then_lama` — kept the
+    # latter as the canonical name; the others no longer match.
+    if mode == "sttn_then_lama":
         mode = "sttn"
         post_lama_refine = True
     aliases = {
@@ -254,6 +256,8 @@ def _normalize_options(payload):
             0,
             300,
         ),
+        # [deprecated] 已被 subtitle_area_deviation_pixel_y 替代。保留以兼容
+        # 旧 API 客户端;调用方请改用 subtitle_area_deviation_pixel_y。
         "ocr_bbox_y_pad": _bounded_int(merged.get("ocr_bbox_y_pad"), "ocr_bbox_y_pad", 0, 0, 120),
         "sttn_skip_detection": _to_bool(merged.get("sttn_skip_detection", False)),
         "sttn_neighbor_stride": _bounded_int(merged.get("sttn_neighbor_stride"), "sttn_neighbor_stride", 5, 1, 30),
@@ -286,8 +290,7 @@ def _normalize_options(payload):
         "residual_dilate_iters": _bounded_int(merged.get("residual_dilate_iters"), "residual_dilate_iters", 2, 0, 4),
         "residual_bright_threshold": _bounded_int(merged.get("residual_bright_threshold"), "residual_bright_threshold", 130, 80, 200),
         "residual_early_stop_ratio": float(_bounded_int(merged.get("residual_early_stop_ratio"), "residual_early_stop_ratio", 2, 0, 500)) / 10000.0,
-        "residual_top_extra_px": _bounded_int(merged.get("residual_top_extra_px"), "residual_top_extra_px", 6, 0, 12),
-        "residual_bottom_extra_px": _bounded_int(merged.get("residual_bottom_extra_px"), "residual_bottom_extra_px", 6, 0, 12),
+        "residual_v_extra_px": _bounded_int(merged.get("residual_v_extra_px"), "residual_v_extra_px", 6, 0, 12),
         "residual_vertical_close_px": _bounded_int(merged.get("residual_vertical_close_px"), "residual_vertical_close_px", 3, 0, 8),
         "residual_dark_vertical_strip_px": _bounded_int(merged.get("residual_dark_vertical_strip_px"), "residual_dark_vertical_strip_px", 8, 0, 16),
         "residual_dark_nbhd_radius": _bounded_int(merged.get("residual_dark_nbhd_radius"), "residual_dark_nbhd_radius", 7, 0, 16),
@@ -1478,14 +1481,17 @@ def _run_post_verify_blur(video_path, area, options, progress_callback=None, sta
 def _residual_text_mask(crop_bgr, options):
     """Return a binary mask of residual text-like pixels inside `crop_bgr`.
 
-    Three signals ORed together:
+    Four signals ORed together:
       A. White text   — V >= residual_bright_threshold AND S <= 130.
       B. Yellow text  — V in [110..230], S >= 60, H in [8, 45].
-      C. Dark glyphs / outlines — V in [40..140] AND S <= 90, only counted
-         if at least one A/B neighbor exists in a 7x7 ellipse. This catches
-         the dark fill or stroke that surrounds a white/yellow subtitle
-         when STTN's main pass left a hollow ghost (very common in
-         real-shot drama / 1080p SD material).
+      C. Colorful text — S >= 60 AND V in [80, 230]. Catches blue (H≈100),
+         red (H≈0/180), green (H≈60), purple (H≈130), cyan, etc. that
+         signals A/B miss entirely.
+      D. Dark glyphs / outlines — V in [40..140] AND S <= 90, only counted
+         if at least one A/B/C neighbor exists in a 7x7 ellipse. This
+         catches the dark fill or stroke that surrounds a colorful/white
+         subtitle when STTN's main pass left a hollow ghost (very common
+         in real-shot drama / 1080p SD material).
 
     Each candidate pixel is then ANDed with a 5x5 ellipse neighborhood of
     itself to suppress stray bright texture that happens to match HSV but
@@ -1505,46 +1511,58 @@ def _residual_text_mask(crop_bgr, options):
         & (s_ch >= 60)
         & (h_ch >= 8) & (h_ch <= 45)
     )
-    # Signal C: dark glyphs/outlines that survive alongside signal A/B.
-    # The "needs a bright neighbor" gate stops us from erasing genuine dark
-    # features in the video (e.g. clothing, shadows, hair) when there's no
-    # subtitle nearby.
-    dark_v_min = int(options.get("residual_dark_v_min", 40))
-    dark_v_max = int(options.get("residual_dark_v_max", 140))
-    dark_s_max = int(options.get("residual_dark_s_max", 90))
-    bright_signal = (white_mask | yellow_mask)
-    # Two neighborhoods — the original 7x7 ellipse catches dark pixels
-    # *around* a glyph, and the vertical-strip dilation catches dark pixels
-    # sitting directly above/below a glyph (top/bottom edge shadow or
-    # stroke that the symmetric nbhd can miss when the glyph is already
-    # too thin to register horizontally).
+    # Colorful text: saturated (S >= 60) and mid-bright (V in [80, 230]).
+    # The V range deliberately overlaps with white (V >= bright) and yellow
+    # — ORing all three signals is fine and a given pixel will be in
+    # whichever union is the simplest description. The 5x5 nbhd filter at
+    # the end of the function handles isolated false positives.
+    colorful_mask = (s_ch >= 60) & (v_ch >= 80) & (v_ch <= 230)
+    # Signal D: dark glyphs/outlines that survive alongside the text-color
+    # signals. The "needs a text-color neighbor" gate stops us from
+    # erasing genuine dark features in the video (e.g. clothing, shadows,
+    # hair) when there's no subtitle nearby.
+    # Internal thresholds — these are baked in, not user-tunable. The
+    # remaining user-facing knobs (`residual_dark_nbhd_radius`,
+    # `residual_dark_vertical_strip_px`) cover the geometric properties of
+    # the gate; the HSV windows are class-conditional constants.
+    dark_v_min = 40
+    dark_v_max = 140
+    dark_s_max = 90
+    text_signal = (white_mask | yellow_mask | colorful_mask)
+    # Two neighborhoods — the 7x7 ellipse catches dark pixels *around* a
+    # glyph, and the vertical-strip dilation catches dark pixels sitting
+    # directly above/below a glyph (top/bottom edge shadow or stroke that
+    # the symmetric nbhd can miss when the glyph is already too thin to
+    # register horizontally).
     nbhd_radius = int(options.get("residual_dark_nbhd_radius", 7))
-    bright_nbhd_2d = cv2.dilate(
-        bright_signal.astype(np.uint8),
+    text_nbhd_2d = cv2.dilate(
+        text_signal.astype(np.uint8),
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (nbhd_radius, nbhd_radius)),
     )
     vertical_strip_px = int(options.get("residual_dark_vertical_strip_px", 8))
-    bright_above_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1 + vertical_strip_px))
-    bright_signal_uint8 = bright_signal.astype(np.uint8)
-    bright_above_dilated = cv2.dilate(bright_signal_uint8, bright_above_kernel, iterations=1)
-    # Shift UP by vertical_strip_px so the "is there a bright pixel ABOVE
-    # me in the same column?" check works on the dark-glyph mask below.
-    bright_above = np.zeros_like(bright_above_dilated)
-    bright_below = np.zeros_like(bright_above_dilated)
-    if vertical_strip_px < bright_above.shape[0]:
-        bright_above[: bright_above.shape[0] - vertical_strip_px] = bright_above_dilated[vertical_strip_px:]
-        bright_below[vertical_strip_px:] = bright_above_dilated[: bright_above.shape[0] - vertical_strip_px]
+    text_above_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1 + vertical_strip_px))
+    text_signal_uint8 = text_signal.astype(np.uint8)
+    text_above_dilated = cv2.dilate(text_signal_uint8, text_above_kernel, iterations=1)
+    # Shift UP by vertical_strip_px so the "is there a text-color pixel
+    # ABOVE me in the same column?" check works on the dark-glyph mask
+    # below.
+    text_above = np.zeros_like(text_above_dilated)
+    text_below = np.zeros_like(text_above_dilated)
+    if vertical_strip_px < text_above.shape[0]:
+        text_above[: text_above.shape[0] - vertical_strip_px] = text_above_dilated[vertical_strip_px:]
+        text_below[vertical_strip_px:] = text_above_dilated[: text_above.shape[0] - vertical_strip_px]
     dark_glyph = (
         (v_ch >= dark_v_min) & (v_ch <= dark_v_max)
         & (s_ch <= dark_s_max)
     )
     # A dark pixel is residual if EITHER it sits in a 7x7 neighborhood of
-    # a bright pixel (existing rule, catches outlines on the sides) OR it
-    # sits directly above/below a bright pixel in the same column within
-    # the configured strip. This catches upper and lower subtitle fringes.
-    dark_mask = (dark_glyph & ((bright_nbhd_2d > 0) | (bright_above > 0) | (bright_below > 0))).astype(np.uint8) * 255
+    # a text-color pixel (existing rule, catches outlines on the sides) OR
+    # it sits directly above/below a text-color pixel in the same column
+    # within the configured strip. This catches upper and lower subtitle
+    # fringes.
+    dark_mask = (dark_glyph & ((text_nbhd_2d > 0) | (text_above > 0) | (text_below > 0))).astype(np.uint8) * 255
 
-    raw = ((white_mask | yellow_mask).astype(np.uint8) * 255) | dark_mask
+    raw = ((white_mask | yellow_mask | colorful_mask).astype(np.uint8) * 255) | dark_mask
     if int(raw.sum()) == 0:
         return raw
 
@@ -1563,7 +1581,7 @@ def _residual_text_mask(crop_bgr, options):
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(raw, 8)
     filtered = np.zeros_like(raw)
     crop_h, crop_w = raw.shape[:2]
-    max_blob_ratio = float(options.get("residual_max_blob_ratio", 0.45))
+    max_blob_ratio = 0.45
     max_blob = max(60, int(crop_h * crop_w * max_blob_ratio))
     for label in range(1, n_labels):
         x, y, w, h, area = stats[label]
@@ -1628,24 +1646,21 @@ def _run_residual_cleanup(input_video_path, output_video_path, area, options, pr
     early_stop_pixels = max(4, int(crop_h * crop_w * early_stop_ratio))
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    # Vertical-bias kernels for edge fixes. STTN's text-trace mask is
+    # Vertical-bias kernel for edge fixes. STTN's text-trace mask is
     # symmetric, but a real subtitle's top/bottom edges have anti-aliased
     # fringe + dark stroke that can need the inpaint mask to extend
-    # further vertically than left/right.
-    top_extra_px = max(0, int(options.get("residual_top_extra_px", 6)))
-    if top_extra_px > 0:
-        top_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1 + 2 * top_extra_px))
+    # further vertically than left/right. We extend symmetrically in both
+    # directions (top + bottom) by a single knob — `residual_v_extra_px`
+    # — because the failure modes are mirror-symmetric in practice.
+    v_extra_px = max(0, int(options.get("residual_v_extra_px", 6)))
+    if v_extra_px > 0:
+        v_extra_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1 + 2 * v_extra_px))
     else:
-        top_kernel = None
-    bottom_extra_px = max(0, int(options.get("residual_bottom_extra_px", 6)))
-    if bottom_extra_px > 0:
-        bottom_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1 + 2 * bottom_extra_px))
-    else:
-        bottom_kernel = None
+        v_extra_kernel = None
     # Vertical-close step: MORPH_CLOSE on the raw mask with a tall thin
     # kernel. Closes the 1-3 px vertical gap between the top-edge shadow
     # band and the glyph body that often survives STTN. Without this the
-    # top_extra_px shift can't reach the shadow because there's no
+    # v_extra_px shift can't reach the shadow because there's no
     # connecting mask to "drag" upward.
     vertical_close_px = max(0, int(options.get("residual_vertical_close_px", 3)))
     vertical_close_kernel = None
@@ -1710,24 +1725,21 @@ def _run_residual_cleanup(input_video_path, output_video_path, area, options, pr
                             mask_for_inpaint = cv2.dilate(residual, kernel, iterations=dilate_iters)
                         else:
                             mask_for_inpaint = residual
-                        # Top-edge extension: dilate with a 1xN vertical
-                        # kernel, then shift the result up by `top_extra_px`
-                        # so the inpaint covers the anti-aliased fringe
-                        # ABOVE each detected text pixel (the symmetric
-                        # dilate alone doesn't reach high enough on the
-                        # top side).
-                        if top_kernel is not None and top_extra_px > 0:
-                            vert = cv2.dilate(residual, top_kernel, iterations=1)
-                            top_ext = np.zeros_like(vert)
-                            if top_extra_px < vert.shape[0]:
-                                top_ext[: vert.shape[0] - top_extra_px] = vert[top_extra_px:]
-                            mask_for_inpaint = cv2.bitwise_or(mask_for_inpaint, top_ext)
-                        if bottom_kernel is not None and bottom_extra_px > 0:
-                            vert = cv2.dilate(residual, bottom_kernel, iterations=1)
-                            bottom_ext = np.zeros_like(vert)
-                            if bottom_extra_px < vert.shape[0]:
-                                bottom_ext[bottom_extra_px:] = vert[: vert.shape[0] - bottom_extra_px]
-                            mask_for_inpaint = cv2.bitwise_or(mask_for_inpaint, bottom_ext)
+                        # Vertical-edge extension: dilate with a 1xN
+                        # vertical kernel, then shift the result up AND
+                        # down by `v_extra_px` so the inpaint covers the
+                        # anti-aliased fringe above and below each
+                        # detected text pixel (the symmetric dilate alone
+                        # doesn't reach far enough on the top/bottom).
+                        if v_extra_kernel is not None and v_extra_px > 0:
+                            vert = cv2.dilate(residual, v_extra_kernel, iterations=1)
+                            if v_extra_px < vert.shape[0]:
+                                top_ext = np.zeros_like(vert)
+                                top_ext[: vert.shape[0] - v_extra_px] = vert[v_extra_px:]
+                                mask_for_inpaint = cv2.bitwise_or(mask_for_inpaint, top_ext)
+                                bottom_ext = np.zeros_like(vert)
+                                bottom_ext[v_extra_px:] = vert[: vert.shape[0] - v_extra_px]
+                                mask_for_inpaint = cv2.bitwise_or(mask_for_inpaint, bottom_ext)
                         inpainted = cv2.inpaint(inpainted, mask_for_inpaint, inpaint_radius, cv2.INPAINT_NS)
                         residual = _residual_text_mask(inpainted, options)
                     if passes_for_this_frame > passes_used:
@@ -2360,6 +2372,8 @@ def _normalize_detect_options(payload):
         "allow_outside_band": _to_bool(merged.get("allow_outside_band", False)),
         "padding_x": _bounded_int(merged.get("padding_x"), "padding_x", 16, 0, 240),
         "padding_y": _bounded_int(merged.get("padding_y"), "padding_y", 16, 0, 240),
+        # [deprecated] 已被 subtitle_area_deviation_pixel_y 替代。保留以兼容
+        # 旧 API 客户端;调用方请改用 subtitle_area_deviation_pixel_y。
         "ocr_bbox_y_pad": _bounded_int(merged.get("ocr_bbox_y_pad"), "ocr_bbox_y_pad", 0, 0, 120),
         "raw_area_buffer_y": _bounded_int(merged.get("raw_area_buffer_y"), "raw_area_buffer_y", 60, 0, 120),
         "max_boxes": _bounded_int(merged.get("max_boxes"), "max_boxes", 240, 20, 1000),

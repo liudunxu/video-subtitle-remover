@@ -75,7 +75,10 @@ from backend.tools.inpaint_tools import create_mask  # noqa: E402
 
 class CreateMaskTest(unittest.TestCase):
     def test_basic_xy_split_and_morphology(self):
-        """dev_x=10 / dev_y=22: rectangle (90,28)-(210,102) filled, then dilate (1,5) iter=2 extends ±4 rows in Y."""
+        """dev_x=10 / dev_y=22: rectangle (90,28)-(210,102) filled, then
+        vertical dilate (1, 5) iter=2 extends ±4 rows in Y and horizontal
+        dilate (3, 1) iter=1 extends ±1 col in X.
+        """
         config.set(config.subtitleAreaDeviationPixelX, 10)
         config.set(config.subtitleAreaDeviationPixelY, 22)
 
@@ -85,11 +88,14 @@ class CreateMaskTest(unittest.TestCase):
         mask = create_mask((200, 300, 3), coords)
 
         # Phase 1: rectangle (90, 28) - (210, 102) inclusive on both endpoints.
-        # Phase 2: dilate with (1, 5) kernel, 2 iterations extends 4 rows above and 4 below.
+        # Phase 2 vertical: kernel (1, 1+2*max(1, 22//8)) = (1, 5), iter=2 →
+        # Y range extends 4 rows above and below.
+        # Phase 2 horizontal: kernel (1+2*max(1, 10//8), 1) = (3, 1), iter=1 →
+        # X range extends 1 col each side.
         # Final Y range: 24..106 (4 extra above and below).
-        # Final X range: 90..210 (unchanged — kernel width is 1).
+        # Final X range: 89..211 (1 extra each side).
         expected_y_start, expected_y_end = 24, 106
-        expected_x_start, expected_x_end = 90, 210
+        expected_x_start, expected_x_end = 89, 211
 
         for y in range(expected_y_start, expected_y_end + 1):
             row = mask[y, expected_x_start:expected_x_end + 1, 0]
@@ -98,15 +104,15 @@ class CreateMaskTest(unittest.TestCase):
                 f"row {y} should be fully 255 in X range, got {row}",
             )
 
-        # Just outside the morph-extended Y range:
+        # Just outside the morph-extended range:
         # row 23 should NOT be 255 in the X range
         self.assertFalse(np.any(mask[23, expected_x_start:expected_x_end + 1, 0] == 255))
         # row 107 should NOT be 255 in the X range
         self.assertFalse(np.any(mask[107, expected_x_start:expected_x_end + 1, 0] == 255))
-        # col 89 should NOT be 255 in the Y range
-        self.assertFalse(np.any(mask[expected_y_start:expected_y_end + 1, 89, 0] == 255))
-        # col 211 should NOT be 255 in the Y range
-        self.assertFalse(np.any(mask[expected_y_start:expected_y_end + 1, 211, 0] == 255))
+        # col 88 should NOT be 255 in the Y range (1 col before the morph extent)
+        self.assertFalse(np.any(mask[expected_y_start:expected_y_end + 1, 88, 0] == 255))
+        # col 212 should NOT be 255 in the Y range
+        self.assertFalse(np.any(mask[expected_y_start:expected_y_end + 1, 212, 0] == 255))
 
     def test_empty_coords_returns_zero_mask_without_morphology(self):
         """Empty coords_list returns all-zero mask. cv2.dilate must NOT be called."""
@@ -132,20 +138,76 @@ class CreateMaskTest(unittest.TestCase):
         mask = create_mask((100, 200, 3), coords)
 
         # After dev_y=22: y1 would be -22, clipped to 0; y2 = 30+22=52.
-        # After dilate (1,5) iter=2: top can't extend above 0 (clipped), but bottom extends
-        # 4 rows down to 56. So filled region: rows 0..56, cols 0..60.
-        # X: x1=0 (clipped), x2=50+10=60. Dilate doesn't extend X.
-        self.assertTrue(np.all(mask[0:57, 0:61, 0] == 255))
-        # col 61 should be all 0 across the filled Y range
-        self.assertFalse(np.any(mask[0:57, 61, 0] == 255))
-        # row 57 should be all 0 in cols 0..60
-        self.assertFalse(np.any(mask[57, 0:61, 0] == 255))
+        # After dilate (1,5) iter=2: top can't extend above 0 (clipped), but
+        # bottom extends 4 rows down to 56.
+        # X: x1=0 (clipped), x2=50+10=60. After horizontal dilate (3,1)
+        # iter=1: x2 extends to 61.
+        # So filled region: rows 0..56, cols 0..61.
+        self.assertTrue(np.all(mask[0:57, 0:62, 0] == 255))
+        # col 62 should be all 0 across the filled Y range
+        self.assertFalse(np.any(mask[0:57, 62, 0] == 255))
+        # row 57 should be all 0 in cols 0..61
+        self.assertFalse(np.any(mask[57, 0:62, 0] == 255))
 
-    def test_y_zero_skips_morphology(self):
-        """dev_y=0 skips cv2.dilate entirely."""
+    def test_y_zero_skips_vertical_morphology(self):
+        """dev_y=0 skips the vertical dilate; horizontal dilate still runs
+        (gated independently on dev_x).
+        """
         from unittest.mock import patch
+        import cv2 as real_cv2
 
         config.set(config.subtitleAreaDeviationPixelX, 10)
+        config.set(config.subtitleAreaDeviationPixelY, 0)
+
+        coords = [(100, 200, 50, 80)]
+        # side_effect=real_cv2.dilate so the real morphology still runs
+        # while mock_dilate records call counts. A naive patch would
+        # replace dilate with a MagicMock and break the mask shape
+        # assertions below.
+        with patch("backend.tools.inpaint_tools.cv2.dilate", side_effect=real_cv2.dilate) as mock_dilate:
+            mask = create_mask((200, 300, 3), coords)
+
+        # dilate IS called (for the horizontal pass) but the vertical
+        # kernel never gets used. We don't assert kernel shape here — the
+        # call-count check below plus the test_x_zero_skips_horizontal
+        # test cover both halves of the per-axis gating.
+        self.assertGreaterEqual(mock_dilate.call_count, 1)
+        # X range after dev_x=10 + horizontal dilate (3,1) iter=1: 89..211.
+        # Y range with dev_y=0 + no vertical dilate: 50..80.
+        self.assertTrue(np.all(mask[50:81, 89:212, 0] == 255))
+        # Y=49 and Y=81 should be 0
+        self.assertFalse(np.any(mask[49, 89:212, 0] == 255))
+        self.assertFalse(np.any(mask[81, 89:212, 0] == 255))
+
+    def test_x_zero_skips_horizontal_morphology(self):
+        """dev_x=0 skips the horizontal dilate; vertical dilate still runs."""
+        from unittest.mock import patch
+        import cv2 as real_cv2
+
+        config.set(config.subtitleAreaDeviationPixelX, 0)
+        config.set(config.subtitleAreaDeviationPixelY, 22)
+
+        coords = [(100, 200, 50, 80)]
+        with patch("backend.tools.inpaint_tools.cv2.dilate", side_effect=real_cv2.dilate) as mock_dilate:
+            mask = create_mask((200, 300, 3), coords)
+
+        # dilate IS called (for the vertical pass) but the horizontal
+        # kernel never gets used.
+        self.assertGreaterEqual(mock_dilate.call_count, 1)
+        # X range with dev_x=0 + no horizontal dilate: 100..200.
+        # Y range after dev_y=22 + vertical dilate (1,5) iter=2: 24..106.
+        self.assertTrue(np.all(mask[24:107, 100:201, 0] == 255))
+        # col 99 and col 201 should be 0 (X dilate didn't run)
+        self.assertFalse(np.any(mask[24:107, 99, 0] == 255))
+        self.assertFalse(np.any(mask[24:107, 201, 0] == 255))
+
+    def test_both_axes_zero_no_dilate(self):
+        """dev_x=0 AND dev_y=0 → no dilate is called (per-axis gating
+        both kick in).
+        """
+        from unittest.mock import patch
+
+        config.set(config.subtitleAreaDeviationPixelX, 0)
         config.set(config.subtitleAreaDeviationPixelY, 0)
 
         coords = [(100, 200, 50, 80)]
@@ -153,25 +215,18 @@ class CreateMaskTest(unittest.TestCase):
             mask = create_mask((200, 300, 3), coords)
 
         mock_dilate.assert_not_called()
-        # X range: 90..210. Y range: 50..80 (no expansion, no morphology).
-        self.assertTrue(np.all(mask[50:81, 90:211, 0] == 255))
-        # Y=49 and Y=81 should be 0
-        self.assertFalse(np.any(mask[49, 90:211, 0] == 255))
-        self.assertFalse(np.any(mask[81, 90:211, 0] == 255))
+        # Tight rectangle, no morphology: 100..200 × 50..80.
+        self.assertTrue(np.all(mask[50:81, 100:201, 0] == 255))
 
-    def test_morphology_does_not_affect_x(self):
-        """Kernel (1, 5) is 1 col wide; X is not affected by dilate."""
+    def test_horizontal_morphology_does_not_affect_y(self):
+        """Horizontal kernel is 1 row tall; Y is not affected by it."""
         config.set(config.subtitleAreaDeviationPixelX, 10)
         config.set(config.subtitleAreaDeviationPixelY, 22)
 
         coords = [(100, 200, 50, 80)]
         mask = create_mask((200, 300, 3), coords)
 
-        # X: dev_x=10 → x1=90, x2=210. With (1,5) kernel, X range unchanged.
-        # col 89 must be 0 across the Y range
-        self.assertFalse(np.any(mask[:, 89, 0] == 255))
-        # col 211 must be 0 across the Y range
-        self.assertFalse(np.any(mask[:, 211, 0] == 255))
-        # but col 90 and col 210 are filled in the Y range
-        self.assertTrue(np.any(mask[:, 90, 0] == 255))
-        self.assertTrue(np.any(mask[:, 210, 0] == 255))
+        # Row 23 (1 row above the vertical morph extent) must be 0 across X
+        self.assertFalse(np.any(mask[23, :, 0] == 255))
+        # Row 107 (1 row below) must be 0 across X
+        self.assertFalse(np.any(mask[107, :, 0] == 255))
