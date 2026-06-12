@@ -187,6 +187,7 @@ def _normalize_options(payload):
         "subtitle_area_deviation_pixel",
         "subtitle_area_deviation_pixel_y",
         "mask_deviation",
+        "ocr_bbox_y_pad",
         "sttn_skip_detection",
         "sttn_neighbor_stride",
         "sttn_reference_length",
@@ -253,6 +254,7 @@ def _normalize_options(payload):
             0,
             300,
         ),
+        "ocr_bbox_y_pad": _bounded_int(merged.get("ocr_bbox_y_pad"), "ocr_bbox_y_pad", 16, 0, 120),
         "sttn_skip_detection": _to_bool(merged.get("sttn_skip_detection", False)),
         "sttn_neighbor_stride": _bounded_int(merged.get("sttn_neighbor_stride"), "sttn_neighbor_stride", 5, 1, 30),
         "sttn_reference_length": _bounded_int(merged.get("sttn_reference_length"), "sttn_reference_length", 20, 1, 60),
@@ -607,6 +609,34 @@ def _run_lama_area_remover(remover, area):
             pass
 
 
+def _padded_ocr_coords(coords, image_height, y_pad):
+    """Expand OCR bboxes vertically; PaddleOCR often returns cap-height-tight boxes."""
+    pad = max(0, int(y_pad or 0))
+    if pad <= 0:
+        return coords
+    height = max(1, int(image_height or 1))
+    padded = []
+    for xmin, xmax, ymin, ymax in coords:
+        padded.append((xmin, xmax, max(0, int(ymin) - pad), min(height, int(ymax) + pad)))
+    return padded
+
+
+def _build_padded_subtitle_detector(base_cls, video_path, area, y_pad, **kwargs):
+    detector = base_cls(str(video_path), sub_area=area, **kwargs)
+    pad = max(0, int(y_pad or 0))
+    if pad <= 0:
+        return detector
+
+    original_detect_subtitle = detector.detect_subtitle
+
+    def detect_subtitle_with_y_pad(img):
+        coords = original_detect_subtitle(img)
+        return _padded_ocr_coords(coords, img.shape[0] if img is not None else 0, pad)
+
+    detector.detect_subtitle = detect_subtitle_with_y_pad
+    return detector
+
+
 def _run_blur_cover(video_path, area, options, ocr_preset=None):
     """模糊覆盖模式：自动检测字幕位置并应用高斯模糊。
 
@@ -631,6 +661,7 @@ def _run_blur_cover(video_path, area, options, ocr_preset=None):
     blur_pad = max(0, int(options.get("blur_pad") or 24))
     blur_feather = max(0, int(options.get("blur_feather") or 20))
     blur_temporal_window = max(0, int(options.get("blur_temporal_window") or 3))
+    ocr_bbox_y_pad = max(0, int(options.get("ocr_bbox_y_pad") or 0))
 
     ocr_preset_name = str(options.get("ocr_preset") or "default").strip().lower()
     det_db_thresh = None
@@ -648,17 +679,22 @@ def _run_blur_cover(video_path, area, options, ocr_preset=None):
     print(
         f"INFO: _run_blur_cover ocr_preset={ocr_preset_name}, "
         f"kernel={blur_kernel}, passes={blur_passes}, pad={blur_pad}, "
-        f"feather={blur_feather}, temporal_window={blur_temporal_window}"
+        f"feather={blur_feather}, temporal_window={blur_temporal_window}, "
+        f"ocr_bbox_y_pad={ocr_bbox_y_pad}"
     )
 
     # Step 1: 使用 SubtitleRemover 查找字幕帧和位置
     remover = SubtitleRemover(str(video_path), sub_area=area)
+    detector_kwargs = {}
     if det_db_thresh is not None:
-        remover.sub_detector = SubtitleDetect(
-            str(video_path), sub_area=area,
-            det_db_thresh=det_db_thresh,
-            det_db_box_thresh=det_db_box_thresh,
-            det_limit_side_len=det_limit_side_len,
+        detector_kwargs = {
+            "det_db_thresh": det_db_thresh,
+            "det_db_box_thresh": det_db_box_thresh,
+            "det_limit_side_len": det_limit_side_len,
+        }
+    if detector_kwargs or ocr_bbox_y_pad > 0:
+        remover.sub_detector = _build_padded_subtitle_detector(
+            SubtitleDetect, video_path, area, ocr_bbox_y_pad, **detector_kwargs
         )
 
     # 查找字幕位置（检测可能因CUDNN失败，降级处理）
@@ -2045,6 +2081,7 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
 
     ocr_preset_name = str(options.get("ocr_preset") or "default").strip().lower()
     ocr_preset = _OCR_PRESETS.get(ocr_preset_name, _OCR_PRESETS["default"])
+    ocr_bbox_y_pad = max(0, int(options.get("ocr_bbox_y_pad") or 0))
     need_ocr_override = (
         not options.get("sttn_skip_detection", False)
         and ocr_preset_name != "default"
@@ -2060,18 +2097,23 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
     phase_label = "sttn" if options["mode"] == "sttn" else options["mode"]
     for attempt in range(2):
         remover = SubtitleRemover(str(video_path), sub_area=area)
-        if need_ocr_override:
-            print(f"INFO: _run_subtitle_remover overriding OCR detector: ocr_preset={ocr_preset_name}, det_db_thresh={ocr_preset.get('det_db_thresh')}, det_db_box_thresh={ocr_preset.get('det_db_box_thresh')}, det_limit_side_len={ocr_preset.get('det_limit_side_len')}")
-            remover.sub_detector = SubtitleDetect(
-                str(video_path), sub_area=area,
-                det_db_thresh=ocr_preset.get("det_db_thresh"),
-                det_db_box_thresh=ocr_preset.get("det_db_box_thresh"),
-                det_limit_side_len=ocr_preset.get("det_limit_side_len"),
-            )
-        elif options.get("sttn_skip_detection", False):
+        detector_kwargs = {}
+        if options.get("sttn_skip_detection", False):
             print(f"INFO: _run_subtitle_remover sttn_skip_detection=True, OCR override not needed")
         else:
-            print(f"INFO: _run_subtitle_remover ocr_preset={ocr_preset_name} (default), using built-in OCR thresholds")
+            if need_ocr_override:
+                print(f"INFO: _run_subtitle_remover overriding OCR detector: ocr_preset={ocr_preset_name}, det_db_thresh={ocr_preset.get('det_db_thresh')}, det_db_box_thresh={ocr_preset.get('det_db_box_thresh')}, det_limit_side_len={ocr_preset.get('det_limit_side_len')}, ocr_bbox_y_pad={ocr_bbox_y_pad}")
+                detector_kwargs = {
+                    "det_db_thresh": ocr_preset.get("det_db_thresh"),
+                    "det_db_box_thresh": ocr_preset.get("det_db_box_thresh"),
+                    "det_limit_side_len": ocr_preset.get("det_limit_side_len"),
+                }
+            elif ocr_bbox_y_pad > 0:
+                print(f"INFO: _run_subtitle_remover ocr_bbox_y_pad={ocr_bbox_y_pad}, using built-in OCR thresholds")
+            if detector_kwargs or ocr_bbox_y_pad > 0:
+                remover.sub_detector = _build_padded_subtitle_detector(
+                    SubtitleDetect, video_path, area, ocr_bbox_y_pad, **detector_kwargs
+                )
         old_values = _apply_config_options(config, options)
         # Detector-empty fallback: if STTN is the engine and the user did
         # NOT explicitly request skip_detection, peek at the OCR result
@@ -2296,6 +2338,7 @@ def _normalize_detect_options(payload):
         "allow_outside_band",
         "padding_x",
         "padding_y",
+        "ocr_bbox_y_pad",
         "raw_area_buffer_y",
         "max_boxes",
         "ocr_preset",
@@ -2317,6 +2360,7 @@ def _normalize_detect_options(payload):
         "allow_outside_band": _to_bool(merged.get("allow_outside_band", False)),
         "padding_x": _bounded_int(merged.get("padding_x"), "padding_x", 16, 0, 240),
         "padding_y": _bounded_int(merged.get("padding_y"), "padding_y", 16, 0, 240),
+        "ocr_bbox_y_pad": _bounded_int(merged.get("ocr_bbox_y_pad"), "ocr_bbox_y_pad", 16, 0, 120),
         "raw_area_buffer_y": _bounded_int(merged.get("raw_area_buffer_y"), "raw_area_buffer_y", 60, 0, 120),
         "max_boxes": _bounded_int(merged.get("max_boxes"), "max_boxes", 240, 20, 1000),
         "ocr_preset": ocr_preset_raw,
@@ -2360,6 +2404,23 @@ def _box_in_area(box, area):
     box_xmax = box["x"] + box["width"]
     box_ymax = box["y"] + box["height"]
     return xmin <= box["x"] and box_xmax <= xmax and ymin <= box["y"] and box_ymax <= ymax
+
+
+def _clamp_box_to_area(box, area):
+    if area is None:
+        return box
+    ymin, ymax, xmin, xmax = area
+    left = max(int(xmin), int(box["x"]))
+    top = max(int(ymin), int(box["y"]))
+    right = min(int(xmax), int(box["x"]) + int(box["width"]))
+    bottom = min(int(ymax), int(box["y"]) + int(box["height"]))
+    return {
+        **box,
+        "x": left,
+        "y": top,
+        "width": max(0, right - left),
+        "height": max(0, bottom - top),
+    }
 
 
 def _area_from_boxes(boxes):
@@ -2525,7 +2586,7 @@ _OCR_PRESETS = {
 _MAX_DETECTION_EDGE = 1280
 
 
-def _detect_subtitle_on_frame(detector, frame, width, height, max_detection_edge=None):
+def _detect_subtitle_on_frame(detector, frame, width, height, max_detection_edge=None, y_pad=0):
     """对单帧做字幕检测；如果分辨率过高先缩放，再把坐标映射回原始分辨率。"""
     import cv2
 
@@ -2560,7 +2621,7 @@ def _detect_subtitle_on_frame(detector, frame, width, height, max_detection_edge
             )
             for xmin, xmax, ymin, ymax in coords
         ]
-    return coords
+    return _padded_ocr_coords(coords, height, y_pad)
 
 
 def _run_subtitle_area_detection(video_path, area, options):
@@ -2574,7 +2635,8 @@ def _run_subtitle_area_detection(video_path, area, options):
     det_db_box_thresh = ocr_preset.get("det_db_box_thresh")
     det_limit_side_len = ocr_preset.get("det_limit_side_len")
     detect_max_edge = ocr_preset.get("detect_max_edge") or _MAX_DETECTION_EDGE
-    print(f"INFO: _run_subtitle_area_detection ocr_preset={ocr_preset_name}, det_db_thresh={det_db_thresh}, det_db_box_thresh={det_db_box_thresh}, det_limit_side_len={det_limit_side_len}, detect_max_edge={detect_max_edge}")
+    ocr_bbox_y_pad = max(0, int(options.get("ocr_bbox_y_pad") or 0))
+    print(f"INFO: _run_subtitle_area_detection ocr_preset={ocr_preset_name}, det_db_thresh={det_db_thresh}, det_db_box_thresh={det_db_box_thresh}, det_limit_side_len={det_limit_side_len}, detect_max_edge={detect_max_edge}, ocr_bbox_y_pad={ocr_bbox_y_pad}")
 
     video_cap = cv2.VideoCapture(str(video_path))
     if not video_cap.isOpened():
@@ -2602,8 +2664,9 @@ def _run_subtitle_area_detection(video_path, area, options):
                 frames_sampled.append(frame_no)
                 if width <= 0 or height <= 0:
                     height, width = frame.shape[:2]
-                for coord in _detect_subtitle_on_frame(detector, frame, width, height, detect_max_edge):
+                for coord in _detect_subtitle_on_frame(detector, frame, width, height, detect_max_edge, ocr_bbox_y_pad):
                     box = _box_from_coords(frame_no, coord, width, height)
+                    box = _clamp_box_to_area(box, area)
                     if box["width"] <= 1 or box["height"] <= 1 or not _box_in_area(box, area):
                         continue
                     boxes.append(box)
@@ -2617,8 +2680,9 @@ def _run_subtitle_area_detection(video_path, area, options):
                 frames_sampled.append(current_frame)
                 if width <= 0 or height <= 0:
                     height, width = frame.shape[:2]
-                for coord in _detect_subtitle_on_frame(detector, frame, width, height, detect_max_edge):
+                for coord in _detect_subtitle_on_frame(detector, frame, width, height, detect_max_edge, ocr_bbox_y_pad):
                     box = _box_from_coords(current_frame, coord, width, height)
+                    box = _clamp_box_to_area(box, area)
                     if box["width"] <= 1 or box["height"] <= 1 or not _box_in_area(box, area):
                         continue
                     boxes.append(box)
