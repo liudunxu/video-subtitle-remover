@@ -8,13 +8,13 @@ import zipfile
 import math
 
 import torch
-import matplotlib
-import matplotlib.patches as patches
-from matplotlib.path import Path
-from matplotlib import pyplot as plt
 from torchvision import transforms
 
-# matplotlib.use('agg')
+# matplotlib is only used by `get_random_shape` (training-only data
+# augmentation helper).  Keep the import inside that function so the
+# production inference path (which imports `to_tensors` from this
+# module) doesn't pull in matplotlib and break on newer matplotlib
+# versions that removed `_is_pandas_dataframe` from `cbook`.
 
 # ###########################################################################
 # Directory IO
@@ -274,6 +274,15 @@ def get_random_shape(edge_num=9, ratio=0.7, width=432, height=240):
       points_num, number of points in the Path
       ratio, (0, 1) magnitude of the perturbation from the unit circle,
     '''
+    # Lazy import: matplotlib is only available when this function is
+    # actually called (training data augmentation).  Production inference
+    # never reaches this code path.
+    import matplotlib
+    matplotlib.use('agg')
+    import matplotlib.patches as patches
+    from matplotlib.path import Path
+    from matplotlib import pyplot as plt
+
     points_num = edge_num*3 + 1
     angles = np.linspace(0, 2*np.pi, points_num)
     codes = np.full(points_num, Path.CURVE4)
