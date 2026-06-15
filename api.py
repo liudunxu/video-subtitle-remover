@@ -2581,14 +2581,14 @@ def _choose_subtitle_area(boxes, width, height, options):
             "height": min(height - max(0, raw_area["y"] - buffer_y), raw_area["height"] + buffer_y * 2),
         }
     area = _padded_area(raw_area, width, height, options["padding_x"], options["padding_y"])
-    # Additional +30 px on top and bottom of the returned area.  The
+    # Additional +50 px on top and bottom of the returned area.  The
     # OCR-detected subtitle box is often a tight cap-height rectangle;
     # descenders / ascenders / CJK stroke-ends can sit a few px outside
-    # the box, and giving the downstream inpaint step a 30 px Y buffer
+    # the box, and giving the downstream inpaint step a 50 px Y buffer
     # means those pixels get inpainted on the first pass rather than
     # leaving visible fringes.  Stacks on top of `padding_y` from
-    # `_padded_area` (default 16), so total default Y pad is 46 px.
-    _DETECT_RESULT_V_PAD = 30
+    # `_padded_area` (default 16), so total default Y pad is 66 px.
+    _DETECT_RESULT_V_PAD = 50
     if area is not None:
         new_top = max(0, area["y"] - _DETECT_RESULT_V_PAD)
         new_bottom = min(height, area["y"] + area["height"] + _DETECT_RESULT_V_PAD)
