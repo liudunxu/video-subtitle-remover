@@ -78,6 +78,23 @@ def create_mask(size, coords_list):
         morph_w = 1 + 2 * max(1, dev_x // 8)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_w, 1))
         mask = cv2.dilate(mask, kernel, iterations=1)
+
+    # Vertical close: fill small gaps between multi-line subtitle rows.
+    # When 3+ lines of text are detected, the per-bbox expansion (dev_y on
+    # each side) may not fully bridge the gap between adjacent lines if
+    # the inter-line spacing exceeds 2*dev_y.  A vertical close with a
+    # tall kernel merges these gaps so STTN processes the entire subtitle
+    # block as one inpaint region instead of splitting into separate
+    # areas (which reduces per-line context and inpaint quality).
+    # The kernel height is scaled to dev_y: at dev_y=22 → close_h=25,
+    # which bridges gaps up to ~25px (typical for 1080p 3-line subs).
+    if len(coords_list) >= 2 and dev_y > 0:
+        close_h = max(5, dev_y + 3)
+        if close_h % 2 == 0:
+            close_h += 1
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, close_h))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
+
     return mask
 
 def get_inpaint_area_by_mask(W, H, h, mask, multiple=1):
@@ -152,10 +169,19 @@ def get_inpaint_area_by_mask(W, H, h, mask, multiple=1):
         
         # 检查是否有mask连接当前组和新孤岛
         has_connection = False
+        gap = 0
         if max_y < top_y:  # 只有当前组在新孤岛上方时才需要检查连接
+            gap = top_y - max_y
             # 检查两个区域之间是否有mask像素
             middle_region = binary_mask[max_y:top_y, :]
             if np.any(middle_region > 0):
+                has_connection = True
+            # Also merge when the gap is small (< dev_y pixels) — the
+            # vertical close in create_mask should have connected them,
+            # but a conservative close kernel may leave a 1-3 px gap.
+            # Merging here lets STTN process the full subtitle block as
+            # one region, giving it better vertical context.
+            elif gap < config.subtitleAreaDeviationPixelY.value:
                 has_connection = True
         else:  # 重叠或相邻
             has_connection = True

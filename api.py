@@ -1233,6 +1233,7 @@ def _run_post_verify_blur(video_path, area, options, progress_callback=None, sta
     # Phase 1: coarse sample — find candidate frame ranges
     _report(0.0, "ocr_sampling")
     sampled_hits = []  # list of frame_no (1-based) where sampled frame had text
+    sampled_coords = {}  # frame_no -> list of (xmin, xmax, ymin, ymax) in crop space
     frame_no = 0
     while True:
         ret, frame = src_cap.read()
@@ -1265,6 +1266,7 @@ def _run_post_verify_blur(video_path, area, options, progress_callback=None, sta
         ]
         if coords:
             sampled_hits.append(frame_no)
+            sampled_coords[frame_no] = coords
         if frame_no % 20 == 0:
             _report(50.0 * frame_no / frame_count, "ocr_sampling")
 
@@ -1330,20 +1332,23 @@ def _run_post_verify_blur(video_path, area, options, progress_callback=None, sta
             break
         frame_no += 1
         if frame_no in candidate_set:
-            crop = frame[ay_min:ay_max, ax_min:ax_max]
-            try:
-                coords = detector.detect_subtitle(crop)
-            except Exception:
-                coords = []
-            # Validity-only filter. See Phase 1 comment for why the
-            # earlier 50%-of-crop sanity check was wrong.
-            crop_h = ay_max - ay_min
-            crop_w = ax_max - ax_min
-            coords = [
-                (xmin, xmax, ymin, ymax)
-                for (xmin, xmax, ymin, ymax) in coords
-                if 0 <= xmin < xmax and 0 <= ymin < ymax
-            ]
+            # Use cached Phase 1 coords for sampled hit frames — skip
+            # redundant PaddleOCR detection (saves ~20ms/frame on GPU).
+            if frame_no in sampled_coords:
+                coords = sampled_coords[frame_no]
+            else:
+                crop = frame[ay_min:ay_max, ax_min:ax_max]
+                try:
+                    coords = detector.detect_subtitle(crop)
+                except Exception:
+                    coords = []
+                # Validity-only filter. See Phase 1 comment for why the
+                # earlier 50%-of-crop sanity check was wrong.
+                coords = [
+                    (xmin, xmax, ymin, ymax)
+                    for (xmin, xmax, ymin, ymax) in coords
+                    if 0 <= xmin < xmax and 0 <= ymin < ymax
+                ]
             # Aggregate area floor: drop frames whose total bbox area
             # is below a "this is just noise" threshold. 2% balances:
             # - real residual subtitles easily clear it (typical
@@ -1353,6 +1358,8 @@ def _run_post_verify_blur(video_path, area, options, progress_callback=None, sta
             # Earlier values: 5% (too strict — dropped short single-
             # line subs around 600x40 ≈ 4.6%), 0.5% (too lax — let
             # halo noise through).
+            crop_h = ay_max - ay_min
+            crop_w = ax_max - ax_min
             total_bbox_area = sum(
                 (xmax - xmin) * (ymax - ymin)
                 for (xmin, xmax, ymin, ymax) in coords
@@ -1703,6 +1710,24 @@ def _run_residual_cleanup(input_video_path, output_video_path, area, options, pr
             if crop.size == 0:
                 writer.write(frame)
             else:
+                # Fast pre-check: if the crop has no bright or colorful
+                # pixels at all, skip the expensive _residual_text_mask
+                # computation (morphology + connectedComponents). This is
+                # the same optimization used in _inpaint_one_frame and
+                # makes residual_cleanup nearly free for clean frames.
+                if crop.size > 32 * 32:
+                    try:
+                        _hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+                        _v = _hsv[:, :, 2]
+                        _s = _hsv[:, :, 1]
+                        bright_thr = int(options.get("residual_bright_threshold", 130))
+                        _has_bright = np.any((_v >= bright_thr) & (_s <= 130))
+                        _has_colorful = np.any((_s >= 60) & (_v >= 80) & (_v <= 230))
+                        if not _has_bright and not _has_colorful:
+                            writer.write(frame)
+                            continue
+                    except Exception:
+                        pass
                 residual = _residual_text_mask(crop, options)
                 # Vertical close: if the residual has a 1-3 px gap between
                 # the top-edge shadow band and the glyph body, fill it so
@@ -1894,7 +1919,8 @@ def _patch_sttn_none_safe_and_quality():
         H_ori = int(H_ori + 0.5)
         W_ori = int(W_ori + 0.5)
         split_h = int(W_ori * 3 / 16)
-        inpaint_area = self.get_inpaint_area_by_mask(H_ori, split_h, mask)
+        from backend.tools.inpaint_tools import get_inpaint_area_by_mask as _get_ia
+        inpaint_area = _get_ia(W_ori, H_ori, split_h, mask)
 
         none_mask = [f is None for f in input_frames]
         valid_frames = [f for f in input_frames if f is not None]
@@ -1975,7 +2001,8 @@ def _patch_sttn_none_safe_and_quality():
         else:
             _, mask = cv2.threshold(input_mask, 127, 1, cv2.THRESH_BINARY)
             mask = mask[:, :, None]
-        inpaint_area = self.sttn_inpaint.get_inpaint_area_by_mask(frame_info['H_ori'], split_h, mask)
+        from backend.tools.inpaint_tools import get_inpaint_area_by_mask as _get_ia2
+        inpaint_area = _get_ia2(frame_info['W_ori'], frame_info['H_ori'], split_h, mask)
 
         FEATHER_SIGMA = 2.0
         skipped_frames = 0
