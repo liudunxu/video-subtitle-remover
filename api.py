@@ -211,6 +211,9 @@ def _normalize_options(payload):
         "post_verify_blur_max_ratio",
         "post_verify_blur_kernel",
         "post_verify_blur_pad",
+        "post_verify_blur_pad_y_extra",
+        "post_verify_blur_passes",
+        "post_verify_blur_median_kernel",
         "auto_residual_cleanup",
         "residual_inpaint_radius",
         "residual_max_passes",
@@ -280,11 +283,9 @@ def _normalize_options(payload):
         "post_refine_feather": _bounded_int(merged.get("post_refine_feather"), "post_refine_feather", 3, 0, 12),
         "ocr_preset": str(merged.get("ocr_preset") or "default").strip().lower(),
         # Auto residual cleanup tail pass — see _run_residual_cleanup.
-        # 默认 False: 残字兜底是 STTN 之后的二次修补,在 STTN 已经被时域参数
-        # 优化后(NEIGHBOR=8 / REF=7 / MAX_LOAD=100)效果已经不错的情况下,默认
-        # 跑残字擦除会让大多数干净视频也多耗 30-60 秒。用户想要"修了还有残
-        # 影"时再勾选。
-        "auto_residual_cleanup": _to_bool(merged.get("auto_residual_cleanup", False)),
+        # 默认打开：三行字幕最常见的问题是上下沿残留，字形级二次 inpaint
+        # 比 OCR blur 更不容易把整块画面糊掉。调用方仍可显式传 False 关闭。
+        "auto_residual_cleanup": _to_bool(merged.get("auto_residual_cleanup", True)),
         "residual_inpaint_radius": _bounded_int(merged.get("residual_inpaint_radius"), "residual_inpaint_radius", 7, 2, 12),
         "residual_max_passes": _bounded_int(merged.get("residual_max_passes"), "residual_max_passes", 3, 1, 4),
         "residual_dilate_iters": _bounded_int(merged.get("residual_dilate_iters"), "residual_dilate_iters", 2, 0, 4),
@@ -294,20 +295,19 @@ def _normalize_options(payload):
         "residual_vertical_close_px": _bounded_int(merged.get("residual_vertical_close_px"), "residual_vertical_close_px", 3, 0, 8),
         "residual_dark_vertical_strip_px": _bounded_int(merged.get("residual_dark_vertical_strip_px"), "residual_dark_vertical_strip_px", 8, 0, 16),
         "residual_dark_nbhd_radius": _bounded_int(merged.get("residual_dark_nbhd_radius"), "residual_dark_nbhd_radius", 7, 0, 16),
-        # Post-verify blur: re-runs PaddleOCR text_detector on the STTN
-        # output and blurs any residual-text bboxes. On by default
-        # after the 92.8% residual report — the helper itself auto-skips
-        # when no residual is found, so the cost is bounded to the
-        # sampling PaddleOCR pass (~20% of a full pass) plus the no-op
-        # candidate blur loop when nothing's there. Users can still
-        # uncheck the box on /remove-subtitle for the cleanest videos.
+        # Post-verify blur: opt-in OCR blur fallback after residual cleanup.
+        # Keep it off by default because it intentionally blurs detected
+        # bboxes; enable it only when inpaint still leaves readable text.
         "post_verify_blur": _to_bool(merged.get("post_verify_blur", False)),
         "post_verify_blur_force": _to_bool(merged.get("post_verify_blur_force", False)),
         "post_verify_blur_sample_every": _bounded_int(merged.get("post_verify_blur_sample_every"), "post_verify_blur_sample_every", 5, 1, 30),
         "post_verify_blur_boundary": _bounded_int(merged.get("post_verify_blur_boundary"), "post_verify_blur_boundary", 3, 0, 15),
         "post_verify_blur_max_ratio": float(_bounded_int(merged.get("post_verify_blur_max_ratio"), "post_verify_blur_max_ratio", 85, 0, 100)) / 100.0,
-        "post_verify_blur_kernel": _bounded_int(merged.get("post_verify_blur_kernel"), "post_verify_blur_kernel", 51, 3, 99),
-        "post_verify_blur_pad": _bounded_int(merged.get("post_verify_blur_pad"), "post_verify_blur_pad", 8, 0, 32),
+        "post_verify_blur_kernel": _bounded_int(merged.get("post_verify_blur_kernel"), "post_verify_blur_kernel", 121, 3, 199),
+        "post_verify_blur_pad": _bounded_int(merged.get("post_verify_blur_pad"), "post_verify_blur_pad", 16, 0, 64),
+        "post_verify_blur_pad_y_extra": _bounded_int(merged.get("post_verify_blur_pad_y_extra"), "post_verify_blur_pad_y_extra", 20, 0, 80),
+        "post_verify_blur_passes": _bounded_int(merged.get("post_verify_blur_passes"), "post_verify_blur_passes", 3, 1, 6),
+        "post_verify_blur_median_kernel": _bounded_int(merged.get("post_verify_blur_median_kernel"), "post_verify_blur_median_kernel", 21, 0, 99),
     }
 
 
@@ -2130,7 +2130,13 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
     old_values = {}
     last_exc = None
     has_refine = bool(options.get("post_lama_refine") and options["mode"] == "sttn")
-    main_scale_end = 70.0 if has_refine else 100.0
+    has_residual_tail = bool(
+        options["mode"] != "blur_cover"
+        and options.get("auto_residual_cleanup", False)
+    )
+    has_verify_tail = bool(options.get("post_verify_blur", False))
+    has_tail = has_residual_tail or has_verify_tail
+    main_scale_end = 70.0 if has_refine else (90.0 if has_tail else 100.0)
     remover = None
     poller_stop = None
     phase_label = "sttn" if options["mode"] == "sttn" else options["mode"]
@@ -2221,7 +2227,7 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
     if has_refine:
         refine_target = refine_area or area
         refine_start = main_scale_end
-        refine_end = 95.0
+        refine_end = 90.0 if has_tail else 95.0
         refine_method = options.get("post_refine_method") or "telea_text"
         if refine_method == "lama_rect":
             _report("refine", refine_start, "starting")
@@ -2266,17 +2272,50 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 f"Post refinement did not create an output file at {output_path}",
             )
-    # Post-verify blur: opt-in tail pass that re-runs PaddleOCR text_detector
-    # on the STTN output and blurs any residual-text bboxes. Off by default
-    # because it costs another 30-60s on the PaddleOCR pass. The
-    # helper itself auto-skips when no residual is found, so it only
-    # adds cost when there's actually something to fix.
-    if options.get("post_verify_blur", False) and output_path.is_file():
+    # Auto residual cleanup runs before OCR blur: try a local text-mask
+    # inpaint first so we only blur frames where OCR still sees residual text.
+    if has_residual_tail and output_path.is_file():
         try:
+            residual_tmp = output_path.with_name(output_path.stem + "_residual.mp4")
+            residual_start = 90.0
+            residual_end = 97.0 if has_verify_tail else 99.0
+            _report("refine", residual_start, "residual_starting")
+            residual_output = _run_residual_cleanup(
+                output_path, residual_tmp, area, options,
+                progress_callback=progress_callback,
+                start_percent=residual_start, end_percent=residual_end,
+            )
+            # Replace the upstream output with the residual-cleaned one.
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
+            residual_output.replace(output_path)
+            _report("refine", residual_end, "residual_done")
+        except Exception as residual_exc:
+            # Residual cleanup is best-effort: if it fails (e.g. cv2 import
+            # blip, decoder error on the upstream mp4), log and keep the
+            # upstream output rather than failing the whole job.
+            print(
+                f"WARN: residual_cleanup failed ({type(residual_exc).__name__}: "
+                f"{residual_exc}); returning upstream output unchanged"
+            )
+            try:
+                if residual_tmp.is_file():
+                    residual_tmp.unlink()
+            except OSError:
+                pass
+
+    # Post-verify blur: final opt-in tail pass that re-runs PaddleOCR
+    # text_detector on the inpainted output and blurs any remaining bboxes.
+    # This is intentionally after residual cleanup to minimize visible blur.
+    if has_verify_tail and output_path.is_file():
+        try:
+            verify_start = 97.0 if has_residual_tail else 90.0
             verified_output = _run_post_verify_blur(
                 output_path, area, options,
                 progress_callback=progress_callback,
-                start_percent=95.0, end_percent=99.0,
+                start_percent=verify_start, end_percent=99.0,
             )
             if verified_output != output_path:
                 output_path = verified_output
@@ -2292,6 +2331,7 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
                 f"{verify_exc}); returning upstream output unchanged"
             )
             traceback.print_exc()
+
     # 输出完整性校验：防止 GPU 异常导致末尾 chunk 丢失却返回 200
     input_info = _probe_video_info(video_path)
     output_info = _probe_video_info(output_path)
@@ -2314,41 +2354,6 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
                 f"输出仅 {output_info['nb_frames']} 帧/{output_dur:.1f}s。"
                 f"通常是 GPU 处理末尾 chunk 时异常导致。"
             )
-    # Auto residual cleanup: re-scan the upstream output for white / yellow
-    # text-like pixels that survived STTN's main pass, and inpaint them
-    # inside the user-defined `area` only. This catches the two main
-    # badcases — entire rows of text that STTN missed, and glyph edges that
-    # were outside STTN's text-trace mask. blur_cover is intentionally
-    # skipped because the whole area is already blurred.
-    if options["mode"] != "blur_cover" and options.get("auto_residual_cleanup", False) and output_path.is_file():
-        try:
-            residual_tmp = output_path.with_name(output_path.stem + "_residual.mp4")
-            _report("refine", 70.0, "residual_starting")
-            residual_output = _run_residual_cleanup(
-                output_path, residual_tmp, area, options,
-                progress_callback=progress_callback,
-                start_percent=70.0, end_percent=95.0,
-            )
-            # Replace the upstream output with the residual-cleaned one.
-            try:
-                output_path.unlink()
-            except OSError:
-                pass
-            residual_output.replace(output_path)
-            _report("refine", 95.0, "residual_done")
-        except Exception as residual_exc:
-            # Residual cleanup is best-effort: if it fails (e.g. cv2 import
-            # blip, decoder error on the upstream mp4), log and keep the
-            # upstream output rather than failing the whole job.
-            print(
-                f"WARN: residual_cleanup failed ({type(residual_exc).__name__}: "
-                f"{residual_exc}); returning upstream output unchanged"
-            )
-            try:
-                if residual_tmp.is_file():
-                    residual_tmp.unlink()
-            except OSError:
-                pass
     _restore_config_options(config, old_values)
     # Final pass: ensure the returned file is H.264 so browsers can play
     # the result page. STTN's `merge_audio_to_video` defaults to
