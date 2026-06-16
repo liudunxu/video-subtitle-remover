@@ -1526,21 +1526,21 @@ def _residual_text_mask(crop_bgr, options):
 
     hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
     h_ch, s_ch, v_ch = cv2.split(hsv)
-    bright = int(options.get("residual_bright_threshold", 130))
+    bright = int(options.get("residual_bright_threshold", 180))
     white_mask = (v_ch >= bright) & (s_ch <= 130)
-    yellow_v_min = max(110, bright - 40)
+    # Yellow subtitles are bright and saturated; keep the window tight so
+    # skin tones and warm backgrounds do not inflate the residual mask.
+    yellow_v_min = max(140, bright - 30)
     yellow_v_max = 230
     yellow_mask = (
         (v_ch >= yellow_v_min) & (v_ch <= yellow_v_max)
-        & (s_ch >= 60)
+        & (s_ch >= 70)
         & (h_ch >= 8) & (h_ch <= 45)
     )
-    # Colorful text: saturated (S >= 60) and mid-bright (V in [80, 230]).
-    # The V range deliberately overlaps with white (V >= bright) and yellow
-    # — ORing all three signals is fine and a given pixel will be in
-    # whichever union is the simplest description. The 5x5 nbhd filter at
-    # the end of the function handles isolated false positives.
-    colorful_mask = (s_ch >= 60) & (v_ch >= 80) & (v_ch <= 230)
+    # Colorful text: strongly saturated (S >= 80) and mid-bright
+    # (V in [100, 220]). The higher saturation gate avoids classifying
+    # textured but only mildly saturated background as residual text.
+    colorful_mask = (s_ch >= 80) & (v_ch >= 100) & (v_ch <= 220)
     # Signal D: dark glyphs/outlines that survive alongside the text-color
     # signals. The "needs a text-color neighbor" gate stops us from
     # erasing genuine dark features in the video (e.g. clothing, shadows,
@@ -1550,8 +1550,8 @@ def _residual_text_mask(crop_bgr, options):
     # `residual_dark_vertical_strip_px`) cover the geometric properties of
     # the gate; the HSV windows are class-conditional constants.
     dark_v_min = 40
-    dark_v_max = 140
-    dark_s_max = 90
+    dark_v_max = 120
+    dark_s_max = 80
     text_signal = (white_mask | yellow_mask | colorful_mask)
     # Two neighborhoods — the 7x7 ellipse catches dark pixels *around* a
     # glyph, and the vertical-strip dilation catches dark pixels sitting
@@ -1605,13 +1605,20 @@ def _residual_text_mask(crop_bgr, options):
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(raw, 8)
     filtered = np.zeros_like(raw)
     crop_h, crop_w = raw.shape[:2]
-    max_blob_ratio = 0.45
+    # Keep blobs that look like glyphs: small-to-medium area, non-trivial
+    # width and height, and not taller than most of the crop. Drop huge
+    # blobs that are almost certainly background/texture, not residual text.
+    max_blob_ratio = 0.15
     max_blob = max(60, int(crop_h * crop_w * max_blob_ratio))
     for label in range(1, n_labels):
         x, y, w, h, area = stats[label]
-        if area < 3 or area > max_blob:
+        if area < 8 or area > max_blob:
             continue
-        if w < 2 or h < 2 or h > crop_h * 0.85:
+        if w < 3 or h < 3 or h > crop_h * 0.75:
+            continue
+        # Reject very wide flat blobs that are more likely strip/texture
+        # than text (e.g. a horizontal light band).
+        if w > 8 * max(h, 1):
             continue
         filtered[labels == label] = 255
     return filtered
