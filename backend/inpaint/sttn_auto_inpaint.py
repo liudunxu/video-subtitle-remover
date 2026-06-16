@@ -236,92 +236,92 @@ class STTNAutoInpaint:
                 effective_clip_gap = min(self.clip_gap, max_frames_by_vram)
                 if effective_clip_gap < self.clip_gap:
                     tqdm.write(f'GPU VRAM: {vram_mb:.0f}MB, adjusting clip_gap: {self.clip_gap} -> {effective_clip_gap}')
-            # 计算需要迭代修复视频的次数
-            rec_time = frame_info['len'] // effective_clip_gap if frame_info['len'] % effective_clip_gap == 0 else frame_info['len'] // effective_clip_gap + 1
-            # 遍历每一次的迭代次数
-            for i in range(rec_time):
-                start_f = i * effective_clip_gap  # 起始帧位置
-                end_f = min((i + 1) * effective_clip_gap, frame_info['len'])  # 结束帧位置
-                tqdm.write(f'Processing: {start_f + 1} - {end_f} / Total: {frame_info["len"]}')
-                
-                frames_hr = []  # 高分辨率帧列表
-                frames = {}  # 帧字典，用于存储裁剪后的图像
-                comps = {}  # 组合字典，用于存储修复后的图像
-                
-                # 初始化帧字典
+            # Stream frames from the prefetcher instead of trusting
+            # frame_info['len']. CAP_PROP_FRAME_COUNT is often larger than the
+            # number of decodable frames, especially with variable-GOP sources.
+            # We accumulate up to effective_clip_gap frames, process them, and
+            # repeat until the stream is exhausted. This guarantees every
+            # decodable input frame is written to the output.
+            global_frame_idx = 0
+            chunk_idx = 0
+            while True:
+                frames_hr = []
+                frames = {}
+                comps = {}
                 for k in range(len(inpaint_area)):
                     frames[k] = []
-                    
-                # 读取和修复高分辨率帧
-                valid_frames_count = 0
-                for j in range(start_f, end_f):
+
+                # Collect one chunk of decodable frames.
+                for _ in range(effective_clip_gap):
                     success, image = prefetcher.read()
-                    if not success:
-                        print(f"Warning: Failed to read frame {j}.")
+                    if not success or image is None:
                         break
-                    
                     frames_hr.append(image)
-                    valid_frames_count += 1
-                    
-                    if is_frame_number_in_ab_sections(j, ab_sections):
+                    if is_frame_number_in_ab_sections(global_frame_idx, ab_sections):
                         for k in range(len(inpaint_area)):
-                            # 裁剪、缩放并添加到帧字典
                             image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], :, :]
-                            image_resize = cv2.resize(image_crop, (self.sttn_inpaint.model_input_width, self.sttn_inpaint.model_input_height))
+                            image_resize = cv2.resize(
+                                image_crop,
+                                (self.sttn_inpaint.model_input_width, self.sttn_inpaint.model_input_height),
+                            )
                             frames[k].append(image_resize)
-                
-                # 如果没有读取到有效帧，则跳过当前迭代
+                    global_frame_idx += 1
+
+                valid_frames_count = len(frames_hr)
                 if valid_frames_count == 0:
-                    print(f"Warning: No valid frames found in range {start_f+1}-{end_f}. Skipping this segment.")
-                    continue
-                    
-                # 对每个修复区域运行修复
+                    break
+
+                chunk_idx += 1
+                tqdm.write(
+                    f'Processing chunk {chunk_idx}: frames {global_frame_idx - valid_frames_count + 1}-{global_frame_idx}'
+                )
+
                 for k in range(len(inpaint_area)):
-                    if len(frames[k]) > 0:  # 确保有帧可以处理
+                    if len(frames[k]) > 0:
                         comps[k] = self.sttn_inpaint.inpaint(frames[k])
                     else:
                         comps[k] = []
-                
-                # 如果有要修复的区域
-                if inpaint_area and valid_frames_count > 0:
-                    # 创建一个映射，记录哪些帧被处理了以及它们在frames[k]中的索引
+
+                if inpaint_area:
                     processed_frames_map = {}
                     processed_idx = 0
-                    
-                    # 构建映射关系
-                    for j in range(start_f, end_f):
-                        if j - start_f < valid_frames_count and is_frame_number_in_ab_sections(j, ab_sections):
-                            processed_frames_map[j - start_f] = processed_idx
+                    start_idx = global_frame_idx - valid_frames_count
+                    for local_idx in range(valid_frames_count):
+                        if is_frame_number_in_ab_sections(start_idx + local_idx, ab_sections):
+                            processed_frames_map[local_idx] = processed_idx
                             processed_idx += 1
-                    
-                    # 应用修复结果
-                    for j in range(valid_frames_count):
+
+                    for local_idx in range(valid_frames_count):
                         if input_sub_remover is not None and input_sub_remover.gui_mode:
-                            original_frame = frames_hr[j].copy()
+                            original_frame = frames_hr[local_idx].copy()
                         else:
                             original_frame = None
-                            
-                        frame = frames_hr[j]
-                        
-                        # 只有被处理过的帧才应用修复结果
-                        if j in processed_frames_map:
-                            comp_idx = processed_frames_map[j]
+
+                        frame = frames_hr[local_idx]
+                        if local_idx in processed_frames_map:
+                            comp_idx = processed_frames_map[local_idx]
                             for k in range(len(inpaint_area)):
-                                if comp_idx < len(comps[k]):  # 确保索引有效
-                                    # 将修复的图像重新扩展到原始分辨率，并融合到原始帧
+                                if comp_idx < len(comps[k]):
                                     comp = cv2.resize(comps[k][comp_idx], (frame_info['W_ori'], split_h))
                                     comp = cv2.cvtColor(comp.astype(np.uint8), cv2.COLOR_BGR2RGB)
                                     mask_area = mask[inpaint_area[k][0]:inpaint_area[k][1], :]
-                                    frame[inpaint_area[k][0]:inpaint_area[k][1], :, :] = mask_area * comp + (1 - mask_area) * frame[inpaint_area[k][0]:inpaint_area[k][1], :, :]
-                        
+                                    frame[inpaint_area[k][0]:inpaint_area[k][1], :, :] = (
+                                        mask_area * comp
+                                        + (1 - mask_area) * frame[inpaint_area[k][0]:inpaint_area[k][1], :, :]
+                                    )
+
                         writer.write(frame)
-                        
                         if input_sub_remover is not None:
                             if tbar is not None:
                                 input_sub_remover.update_progress(tbar, increment=1)
                             if original_frame is not None and input_sub_remover.gui_mode:
                                 input_sub_remover.update_preview_with_comp(original_frame, frame)
-                # 每个chunk处理完后清理GPU缓存
+                else:
+                    for frame in frames_hr:
+                        writer.write(frame)
+                        if input_sub_remover is not None and tbar is not None:
+                            input_sub_remover.update_progress(tbar, increment=1)
+
                 del frames_hr, frames, comps
                 gc.collect()
                 if torch.cuda.is_available():
