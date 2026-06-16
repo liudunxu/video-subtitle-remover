@@ -1941,7 +1941,14 @@ def _ensure_h264(video_path, timeout=1800):
 
 
 def _probe_video_info(path):
-    """用 ffprobe 快速获取视频流时长和帧数标签。"""
+    """用 ffprobe 快速获取视频流时长和帧数标签。
+
+    Prefer duration computed from nb_frames / r_frame_rate over the stream's
+    duration tag, because the latter (and the container format duration) can
+    be longer than the number of actually decodable frames. This makes the
+    completeness check compare the remover output against the same frame
+    count that OpenCV/ffmpeg will really produce.
+    """
     try:
         result = subprocess.run(
             [
@@ -1951,7 +1958,7 @@ def _probe_video_info(path):
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "stream=duration,nb_frames",
+                "stream=duration,nb_frames,r_frame_rate",
                 "-of",
                 "json",
                 str(path),
@@ -1962,8 +1969,18 @@ def _probe_video_info(path):
         )
         data = json.loads(result.stdout)
         stream = data.get("streams", [{}])[0]
-        duration = float(stream.get("duration") or 0)
         nb_frames = stream.get("nb_frames")
+        r_frame_rate = stream.get("r_frame_rate")
+        duration = 0.0
+        if nb_frames and r_frame_rate:
+            try:
+                num, den = r_frame_rate.split("/")
+                fps = float(num) / float(den)
+                duration = int(float(nb_frames)) / fps
+            except Exception:
+                pass
+        if duration <= 0:
+            duration = float(stream.get("duration") or 0)
         nb_frames = int(float(nb_frames)) if nb_frames else 0
         return {"duration": duration, "nb_frames": nb_frames}
     except Exception:
