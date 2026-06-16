@@ -988,13 +988,30 @@ def _run_text_trace_refine(video_path, mask_source_path, area, options, progress
         mask = _text_trace_mask(mask_frame, frame, area, options)
         if cv2.countNonZero(mask) > 0:
             radius = int(options.get("post_refine_inpaint_radius") or 4)
-            refined = cv2.inpaint(frame, mask, radius, cv2.INPAINT_TELEA)
             feather = int(options.get("post_refine_feather") or 3)
+            # Inpaint only the subtitle area plus a small boundary pad instead
+            # of the full frame. cv2.inpaint cost scales with image area, so
+            # this is the dominant speedup for high-resolution video while
+            # keeping the visual result identical inside the mask region.
+            pad = max(radius, feather) + 5
+            h, w = frame.shape[:2]
+            y1 = max(0, ymin - pad)
+            y2 = min(h, ymax + pad)
+            x1 = max(0, xmin - pad)
+            x2 = min(w, xmax + pad)
+            inpaint_crop = frame[y1:y2, x1:x2]
+            mask_crop = mask[y1:y2, x1:x2]
+            refined_crop = cv2.inpaint(inpaint_crop, mask_crop, radius, cv2.INPAINT_TELEA)
             if feather > 0:
-                alpha = cv2.GaussianBlur(mask, (0, 0), feather).astype("float32") / 255.0
+                alpha = cv2.GaussianBlur(mask_crop, (0, 0), feather).astype("float32") / 255.0
                 alpha = cv2.merge([alpha, alpha, alpha])
-                return (refined.astype("float32") * alpha + frame.astype("float32") * (1.0 - alpha)).astype("uint8")
-            return refined
+                refined_crop = (
+                    refined_crop.astype("float32") * alpha
+                    + inpaint_crop.astype("float32") * (1.0 - alpha)
+                ).astype("uint8")
+            out = frame.copy()
+            out[y1:y2, x1:x2] = refined_crop
+            return out
         return frame
 
     cpu_count = os.cpu_count() or 1
