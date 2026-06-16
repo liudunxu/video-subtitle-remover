@@ -1816,6 +1816,60 @@ def _run_residual_cleanup(input_video_path, output_video_path, area, options, pr
     return output_path
 
 
+def _pad_video_duration(video_path, target_duration, timeout=600):
+    """Extend `video_path` to at least `target_duration` by freezing the last frame.
+
+    Used when the subtitle remover processes every decodable frame correctly
+    but the source container advertises a slightly longer duration than
+    OpenCV/ffmpeg can decode. Returns the (possibly replaced) path.
+    """
+    import subprocess
+
+    path = Path(video_path)
+    if not path.is_file():
+        return path
+    probe = _probe_video_info(path)
+    current_duration = probe.get("duration") or 0
+    if current_duration <= 0 or current_duration + 0.05 >= target_duration:
+        return path
+    pad_seconds = target_duration - current_duration
+    ffmpeg_path = "ffmpeg"
+    try:
+        from backend import config as _vsr_cfg
+        ffmpeg_path = getattr(_vsr_cfg, "FFMPEG_PATH", "ffmpeg") or "ffmpeg"
+    except Exception:
+        pass
+    padded_path = path.with_name(path.stem + "_padded.mp4")
+    if padded_path.is_file():
+        try:
+            padded_path.unlink()
+        except OSError:
+            pass
+    cmd = [
+        ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(path),
+        "-vf", f"tpad=stop_mode=clone:stop_duration={pad_seconds:.3f}",
+        "-c:a", "copy",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-movflags", "+faststart",
+        str(padded_path),
+    ]
+    with open(os.devnull) as devnull:
+        subprocess.check_output(cmd, stdin=devnull, timeout=timeout)
+    if not padded_path.is_file():
+        raise RequestError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "Failed to pad subtitle remover output to input duration",
+        )
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    padded_path.replace(path)
+    print(f"INFO: _pad_video_duration: padded {pad_seconds:.3f}s to reach {target_duration:.3f}s ({path})")
+    return path
+
+
 def _ensure_h264(video_path, timeout=1800):
     """Re-encode `video_path` to H.264 (libx264) if its video stream is not
     already H.264. Browsers (Chrome/Safari) cannot play mpeg4 / Xvid inside
@@ -2364,6 +2418,23 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
     if input_dur > 3 and output_dur > 0:
         frame_diff = abs(input_info.get("nb_frames", 0) - output_info.get("nb_frames", 0))
         dur_diff = abs(input_dur - output_dur)
+        # If the output is only slightly shorter, pad it by freezing the last
+        # frame rather than failing. This commonly happens when the source
+        # container reports more frames than OpenCV can actually decode, so
+        # the remover writes every decodable frame but the duration is shorter
+        # than the container metadata suggests.
+        if 0.3 < dur_diff <= 2.0 and output_dur < input_dur:
+            print(
+                f"INFO: Subtitle remover output slightly shorter than input; "
+                f"padding {dur_diff:.3f}s by cloning last frame. "
+                f"input={input_info['nb_frames']}f/{input_dur:.2f}s, "
+                f"output={output_info['nb_frames']}f/{output_dur:.2f}s"
+            )
+            output_path = _pad_video_duration(output_path, input_dur)
+            output_info = _probe_video_info(output_path)
+            output_dur = output_info.get("duration") or 0
+            frame_diff = abs(input_info.get("nb_frames", 0) - output_info.get("nb_frames", 0))
+            dur_diff = abs(input_dur - output_dur)
         # 帧数差超过 5% 或时长差超过 1.5 秒视为不完整
         if frame_diff > max(30, input_info.get("nb_frames", 0) * 0.05) or dur_diff > 1.5:
             print(
