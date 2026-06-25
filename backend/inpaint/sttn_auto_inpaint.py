@@ -335,8 +335,10 @@ class STTNAutoInpaint:
             print(f"[phase] sttn_auto: finally start, releasing prefetcher+writer", flush=True)
             if reader:
                 prefetcher.release()
+                print(f"[phase] sttn_auto: prefetcher released", flush=True)
             if writer:
                 writer.release()
+                print(f"[phase] sttn_auto: writer released", flush=True)
             print(f"[phase] sttn_auto: finally done", flush=True)
 
 
