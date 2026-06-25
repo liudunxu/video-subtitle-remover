@@ -389,16 +389,13 @@ class SubtitleRemover:
             else:
                 raise Exception(f'inpaint mode: {config.inpaintMode.value} not implemented')
 
-        _t0 = time.time()
-        print(f"[phase] run: releasing video_cap (elapsed={time.time() - start_time:.1f}s)", flush=True)
         self.video_cap.release()
-        print(f"[phase] run: releasing video_writer/ffmpeg-flush (elapsed={time.time() - start_time:.1f}s)", flush=True)
         self.video_writer.release()
         if not self.is_picture:
             # 将原音频合并到新生成的视频文件中
             print(f"[phase] run: merge_audio_to_video start (elapsed={time.time() - start_time:.1f}s)", flush=True)
             self.merge_audio_to_video()
-            print(f"[phase] run: merge_audio_to_video done (elapsed={time.time() - start_time:.1f}s, step={time.time() - _t0:.1f}s)", flush=True)
+            print(f"[phase] run: merge_audio_to_video done (elapsed={time.time() - start_time:.1f}s)", flush=True)
         self.append_output(tr['Main']['FinishedProcessing'].format(self.video_out_path))
         self.append_output(tr['Main']['ProcessingTime'].format(round(time.time() - start_time)))
         self.isFinished = True
@@ -432,8 +429,6 @@ class SubtitleRemover:
                                  "-acodec", "copy",
                                  "-vn", "-loglevel", "error", temp.name]
         use_shell = True if os.name == "nt" else False
-        _mt0 = time.time()
-        print(f"[phase] merge_audio: extracting audio from source (timeout=600s)", flush=True)
         try:
             subprocess.check_output(audio_extract_command, stdin=open(os.devnull), shell=use_shell, timeout=600)
         except Exception as e:
@@ -441,9 +436,7 @@ class SubtitleRemover:
             self.append_output(tr['Main']['FailToExtractAudio'].format(str(e)))
             return
         else:
-            print(f"[phase] merge_audio: audio extracted ({time.time() - _mt0:.1f}s)", flush=True)
             if os.path.exists(self.video_temp_file.name):
-                print(f"[phase] merge_audio: merging audio into output (timeout=600s)", flush=True)
                 audio_merge_command = [FFmpegCLI.instance().ffmpeg_path,
                                        "-y", "-i", self.video_temp_file.name,
                                        "-i", temp.name,
@@ -456,7 +449,6 @@ class SubtitleRemover:
                     traceback.print_exc()
                     self.append_output(tr['Main']['FailToMergeAudio'].format(str(e)))
                     return
-                print(f"[phase] merge_audio: merge done ({time.time() - _mt0:.1f}s)", flush=True)
             if os.path.exists(temp.name):
                 try:
                     os.remove(temp.name)

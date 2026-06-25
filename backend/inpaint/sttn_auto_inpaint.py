@@ -252,7 +252,6 @@ class STTNAutoInpaint:
                     frames[k] = []
 
                 # Collect one chunk of decodable frames.
-                print(f"[phase] sttn_auto: chunk {chunk_idx + 1} collect start (global_frame_idx={global_frame_idx})", flush=True)
                 for _ in range(effective_clip_gap):
                     success, image = prefetcher.read()
                     if not success or image is None:
@@ -327,19 +326,15 @@ class STTNAutoInpaint:
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-            print(f"[phase] sttn_auto: stream exhausted, exiting main loop (total_chunks={chunk_idx}, frames={global_frame_idx})", flush=True)
+            print(f"[phase] sttn_auto: stream exhausted (chunks={chunk_idx}, frames={global_frame_idx})", flush=True)
         except Exception as e:
             print(f"Error during video processing: {str(e)}")
             # 不抛出异常，允许程序继续执行
         finally:
-            print(f"[phase] sttn_auto: finally start, releasing prefetcher+writer", flush=True)
             if reader:
                 prefetcher.release()
-                print(f"[phase] sttn_auto: prefetcher released", flush=True)
             if writer:
                 writer.release()
-                print(f"[phase] sttn_auto: writer released", flush=True)
-            print(f"[phase] sttn_auto: finally done", flush=True)
 
 
 if __name__ == '__main__':

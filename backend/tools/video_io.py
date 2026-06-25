@@ -9,6 +9,11 @@ import numpy as np
 from .ffmpeg_cli import FFmpegCLI
 
 
+# 单帧解码正常 <100ms（4K 也 <500ms），EOF 挂起时 cap.read() 永不返回。
+# 15s 是 30~100 倍余量，绝不在健康源上误触发，仅在 EOF 挂起时兜底打破死锁。
+_EOF_TIMEOUT = 15
+
+
 class FramePrefetcher:
     """
     后台线程预解码视频帧，使 I/O 与模型推理重叠。
@@ -20,7 +25,6 @@ class FramePrefetcher:
         self._buffer = queue.Queue(maxsize=buffer_size)
         self._stopped = False
         self._read_count = 0
-        self._eof_signaled = False
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
 
@@ -29,12 +33,6 @@ class FramePrefetcher:
             ret, frame = self.cap.read()
             self._buffer.put((ret, frame))
             if not ret:
-                self._eof_signaled = True
-                print(
-                    f"[phase] prefetcher: cap.read EOF after {self._read_count} "
-                    f"frames, sentinel enqueued",
-                    flush=True,
-                )
                 break
             self._read_count += 1
 
@@ -48,10 +46,10 @@ class FramePrefetcher:
         超时后当作 EOF 返回，打破死锁；正常解码单帧远低于超时阈值，不受影响。
         """
         try:
-            return self._buffer.get(timeout=60)
+            return self._buffer.get(timeout=_EOF_TIMEOUT)
         except queue.Empty:
             print(
-                f"[phase] prefetcher: buffer empty for 60s after "
+                f"[phase] prefetcher: no frame for {_EOF_TIMEOUT}s after "
                 f"{self._read_count} frames (cap.read() likely hung at EOF); "
                 f"treating as EOF to break deadlock",
                 flush=True,
@@ -69,7 +67,11 @@ class FramePrefetcher:
                 self._buffer.get_nowait()
         except queue.Empty:
             pass
-        self._thread.join(timeout=5)
+        # 读线程若仍存活，说明它卡在 cap.read()（EOF 挂起）不会退出；
+        # join 只会白等。它是 daemon，随进程退出即可，cap.release()
+        # 在线程阻塞时调用也是安全的（运行时已验证）。
+        if not self._thread.is_alive():
+            self._thread.join(timeout=5)
 
     def release(self):
         self.stop()

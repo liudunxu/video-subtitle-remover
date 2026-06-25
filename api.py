@@ -2431,12 +2431,10 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
             traceback.print_exc()
 
     # 输出完整性校验：防止 GPU 异常导致末尾 chunk 丢失却返回 200
-    print(f"[phase] _run_subtitle_remover: completeness probe start (elapsed={time.time() - _sr_t0:.1f}s)", flush=True)
     input_info = _probe_video_info(video_path)
     output_info = _probe_video_info(output_path)
     input_dur = input_info.get("duration") or 0
     output_dur = output_info.get("duration") or 0
-    print(f"[phase] _run_subtitle_remover: probe done input={input_info.get('nb_frames')}f/{input_dur:.2f}s output={output_info.get('nb_frames')}f/{output_dur:.2f}s (elapsed={time.time() - _sr_t0:.1f}s)", flush=True)
     if input_dur > 3 and output_dur > 0:
         frame_diff = abs(input_info.get("nb_frames", 0) - output_info.get("nb_frames", 0))
         dur_diff = abs(input_dur - output_dur)
@@ -2477,7 +2475,6 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
     # `-vcodec copy`, which preserves cv2's mp4v fourcc and produces
     # mpeg4 (Xvid) video — Chrome/Safari can't decode that and silently
     # fall back to audio-only.
-    print(f"[phase] _run_subtitle_remover: ensure_h264 start (elapsed={time.time() - _sr_t0:.1f}s)", flush=True)
     try:
         output_path = _ensure_h264(output_path)
     except Exception as h264_exc:
