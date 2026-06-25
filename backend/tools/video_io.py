@@ -19,6 +19,8 @@ class FramePrefetcher:
         self.cap = video_cap
         self._buffer = queue.Queue(maxsize=buffer_size)
         self._stopped = False
+        self._read_count = 0
+        self._eof_signaled = False
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
 
@@ -27,11 +29,34 @@ class FramePrefetcher:
             ret, frame = self.cap.read()
             self._buffer.put((ret, frame))
             if not ret:
+                self._eof_signaled = True
+                print(
+                    f"[phase] prefetcher: cap.read EOF after {self._read_count} "
+                    f"frames, sentinel enqueued",
+                    flush=True,
+                )
                 break
+            self._read_count += 1
 
     def read(self):
-        """读取下一帧，接口与 cv2.VideoCapture.read() 一致。"""
-        return self._buffer.get()
+        """读取下一帧，接口与 cv2.VideoCapture.read() 一致。
+
+        带超时保护：cv2.VideoCapture.read() 在某些源（moov 声称的帧数
+        大于实际可解码帧数、VFR、损坏尾部）的 EOF 处会挂起不返回，导致
+        后台 _read_loop 永远不会把 (False, None) 哨兵入队，消费方在
+        queue.get() 上永久死锁（表现为进度到 100% 后完全无活动）。
+        超时后当作 EOF 返回，打破死锁；正常解码单帧远低于超时阈值，不受影响。
+        """
+        try:
+            return self._buffer.get(timeout=60)
+        except queue.Empty:
+            print(
+                f"[phase] prefetcher: buffer empty for 60s after "
+                f"{self._read_count} frames (cap.read() likely hung at EOF); "
+                f"treating as EOF to break deadlock",
+                flush=True,
+            )
+            return (False, None)
 
     def get(self, propId):
         return self.cap.get(propId)
