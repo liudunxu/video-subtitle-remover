@@ -46,23 +46,20 @@ train = [
     "tensorboardX",
 ]
 
-# Hardware acceleration - NVIDIA GPU (CUDA 11.8)
-cuda11 = [
-    "paddlepaddle-gpu==3.0.0",
-    "torch==2.7.0",
-    "torchvision==0.22.0",
-    "onnxruntime-gpu==1.20.1",
-]
-
-# Hardware acceleration - NVIDIA GPU (CUDA 12.x)
+# Hardware acceleration - NVIDIA GPU (CUDA 12.6 / cu126)
+# torch 2.8.0 has no cu118 wheel, so CUDA 11.8 is no longer supported.
+# cu126 is the shared CUDA target with OmniVoice (paddlepaddle-gpu 3.0.0
+# tops out at cu126 and has no cu128 wheel).
 cuda12 = [
     "paddlepaddle-gpu==3.0.0",
-    "torch==2.7.0",
-    "torchvision==0.22.0",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
     "onnxruntime-gpu==1.22.0",
 ]
 
 # Hardware acceleration - DirectML (AMD/Intel GPU on Windows)
+# torch_directml pins torch==2.4.1, so this path is intentionally NOT
+# bumped to 2.8.0 and is independent of the CUDA/shared stack.
 directml = [
     "paddlepaddle==3.0.0",
     "torch==2.7.0",
@@ -73,15 +70,15 @@ directml = [
 # CPU only
 cpu = [
     "paddlepaddle==3.0.0",
-    "torch==2.7.0",
-    "torchvision==0.22.0",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
 ]
 
 # macOS (Apple Silicon)
 macos = [
     "paddlepaddle==3.0.0",
-    "torch==2.7.0",
-    "torchvision==0.22.0",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
 ]
 
 [project.urls]

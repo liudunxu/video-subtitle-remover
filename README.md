@@ -116,10 +116,7 @@ cd video-subtitle-remover
 根据您的硬件环境选择对应的安装命令：
 
 ```shell
-# NVIDIA GPU (CUDA 11.8)
-uv sync --extra cuda11
-
-# NVIDIA GPU (CUDA 12.x)
+# NVIDIA GPU (CUDA 12.6 / cu126，与 OmniVoice 共用同一环境)
 uv sync --extra cuda12
 
 # AMD/Intel GPU (Windows DirectML)
