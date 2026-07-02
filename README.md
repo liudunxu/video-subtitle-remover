@@ -145,6 +145,7 @@ uv run python api.py
 API 服务的 `/api/remove-subtitle` 和 `/api/detect-subtitle-area` 支持两种视频输入：
 JSON 里的 `video_url`（HTTP/file/local path）或 `multipart/form-data` 的 `video` 文件字段。
 100MB+ 视频不要用 base64 JSON；远程调用推荐 multipart，参数放在 `payload` JSON 字段。
+检测灵敏度 `ocr_preset` 支持 `default` / `fuzzy` / `ultra` / `multiline` / `aggressive`；其中 `multiline` 会在检测到 3 行及以上字幕时自动启用 STTN 修边和残字兜底修复。
 
 ---
 

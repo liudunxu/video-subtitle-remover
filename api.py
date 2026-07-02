@@ -48,6 +48,7 @@ JOB_TTL_SECONDS = 1800
 # states — keeps the api-server log readable during long removals.
 _last_logged_progress: dict = {}
 _last_logged_progress_LOCK = threading.Lock()
+_MULTILINE_AUTO_OCR_PRESET = "multiline"
 
 
 def _set_job_progress(job_id, phase, percent, stage=""):
@@ -177,6 +178,21 @@ def _bounded_int(value, field_name, default, minimum, maximum):
     return max(minimum, min(maximum, number))
 
 
+def _normalize_ocr_preset_name(value):
+    preset = str(value or "default").strip().lower().replace("-", "_")
+    aliases = {
+        "multi_line": _MULTILINE_AUTO_OCR_PRESET,
+        "three_line": _MULTILINE_AUTO_OCR_PRESET,
+        "three_lines": _MULTILINE_AUTO_OCR_PRESET,
+        "3line": _MULTILINE_AUTO_OCR_PRESET,
+        "3_lines": _MULTILINE_AUTO_OCR_PRESET,
+    }
+    preset = aliases.get(preset, preset)
+    if preset not in _OCR_PRESETS:
+        return "default"
+    return preset
+
+
 def _normalize_options(payload):
     raw_options = payload.get("options")
     if not isinstance(raw_options, dict):
@@ -283,7 +299,7 @@ def _normalize_options(payload):
         "post_refine_diff_threshold": _bounded_int(merged.get("post_refine_diff_threshold"), "post_refine_diff_threshold", 5, 0, 80),
         "post_refine_inpaint_radius": _bounded_int(merged.get("post_refine_inpaint_radius"), "post_refine_inpaint_radius", 4, 1, 12),
         "post_refine_feather": _bounded_int(merged.get("post_refine_feather"), "post_refine_feather", 3, 0, 12),
-        "ocr_preset": str(merged.get("ocr_preset") or "default").strip().lower(),
+        "ocr_preset": _normalize_ocr_preset_name(merged.get("ocr_preset")),
         # Auto residual cleanup tail pass — see _run_residual_cleanup.
         # 默认打开：三行字幕最常见的问题是上下沿残留，字形级二次 inpaint
         # 比 OCR blur 更不容易把整块画面糊掉。调用方仍可显式传 False 关闭。
@@ -724,6 +740,56 @@ def _build_padded_subtitle_detector(base_cls, video_path, area, y_pad, **kwargs)
     return detector
 
 
+def _estimate_subtitle_line_count(coords):
+    """Estimate subtitle row count from OCR bbox Y centers."""
+    centers = []
+    heights = []
+    for coord in coords or []:
+        try:
+            xmin, xmax, ymin, ymax = [int(v) for v in coord]
+        except (TypeError, ValueError):
+            continue
+        width = xmax - xmin
+        height = ymax - ymin
+        if width < 4 or height < 4:
+            continue
+        # Hard subtitles are horizontal; drop obvious vertical false positives.
+        if height > max(width * 2, 12):
+            continue
+        centers.append((ymin + ymax) / 2.0)
+        heights.append(height)
+    if not centers:
+        return 0
+
+    heights.sort()
+    median_height = heights[len(heights) // 2]
+    line_threshold = max(8.0, min(42.0, median_height * 0.75))
+    groups = []
+    for center_y in sorted(centers):
+        if groups and abs(center_y - groups[-1]["center"]) <= line_threshold:
+            group = groups[-1]
+            group["count"] += 1
+            group["center"] += (center_y - group["center"]) / group["count"]
+        else:
+            groups.append({"center": center_y, "count": 1})
+    return len(groups)
+
+
+def _max_subtitle_line_count(subtitle_frame_no_box_dict):
+    max_lines = 0
+    max_frame_no = None
+    for frame_no, coords in (subtitle_frame_no_box_dict or {}).items():
+        line_count = _estimate_subtitle_line_count(coords)
+        if line_count > max_lines:
+            max_lines = line_count
+            max_frame_no = frame_no
+    return max_lines, max_frame_no
+
+
+def _uses_multiline_auto_strategy(options):
+    return str(options.get("ocr_preset") or "") == _MULTILINE_AUTO_OCR_PRESET
+
+
 def _run_blur_cover(video_path, area, options, ocr_preset=None):
     """模糊覆盖模式：自动检测字幕位置并应用高斯模糊。
 
@@ -750,15 +816,11 @@ def _run_blur_cover(video_path, area, options, ocr_preset=None):
     blur_temporal_window = max(0, int(options.get("blur_temporal_window") or 3))
     ocr_bbox_y_pad = max(0, int(options.get("ocr_bbox_y_pad") or 0))
 
-    ocr_preset_name = str(options.get("ocr_preset") or "default").strip().lower()
+    ocr_preset_name = _normalize_ocr_preset_name(options.get("ocr_preset"))
     det_db_thresh = None
     det_db_box_thresh = None
     det_limit_side_len = None
-    if ocr_preset_name in ("ultra", "aggressive") and ocr_preset:
-        det_db_thresh = ocr_preset.get("det_db_thresh")
-        det_db_box_thresh = ocr_preset.get("det_db_box_thresh")
-        det_limit_side_len = ocr_preset.get("det_limit_side_len")
-    elif ocr_preset_name == "fuzzy" and ocr_preset:
+    if ocr_preset_name != "default" and ocr_preset:
         det_db_thresh = ocr_preset.get("det_db_thresh")
         det_db_box_thresh = ocr_preset.get("det_db_box_thresh")
         det_limit_side_len = ocr_preset.get("det_limit_side_len")
@@ -2286,6 +2348,8 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
     _patch_numpy_compat()
     from backend.main import SubtitleRemover, SubtitleDetect
     from backend import config
+    options = dict(options)
+    options["ocr_preset"] = _normalize_ocr_preset_name(options.get("ocr_preset"))
 
     def _report(phase, percent, stage=""):
         if progress_callback is not None:
@@ -2297,7 +2361,7 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
     if options["mode"] == "sttn":
         _patch_sttn_none_safe_and_quality()
 
-    ocr_preset_name = str(options.get("ocr_preset") or "default").strip().lower()
+    ocr_preset_name = options["ocr_preset"]
     ocr_preset = _OCR_PRESETS.get(ocr_preset_name, _OCR_PRESETS["default"])
     ocr_bbox_y_pad = max(0, int(options.get("ocr_bbox_y_pad") or 0))
     need_ocr_override = (
@@ -2308,17 +2372,15 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
 
     old_values = {}
     last_exc = None
-    has_refine = bool(options.get("post_lama_refine") and options["mode"] == "sttn")
-    has_residual_tail = bool(
-        options["mode"] != "blur_cover"
-        and options.get("auto_residual_cleanup", False)
-    )
-    has_verify_tail = bool(options.get("post_verify_blur", False))
-    has_tail = has_residual_tail or has_verify_tail
-    main_scale_end = 70.0 if has_refine else (90.0 if has_tail else 100.0)
+    has_refine = False
+    has_residual_tail = False
+    has_verify_tail = False
+    has_tail = False
+    main_scale_end = 100.0
     remover = None
     poller_stop = None
     phase_label = "sttn" if options["mode"] == "sttn" else options["mode"]
+    use_multiline_auto_strategy = _uses_multiline_auto_strategy(options)
     for attempt in range(2):
         remover = SubtitleRemover(str(video_path), sub_area=area)
         detector_kwargs = {}
@@ -2366,10 +2428,33 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
                 )
                 config.STTN_SKIP_DETECTION = True
             else:
+                if use_multiline_auto_strategy and peek_list:
+                    max_lines, max_line_frame = _max_subtitle_line_count(peek_list)
+                    if max_lines >= 3:
+                        options["post_lama_refine"] = True
+                        options["auto_residual_cleanup"] = True
+                        print(
+                            "INFO: multiline OCR preset detected "
+                            f"{max_lines} subtitle lines on frame {max_line_frame}; "
+                            "enabling post_lama_refine and auto_residual_cleanup"
+                        )
+                    else:
+                        print(
+                            "INFO: multiline OCR preset did not find 3-line subtitles "
+                            f"(max_lines={max_lines}); using normal repair chain"
+                        )
                 # Restore whatever the original value was so a non-empty
                 # detector result doesn't accidentally trigger skip mode
                 # later if a downstream pass re-reads config.
                 config.STTN_SKIP_DETECTION = bool(options.get("sttn_skip_detection", False))
+        has_refine = bool(options.get("post_lama_refine") and options["mode"] == "sttn")
+        has_residual_tail = bool(
+            options["mode"] != "blur_cover"
+            and options.get("auto_residual_cleanup", False)
+        )
+        has_verify_tail = bool(options.get("post_verify_blur", False))
+        has_tail = has_residual_tail or has_verify_tail
+        main_scale_end = 70.0 if has_refine else (90.0 if has_tail else 100.0)
         _report(phase_label, 0.0, "starting")
         _sr_t0 = time.time()
         print(f"[phase] _run_subtitle_remover: main inpaint start (mode={options['mode']})", flush=True)
@@ -2587,9 +2672,7 @@ def _normalize_detect_options(payload):
         "max_boxes",
         "ocr_preset",
     }}}
-    ocr_preset_raw = str(merged.get("ocr_preset") or "default").strip().lower()
-    if ocr_preset_raw not in _OCR_PRESETS:
-        ocr_preset_raw = "default"
+    ocr_preset_raw = _normalize_ocr_preset_name(merged.get("ocr_preset"))
     return {
         "sample_count": _bounded_int(
             merged.get("sample_count", merged.get("detect_sample_count")),
@@ -2836,6 +2919,15 @@ _OCR_PRESETS = {
         "det_db_thresh": 0.02,
         "det_db_box_thresh": 0.05,
         "det_limit_side_len": 1920,
+        "detect_max_edge": 2400,
+    },
+    "multiline": {
+        # New sensitivity option for tall / 3+ line subtitle stacks.
+        # It is slightly more sensitive than fuzzy and also activates the
+        # multiline auto-repair strategy in _run_subtitle_remover.
+        "det_db_thresh": 0.03,
+        "det_db_box_thresh": 0.08,
+        "det_limit_side_len": 2400,
         "detect_max_edge": 2400,
     },
     "aggressive": {
