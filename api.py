@@ -1,4 +1,5 @@
 import argparse
+import cgi
 import json
 import mimetypes
 import multiprocessing
@@ -30,6 +31,7 @@ WORK_DIR = Path(
     )
 ).resolve()
 MAX_BODY_BYTES = 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.environ.get("VSR_API_MAX_UPLOAD_MB", "2048")) * 1024 * 1024
 MAX_DOWNLOAD_BYTES = int(os.environ.get("VSR_API_MAX_DOWNLOAD_MB", "2048")) * 1024 * 1024
 DOWNLOAD_TIMEOUT_SECONDS = int(os.environ.get("VSR_API_DOWNLOAD_TIMEOUT", "300"))
 PROCESS_LOCK = threading.Lock()
@@ -394,6 +396,88 @@ def _read_json(handler):
     if not isinstance(payload, dict):
         raise RequestError(HTTPStatus.BAD_REQUEST, "JSON body must be an object")
     return payload
+
+
+def _maybe_json_field(value):
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return value
+    if text[0] not in "[{":
+        return value
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return value
+
+
+def _read_multipart(handler, job_dir):
+    content_length = handler.headers.get("Content-Length")
+    if content_length is None:
+        raise RequestError(HTTPStatus.LENGTH_REQUIRED, "Content-Length is required")
+    try:
+        body_size = int(content_length)
+    except ValueError:
+        raise RequestError(HTTPStatus.BAD_REQUEST, "Invalid Content-Length")
+    if body_size > MAX_UPLOAD_BYTES:
+        limit_mb = MAX_UPLOAD_BYTES // 1024 // 1024
+        raise RequestError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, f"Upload exceeds {limit_mb} MB")
+
+    content_type = handler.headers.get("Content-Type") or ""
+    if "multipart/form-data" not in content_type.lower():
+        raise RequestError(HTTPStatus.BAD_REQUEST, "Content-Type must be multipart/form-data")
+
+    form = cgi.FieldStorage(
+        fp=handler.rfile,
+        headers=handler.headers,
+        environ={
+            "REQUEST_METHOD": "POST",
+            "CONTENT_TYPE": content_type,
+            "CONTENT_LENGTH": str(body_size),
+        },
+        keep_blank_values=True,
+    )
+    payload = {}
+    uploaded_path = None
+    for key in form.keys():
+        field = form[key]
+        fields = field if isinstance(field, list) else [field]
+        for item in fields:
+            filename = getattr(item, "filename", None)
+            if filename:
+                if key not in {"video", "file", "video_file"}:
+                    raise RequestError(HTTPStatus.BAD_REQUEST, f"Unsupported file field: {key}")
+                target_path = job_dir / _safe_filename(filename, "input.mp4")
+                with target_path.open("wb") as output:
+                    shutil.copyfileobj(item.file, output, length=1024 * 1024)
+                if target_path.stat().st_size == 0:
+                    raise RequestError(HTTPStatus.BAD_REQUEST, "Uploaded video is empty")
+                uploaded_path = target_path
+                payload["filename"] = target_path.name
+                continue
+
+            value = item.value
+            if key in {"payload", "json", "metadata"}:
+                parsed = _maybe_json_field(value)
+                if not isinstance(parsed, dict):
+                    raise RequestError(HTTPStatus.BAD_REQUEST, f"{key} must be a JSON object")
+                payload.update(parsed)
+            else:
+                payload[key] = _maybe_json_field(value)
+
+    if uploaded_path is not None:
+        payload["_uploaded_video_path"] = str(uploaded_path)
+    return payload
+
+
+def _read_payload(handler, job_dir=None):
+    content_type = (handler.headers.get("Content-Type") or "").lower()
+    if content_type.startswith("multipart/form-data"):
+        if job_dir is None:
+            raise RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "job_dir is required for multipart uploads")
+        return _read_multipart(handler, job_dir)
+    return _read_json(handler)
 
 
 def _download_http_url(video_url, target_path):
@@ -2967,8 +3051,18 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
             except Exception:
                 provided_job_id = ""
 
+        content_type = (self.headers.get("Content-Type") or "").lower()
+        is_multipart = content_type.startswith("multipart/form-data")
+        job_id = provided_job_id or (uuid.uuid4().hex if is_multipart else "")
+        job_dir = WORK_DIR / "jobs" / job_id if job_id else None
+        if job_dir is not None:
+            try:
+                job_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                # Caller reused a job_id; reuse the existing directory.
+                pass
         try:
-            payload = _read_json(self)
+            payload = _read_payload(self, job_dir)
         except RequestError as exc:
             # Body parse failed with a structured 4xx (missing/oversized
             # Content-Length, bad JSON, body not an object). The previous
@@ -2976,31 +3070,48 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
             # and left the client with a connection reset / no HTTP body.
             # Send a real response so the dub web app can surface the
             # upstream cause to the user.
+            try:
+                if job_dir is not None and job_dir.exists():
+                    shutil.rmtree(job_dir, ignore_errors=True)
+            except Exception:
+                pass
             self._send_json(exc.status, {"error": exc.message})
             return
         except Exception as exc:
+            try:
+                if job_dir is not None and job_dir.exists():
+                    shutil.rmtree(job_dir, ignore_errors=True)
+            except Exception:
+                pass
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Invalid request body: {exc}"})
             return
-        if not provided_job_id and isinstance(payload, dict):
+        if not job_id and isinstance(payload, dict):
             provided_job_id = str(payload.get("progress_job_id") or "").strip()
-        job_id = provided_job_id or uuid.uuid4().hex
-        job_dir = WORK_DIR / "jobs" / job_id
-        try:
-            job_dir.mkdir(parents=True, exist_ok=False)
-        except FileExistsError:
-            # Caller reused a job_id; reuse the existing directory.
-            pass
+            job_id = provided_job_id or uuid.uuid4().hex
+            job_dir = WORK_DIR / "jobs" / job_id
+            try:
+                job_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                pass
 
         try:
+            uploaded_video_path = payload.get("_uploaded_video_path")
             video_url = payload.get("video_url") or payload.get("url")
-            if not isinstance(video_url, str) or not video_url.strip():
+            if uploaded_video_path:
+                source_path = Path(str(uploaded_video_path)).resolve()
+                if not source_path.is_file():
+                    raise RequestError(HTTPStatus.BAD_REQUEST, "Uploaded video is missing")
+            elif not isinstance(video_url, str) or not video_url.strip():
                 raise RequestError(HTTPStatus.BAD_REQUEST, "video_url is required")
+            else:
+                source_path = None
 
             filename_hint = _safe_filename(str(payload.get("filename") or "input.mp4"))
             area = _normalize_area(payload)
             options = _normalize_options(payload)
             refine_area = _normalize_refine_area(payload) if options.get("post_lama_refine") else None
-            source_path = _stage_video(video_url.strip(), job_dir, filename_hint)
+            if source_path is None:
+                source_path = _stage_video(video_url.strip(), job_dir, filename_hint)
 
             def _job_progress(phase, percent, stage=""):
                 _set_job_progress(job_id, phase, percent, stage)
@@ -3114,15 +3225,23 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
             pass
 
         try:
-            payload = _read_json(self)
+            payload = _read_payload(self, job_dir)
+            uploaded_video_path = payload.get("_uploaded_video_path")
             video_url = payload.get("video_url") or payload.get("url")
-            if not isinstance(video_url, str) or not video_url.strip():
+            if uploaded_video_path:
+                source_path = Path(str(uploaded_video_path)).resolve()
+                if not source_path.is_file():
+                    raise RequestError(HTTPStatus.BAD_REQUEST, "Uploaded video is missing")
+            elif not isinstance(video_url, str) or not video_url.strip():
                 raise RequestError(HTTPStatus.BAD_REQUEST, "video_url is required")
+            else:
+                source_path = None
 
             filename_hint = _safe_filename(str(payload.get("filename") or "input.mp4"))
             area = _normalize_area(payload)
             detect_options = _normalize_detect_options(payload)
-            source_path = _stage_video(video_url.strip(), job_dir, filename_hint)
+            if source_path is None:
+                source_path = _stage_video(video_url.strip(), job_dir, filename_hint)
 
             with PROCESS_LOCK:
                 result = _run_subtitle_area_detection(source_path, area, detect_options)
@@ -3136,6 +3255,11 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
             )
             self._send_json(HTTPStatus.OK, result)
         except RequestError as exc:
+            try:
+                if job_dir.exists():
+                    shutil.rmtree(job_dir, ignore_errors=True)
+            except Exception:
+                pass
             self._send_json(exc.status, {"error": exc.message})
         except Exception as exc:
             # Print the full traceback to BOTH stderr (default) and stdout

@@ -142,6 +142,10 @@ uv run python ./backend/main.py
 uv run python api.py
 ```
 
+API 服务的 `/api/remove-subtitle` 和 `/api/detect-subtitle-area` 支持两种视频输入：
+JSON 里的 `video_url`（HTTP/file/local path）或 `multipart/form-data` 的 `video` 文件字段。
+100MB+ 视频不要用 base64 JSON；远程调用推荐 multipart，参数放在 `payload` JSON 字段。
+
 ---
 
 ### 方式二：使用传统 pip
