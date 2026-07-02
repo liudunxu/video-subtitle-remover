@@ -745,9 +745,15 @@ def _build_padded_subtitle_detector(base_cls, video_path, area, y_pad, **kwargs)
 
 
 def _estimate_subtitle_line_count(coords):
-    """Estimate subtitle row count from OCR bbox Y centers."""
-    centers = []
-    heights = []
+    """Estimate subtitle row count from OCR bbox vertical bands.
+
+    PaddleOCR often splits one rendered subtitle line into several text boxes
+    with slightly different y centers (strokes, punctuation, descenders). A
+    center-only clustering threshold can then turn a real 2-line subtitle into
+    3 lines. Group by vertical overlap first, then use a center-distance
+    fallback for same-line fragments.
+    """
+    boxes = []
     for coord in coords or []:
         try:
             xmin, xmax, ymin, ymax = [int(v) for v in coord]
@@ -760,22 +766,40 @@ def _estimate_subtitle_line_count(coords):
         # Hard subtitles are horizontal; drop obvious vertical false positives.
         if height > max(width * 2, 12):
             continue
-        centers.append((ymin + ymax) / 2.0)
-        heights.append(height)
-    if not centers:
+        boxes.append({"ymin": ymin, "ymax": ymax, "center": (ymin + ymax) / 2.0, "height": height, "width": width})
+    if not boxes:
         return 0
 
-    heights.sort()
+    heights = sorted(b["height"] for b in boxes)
     median_height = heights[len(heights) // 2]
-    line_threshold = max(8.0, min(42.0, median_height * 0.75))
+    min_fragment_height = max(4.0, median_height * 0.35)
+    boxes = [b for b in boxes if b["height"] >= min_fragment_height]
+    if not boxes:
+        return 0
+
+    center_threshold = max(10.0, min(42.0, median_height * 0.8))
+    overlap_threshold = max(3.0, median_height * 0.25)
     groups = []
-    for center_y in sorted(centers):
-        if groups and abs(center_y - groups[-1]["center"]) <= line_threshold:
-            group = groups[-1]
-            group["count"] += 1
-            group["center"] += (center_y - group["center"]) / group["count"]
-        else:
-            groups.append({"center": center_y, "count": 1})
+    for box in sorted(boxes, key=lambda b: (b["center"], b["ymin"])):
+        matched = None
+        for group in groups:
+            overlap = min(box["ymax"], group["ymax"]) - max(box["ymin"], group["ymin"])
+            center_gap = abs(box["center"] - group["center"])
+            if overlap >= overlap_threshold or center_gap <= center_threshold:
+                matched = group
+                break
+        if matched is None:
+            groups.append({
+                "ymin": box["ymin"],
+                "ymax": box["ymax"],
+                "center": box["center"],
+                "count": 1,
+            })
+            continue
+        matched["count"] += 1
+        matched["ymin"] = min(matched["ymin"], box["ymin"])
+        matched["ymax"] = max(matched["ymax"], box["ymax"])
+        matched["center"] += (box["center"] - matched["center"]) / matched["count"]
     return len(groups)
 
 
