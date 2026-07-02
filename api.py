@@ -36,7 +36,7 @@ MAX_DOWNLOAD_BYTES = int(os.environ.get("VSR_API_MAX_DOWNLOAD_MB", "2048")) * 10
 DOWNLOAD_TIMEOUT_SECONDS = int(os.environ.get("VSR_API_DOWNLOAD_TIMEOUT", "300"))
 PROCESS_LOCK = threading.Lock()
 # Live progress registry: {job_id: {phase, percent, stage, updated_at}}
-#   phase: "sttn" | "refine" | "stitch" | "finalize" | "done" | "error"
+#   phase: "sttn" | "refine" | "residual" | "stitch" | "finalize" | "done" | "error"
 #   percent: 0-100 (within the current phase, except for the very first "sttn"
 #            phase which we report on a 0-70 scale and the refine pass on
 #            70-95 so the caller can render a continuous bar).
@@ -244,6 +244,8 @@ def _normalize_options(payload):
         "residual_dark_nbhd_radius",
     }}}
     mode = str(merged.get("mode") or merged.get("inpaint_mode") or "sttn").strip().lower().replace("-", "_")
+    explicit_post_lama_refine = "post_lama_refine" in merged
+    explicit_auto_residual_cleanup = "auto_residual_cleanup" in merged
     post_lama_refine = _to_bool(merged.get("post_lama_refine", False))
     # Historical aliases for the STTN+LaMa refine mode. `sttn_lama` /
     # `sttn_lama_refine` were folded into `sttn_then_lama` — kept the
@@ -287,6 +289,7 @@ def _normalize_options(payload):
         "lama_super_fast": _to_bool(merged.get("lama_super_fast", False)),
         "propainter_max_load_num": _bounded_int(merged.get("propainter_max_load_num"), "propainter_max_load_num", 70, 2, 180),
         "post_lama_refine": post_lama_refine,
+        "_explicit_post_lama_refine": explicit_post_lama_refine,
         "post_refine_method": str(merged.get("post_refine_method") or "telea_text").strip().lower().replace("-", "_"),
         # Aggressive defaults so frames with clear subtitles get cleaned
         # thoroughly on the first pass. See the post_lama_refine tuning
@@ -301,9 +304,10 @@ def _normalize_options(payload):
         "post_refine_feather": _bounded_int(merged.get("post_refine_feather"), "post_refine_feather", 3, 0, 12),
         "ocr_preset": _normalize_ocr_preset_name(merged.get("ocr_preset")),
         # Auto residual cleanup tail pass — see _run_residual_cleanup.
-        # 默认打开：三行字幕最常见的问题是上下沿残留，字形级二次 inpaint
-        # 比 OCR blur 更不容易把整块画面糊掉。调用方仍可显式传 False 关闭。
-        "auto_residual_cleanup": _to_bool(merged.get("auto_residual_cleanup", True)),
+        # Default is off. The multiline OCR preset may enable it internally
+        # for only the frames where 3+ subtitle lines were detected.
+        "auto_residual_cleanup": _to_bool(merged.get("auto_residual_cleanup", False)),
+        "_explicit_auto_residual_cleanup": explicit_auto_residual_cleanup,
         "residual_inpaint_radius": _bounded_int(merged.get("residual_inpaint_radius"), "residual_inpaint_radius", 7, 2, 12),
         "residual_max_passes": _bounded_int(merged.get("residual_max_passes"), "residual_max_passes", 3, 1, 4),
         "residual_dilate_iters": _bounded_int(merged.get("residual_dilate_iters"), "residual_dilate_iters", 2, 0, 4),
@@ -786,6 +790,17 @@ def _max_subtitle_line_count(subtitle_frame_no_box_dict):
     return max_lines, max_frame_no
 
 
+def _subtitle_frames_with_min_lines(subtitle_frame_no_box_dict, min_lines=3):
+    frames = []
+    for frame_no, coords in (subtitle_frame_no_box_dict or {}).items():
+        if _estimate_subtitle_line_count(coords) >= int(min_lines or 3):
+            try:
+                frames.append(int(frame_no))
+            except (TypeError, ValueError):
+                continue
+    return sorted(set(frames))
+
+
 def _uses_multiline_auto_strategy(options):
     return str(options.get("ocr_preset") or "") == _MULTILINE_AUTO_OCR_PRESET
 
@@ -1176,6 +1191,12 @@ def _run_text_trace_refine(video_path, mask_source_path, area, options, progress
     pending = []  # list of (frame_no, future) in submit order
     frame_no = 0
     last_reported = -1
+    frame_filter = {
+        int(v) for v in (options.get("post_lama_refine_frame_filter") or [])
+        if str(v).strip().lstrip("-").isdigit()
+    }
+    if frame_filter:
+        print(f"INFO: text_trace_refine: frame filter active ({len(frame_filter)} multiline frames)")
 
     def _drain_buffer():
         """Wait for in-order futures and write them out. Returns the
@@ -1201,6 +1222,14 @@ def _run_text_trace_refine(video_path, mask_source_path, area, options, progress
             mask_ret, mask_frame = mask_cap.read() if mask_cap.isOpened() else (False, None)
             if not mask_ret or mask_frame is None or mask_frame.shape[:2] != frame.shape[:2]:
                 mask_frame = frame
+            if frame_filter and frame_no not in frame_filter:
+                writer.write(frame)
+                if frame_count > 0:
+                    current_pct = int(100 * frame_no / frame_count)
+                    if current_pct != last_reported:
+                        _report(current_pct, "inpainting")
+                        last_reported = current_pct
+                continue
             fut = executor.submit(_inpaint_one_frame, frame, mask_frame, area, options)
             pending.append((frame_no, fut))
             if len(pending) >= chunk_depth:
@@ -1862,7 +1891,7 @@ def _run_residual_cleanup(input_video_path, output_video_path, area, options, pr
             return
         try:
             scaled = start_percent + (pct_int / 100.0) * (end_percent - start_percent)
-            progress_callback("refine", scaled, stage)
+            progress_callback("residual", scaled, stage)
         except Exception:
             pass
 
@@ -1870,12 +1899,26 @@ def _run_residual_cleanup(input_video_path, output_video_path, area, options, pr
     passes_used = 0
     frames_with_residual = 0
     frame_no = 0
+    frame_filter = {
+        int(v) for v in (options.get("auto_residual_cleanup_frame_filter") or [])
+        if str(v).strip().lstrip("-").isdigit()
+    }
+    if frame_filter:
+        print(f"INFO: residual_cleanup: frame filter active ({len(frame_filter)} multiline frames)")
     try:
         while True:
             ret, frame = src_cap.read()
             if not ret or frame is None:
                 break
             frame_no += 1
+            if frame_filter and frame_no not in frame_filter:
+                writer.write(frame)
+                if frame_count > 0:
+                    current_pct = int(100 * frame_no / frame_count)
+                    if current_pct != last_pct:
+                        _report(current_pct, "residual_cleaning")
+                        last_pct = current_pct
+                continue
             crop = frame[ymin:ymax, xmin:xmax]
             if crop.size == 0:
                 writer.write(frame)
@@ -2431,12 +2474,21 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
                 if use_multiline_auto_strategy and peek_list:
                     max_lines, max_line_frame = _max_subtitle_line_count(peek_list)
                     if max_lines >= 3:
-                        options["post_lama_refine"] = True
-                        options["auto_residual_cleanup"] = True
+                        multiline_frames = _subtitle_frames_with_min_lines(peek_list, min_lines=3)
+                        enabled_parts = []
+                        if not options.get("_explicit_post_lama_refine"):
+                            options["post_lama_refine"] = True
+                            options["post_lama_refine_frame_filter"] = multiline_frames
+                            enabled_parts.append("post_lama_refine")
+                        if not options.get("_explicit_auto_residual_cleanup"):
+                            options["auto_residual_cleanup"] = True
+                            options["auto_residual_cleanup_frame_filter"] = multiline_frames
+                            enabled_parts.append("auto_residual_cleanup")
+                        enabled_text = " and ".join(enabled_parts) if enabled_parts else "no repair tails (explicit options preserved)"
                         print(
                             "INFO: multiline OCR preset detected "
                             f"{max_lines} subtitle lines on frame {max_line_frame}; "
-                            "enabling post_lama_refine and auto_residual_cleanup"
+                            f"enabling {enabled_text} for {len(multiline_frames)} multiline frame(s)"
                         )
                     else:
                         print(
@@ -2546,7 +2598,7 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
             residual_tmp = output_path.with_name(output_path.stem + "_residual.mp4")
             residual_start = 90.0
             residual_end = 97.0 if has_verify_tail else 99.0
-            _report("refine", residual_start, "residual_starting")
+            _report("residual", residual_start, "residual_starting")
             residual_output = _run_residual_cleanup(
                 output_path, residual_tmp, area, options,
                 progress_callback=progress_callback,
@@ -2558,7 +2610,7 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
             except OSError:
                 pass
             residual_output.replace(output_path)
-            _report("refine", residual_end, "residual_done")
+            _report("residual", residual_end, "residual_done")
         except Exception as residual_exc:
             # Residual cleanup is best-effort: if it fails (e.g. cv2 import
             # blip, decoder error on the upstream mp4), log and keep the
@@ -3236,6 +3288,7 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                         "blur_cover": "模糊覆盖",
                         "lama": "LAMA 擦除",
                         "refine": "STTN 修边",
+                        "residual": "残字兜底修复",
                         "stitch": "合并片段",
                         "finalize": "回灌音频",
                         "done": "完成",
