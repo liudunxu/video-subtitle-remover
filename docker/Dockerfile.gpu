@@ -1,0 +1,112 @@
+# syntax=docker/dockerfile:1.7
+
+FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG TORCH_VERSION=2.8.0
+ARG TORCHVISION_VERSION=0.23.0
+ARG PADDLE_VERSION=3.0.0
+ARG PADDLEX_VERSION=3.4.0
+ARG ONNXRUNTIME_GPU_VERSION=1.22.0
+ARG TORCH_CUDA_INDEX=https://download.pytorch.org/whl/cu126
+ARG PADDLE_CUDA_INDEX=https://www.paddlepaddle.org.cn/packages/stable/cu126/
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH \
+    HOST=0.0.0.0 \
+    PORT=6006 \
+    HOME=/workspace \
+    XDG_CACHE_HOME=/workspace/.cache \
+    MPLCONFIGDIR=/workspace/.cache/matplotlib \
+    VSR_API_WORK_DIR=/workspace/video_subtitle_remover_api \
+    VSR_REQUIRE_GPU=1 \
+    FLAGS_cudnn_deterministic=1 \
+    FLAGS_cudnn_exhaustive_search=0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    ffmpeg \
+    git \
+    libdbus-1-3 \
+    libegl1 \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    libsm6 \
+    libxext6 \
+    libxkbcommon0 \
+    libxrender1 \
+    python3 \
+    python3-dev \
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/venv \
+    && ln -sf /usr/bin/python3 /usr/local/bin/python3-system \
+    && python -m pip install --upgrade pip setuptools wheel
+
+WORKDIR /app
+
+COPY requirements.txt pyproject.toml README.md api.py /app/
+COPY backend/ /app/backend/
+COPY docker/entrypoint-api-gpu.sh /usr/local/bin/vsr-api-gpu-entrypoint
+
+RUN chmod +x /usr/local/bin/vsr-api-gpu-entrypoint \
+    && chmod +x /app/backend/ffmpeg/linux_x64/ffmpeg
+
+# Install GPU builds explicitly. PaddleOCR 3.4.0 uses PaddleX internally, so
+# PaddleX is pinned near that stack instead of floating to the latest release.
+RUN python -m pip install \
+    torch==${TORCH_VERSION} \
+    torchvision==${TORCHVISION_VERSION} \
+    --index-url ${TORCH_CUDA_INDEX} \
+    --extra-index-url https://pypi.org/simple
+
+RUN python -m pip install \
+    paddlepaddle-gpu==${PADDLE_VERSION} \
+    --extra-index-url ${PADDLE_CUDA_INDEX}
+
+RUN python -m pip install \
+    onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION} \
+    paddlex==${PADDLEX_VERSION} \
+    -r requirements.txt
+
+RUN mkdir -p /workspace/.cache/matplotlib /workspace/video_subtitle_remover_api
+
+# Build-time import checks catch accidental CPU wheels or missing PaddleX/HPI
+# packages before the image reaches Vast.ai. Runtime GPU visibility is checked
+# again by the entrypoint because Docker builds usually do not expose a GPU.
+RUN python - <<'PY'
+import onnxruntime as ort
+import paddle
+import paddlex
+import paddleocr
+import torch
+from paddle import inference  # noqa: F401
+
+if not torch.version.cuda:
+    raise SystemExit("torch is not a CUDA build")
+if not paddle.device.is_compiled_with_cuda():
+    raise SystemExit("paddlepaddle is not a CUDA build")
+providers = ort.get_available_providers()
+if "CUDAExecutionProvider" not in providers:
+    raise SystemExit(f"onnxruntime-gpu CUDA provider missing: {providers}")
+
+print("GPU package checks passed:")
+print(f"  torch={torch.__version__} cuda={torch.version.cuda}")
+print(f"  paddle={paddle.__version__} cuda_build={paddle.device.is_compiled_with_cuda()}")
+print(f"  onnxruntime_providers={providers}")
+print(f"  paddleocr={getattr(paddleocr, '__version__', 'unknown')}")
+print(f"  paddlex={getattr(paddlex, '__version__', 'unknown')}")
+PY
+
+EXPOSE 6006
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('PORT', '6006'), timeout=3).read()"
+
+ENTRYPOINT ["/usr/local/bin/vsr-api-gpu-entrypoint"]
