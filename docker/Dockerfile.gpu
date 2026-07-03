@@ -18,6 +18,7 @@ ENV PYTHONUNBUFFERED=1 \
     MPLCONFIGDIR=/workspace/.cache/matplotlib \
     VSR_API_WORK_DIR=/workspace/video_subtitle_remover_api \
     VSR_REQUIRE_GPU=1 \
+    PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
     FLAGS_cudnn_deterministic=1 \
     FLAGS_cudnn_exhaustive_search=0
 
@@ -60,6 +61,8 @@ RUN python -m pip install \
     onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION} \
     paddlex==${PADDLEX_VERSION} \
     -r requirements.txt
+
+RUN python -m pip install --force-reinstall "numpy==1.26.4"
 
 # Paddle 3.0's wheel metadata pins older CUDA Python packages than the PyTorch
 # 2.8 CUDA 12.6 image. Restore PyTorch's exact runtime library pins after Paddle
