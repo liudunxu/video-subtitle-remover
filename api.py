@@ -2747,16 +2747,24 @@ def _normalize_detect_options(payload):
         "raw_area_buffer_y",
         "max_boxes",
         "ocr_preset",
+        "crop_to_band",
+        "band_extra_pct",
+        "early_stop_hit_frames",
+        "non_hpi_fast",
     }}}
     ocr_preset_raw = _normalize_ocr_preset_name(merged.get("ocr_preset"))
+    sample_count_value = merged.get("sample_count", merged.get("detect_sample_count"))
+    crop_to_band_value = merged.get("crop_to_band")
+    early_stop_hit_frames_value = merged.get("early_stop_hit_frames")
     return {
         "sample_count": _bounded_int(
-            merged.get("sample_count", merged.get("detect_sample_count")),
+            sample_count_value,
             "sample_count",
             72,
             1,
             160,
         ),
+        "_sample_count_explicit": sample_count_value not in (None, ""),
         "min_center_y_pct": _bounded_int(merged.get("min_center_y_pct"), "min_center_y_pct", 50, 0, 95),
         "max_center_y_pct": _bounded_int(merged.get("max_center_y_pct"), "max_center_y_pct", 82, 50, 100),
         "preferred_center_y_pct": _bounded_int(merged.get("preferred_center_y_pct"), "preferred_center_y_pct", 68, 40, 98),
@@ -2769,6 +2777,18 @@ def _normalize_detect_options(payload):
         "raw_area_buffer_y": _bounded_int(merged.get("raw_area_buffer_y"), "raw_area_buffer_y", 60, 0, 120),
         "max_boxes": _bounded_int(merged.get("max_boxes"), "max_boxes", 240, 20, 1000),
         "ocr_preset": ocr_preset_raw,
+        "crop_to_band": _to_bool(merged.get("crop_to_band", False)),
+        "_crop_to_band_explicit": crop_to_band_value not in (None, ""),
+        "band_extra_pct": _bounded_int(merged.get("band_extra_pct"), "band_extra_pct", 10, 0, 30),
+        "early_stop_hit_frames": _bounded_int(
+            early_stop_hit_frames_value,
+            "early_stop_hit_frames",
+            0,
+            0,
+            80,
+        ),
+        "_early_stop_hit_frames_explicit": early_stop_hit_frames_value not in (None, ""),
+        "non_hpi_fast": _to_bool(merged.get("non_hpi_fast", True)),
     }
 
 
@@ -2981,6 +3001,23 @@ _OCR_PRESETS = {
         "det_limit_side_len": 1920,
         "detect_max_edge": 1920,
     },
+    "fast": {
+        # Non-HPI speed profile: lower OCR resolution and stricter thresholds.
+        # Intended for quick subtitle-area estimation where a padded approximate
+        # area is acceptable.
+        "det_db_thresh": 0.08,
+        "det_db_box_thresh": 0.25,
+        "det_limit_side_len": 960,
+        "detect_max_edge": 960,
+    },
+    "turbo": {
+        # Faster and less precise than fast. Use when latency matters more than
+        # tight subtitle bounds; downstream padding should cover small misses.
+        "det_db_thresh": 0.12,
+        "det_db_box_thresh": 0.35,
+        "det_limit_side_len": 640,
+        "detect_max_edge": 640,
+    },
     "fuzzy": {
         # 比 default 略激进(thresh 0.05→0.03,box 0.15→0.10),仍然比 ultra
         # 保守(thresh 0.02)。边长保持 1920(不增加检测成本)。
@@ -3017,7 +3054,7 @@ _OCR_PRESETS = {
 _MAX_DETECTION_EDGE = 1280
 
 
-def _detect_subtitle_on_frame(detector, frame, width, height, max_detection_edge=None, y_pad=0):
+def _detect_subtitle_on_frame(detector, frame, width, height, max_detection_edge=None, y_pad=0, offset_x=0, offset_y=0):
     """对单帧做字幕检测；如果分辨率过高先缩放，再把坐标映射回原始分辨率。"""
     import cv2
 
@@ -3052,22 +3089,67 @@ def _detect_subtitle_on_frame(detector, frame, width, height, max_detection_edge
             )
             for xmin, xmax, ymin, ymax in coords
         ]
-    return _padded_ocr_coords(coords, height, y_pad)
+    coords = _padded_ocr_coords(coords, frame.shape[0], y_pad)
+    if offset_x or offset_y:
+        coords = [
+            (
+                xmin + int(offset_x),
+                xmax + int(offset_x),
+                ymin + int(offset_y),
+                ymax + int(offset_y),
+            )
+            for xmin, xmax, ymin, ymax in coords
+        ]
+    return coords
+
+
+def _detection_roi(frame, width, height, area, options):
+    if area is not None:
+        ymin, ymax, xmin, xmax = area
+        return (
+            max(0, min(width - 1, int(xmin))),
+            max(0, min(height - 1, int(ymin))),
+            max(1, min(width, int(xmax))),
+            max(1, min(height, int(ymax))),
+        )
+    if not options.get("crop_to_band", True):
+        return 0, 0, width, height
+    extra = float(options.get("band_extra_pct") or 0) / 100.0
+    top_pct = max(0.0, float(options["min_center_y_pct"]) / 100.0 - extra)
+    bottom_pct = min(1.0, float(options["max_center_y_pct"]) / 100.0 + extra)
+    top = max(0, min(height - 1, int(round(height * top_pct))))
+    bottom = max(top + 1, min(height, int(round(height * bottom_pct))))
+    return 0, top, width, bottom
 
 
 def _run_subtitle_area_detection(video_path, area, options):
     _patch_numpy_compat()
     import cv2
     from backend.main import SubtitleDetect
+    from backend.tools.subtitle_detect import _hpi_plugin_available
 
     ocr_preset_name = str(options.get("ocr_preset") or "default").strip().lower()
+    hpi_available = _hpi_plugin_available()
+    non_hpi_fast = bool(options.get("non_hpi_fast", True)) and not hpi_available
+    if non_hpi_fast and ocr_preset_name == "default":
+        ocr_preset_name = "fast"
     ocr_preset = _OCR_PRESETS.get(ocr_preset_name, _OCR_PRESETS["default"])
     det_db_thresh = ocr_preset.get("det_db_thresh")
     det_db_box_thresh = ocr_preset.get("det_db_box_thresh")
     det_limit_side_len = ocr_preset.get("det_limit_side_len")
     detect_max_edge = ocr_preset.get("detect_max_edge") or _MAX_DETECTION_EDGE
     ocr_bbox_y_pad = max(0, int(options.get("ocr_bbox_y_pad") or 0))
-    print(f"INFO: _run_subtitle_area_detection ocr_preset={ocr_preset_name}, det_db_thresh={det_db_thresh}, det_db_box_thresh={det_db_box_thresh}, det_limit_side_len={det_limit_side_len}, detect_max_edge={detect_max_edge}, ocr_bbox_y_pad={ocr_bbox_y_pad}")
+    effective_options = dict(options)
+    sample_count = int(options["sample_count"])
+    if non_hpi_fast and not options.get("_sample_count_explicit"):
+        sample_count = min(sample_count, 24)
+    if non_hpi_fast and not options.get("_crop_to_band_explicit"):
+        effective_options["crop_to_band"] = True
+        effective_options["band_extra_pct"] = 6
+    early_stop_hit_frames = max(0, int(options.get("early_stop_hit_frames") or 0))
+    if non_hpi_fast and not options.get("_early_stop_hit_frames_explicit"):
+        early_stop_hit_frames = 8
+    print(f"INFO: _run_subtitle_area_detection hpi_available={hpi_available}, non_hpi_fast={non_hpi_fast}, ocr_preset={ocr_preset_name}, det_db_thresh={det_db_thresh}, det_db_box_thresh={det_db_box_thresh}, det_limit_side_len={det_limit_side_len}, detect_max_edge={detect_max_edge}, ocr_bbox_y_pad={ocr_bbox_y_pad}, sample_count={sample_count}, crop_to_band={effective_options.get('crop_to_band')}, early_stop_hit_frames={early_stop_hit_frames}")
 
     video_cap = cv2.VideoCapture(str(video_path))
     if not video_cap.isOpened():
@@ -3077,7 +3159,7 @@ def _run_subtitle_area_detection(video_path, area, options):
         fps = float(video_cap.get(cv2.CAP_PROP_FPS) or 0.0)
         width = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         height = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        frame_numbers = _sample_frame_numbers(frame_count, options["sample_count"])
+        frame_numbers = _sample_frame_numbers(frame_count, sample_count)
         detector = SubtitleDetect(
             str(video_path), sub_area=area,
             det_db_thresh=det_db_thresh, det_db_box_thresh=det_db_box_thresh,
@@ -3095,15 +3177,19 @@ def _run_subtitle_area_detection(video_path, area, options):
                 frames_sampled.append(frame_no)
                 if width <= 0 or height <= 0:
                     height, width = frame.shape[:2]
-                for coord in _detect_subtitle_on_frame(detector, frame, width, height, detect_max_edge, ocr_bbox_y_pad):
+                roi_x1, roi_y1, roi_x2, roi_y2 = _detection_roi(frame, width, height, area, effective_options)
+                detect_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+                for coord in _detect_subtitle_on_frame(detector, detect_frame, width, height, detect_max_edge, ocr_bbox_y_pad, roi_x1, roi_y1):
                     box = _box_from_coords(frame_no, coord, width, height)
                     box = _clamp_box_to_area(box, area)
                     if box["width"] <= 1 or box["height"] <= 1 or not _box_in_area(box, area):
                         continue
                     boxes.append(box)
+                if early_stop_hit_frames > 0 and len({box["frame"] for box in boxes}) >= early_stop_hit_frames:
+                    break
         else:
             current_frame = 0
-            while video_cap.isOpened() and len(frames_sampled) < options["sample_count"]:
+            while video_cap.isOpened() and len(frames_sampled) < sample_count:
                 ret, frame = video_cap.read()
                 if not ret:
                     break
@@ -3111,16 +3197,20 @@ def _run_subtitle_area_detection(video_path, area, options):
                 frames_sampled.append(current_frame)
                 if width <= 0 or height <= 0:
                     height, width = frame.shape[:2]
-                for coord in _detect_subtitle_on_frame(detector, frame, width, height, detect_max_edge, ocr_bbox_y_pad):
+                roi_x1, roi_y1, roi_x2, roi_y2 = _detection_roi(frame, width, height, area, effective_options)
+                detect_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+                for coord in _detect_subtitle_on_frame(detector, detect_frame, width, height, detect_max_edge, ocr_bbox_y_pad, roi_x1, roi_y1):
                     box = _box_from_coords(current_frame, coord, width, height)
                     box = _clamp_box_to_area(box, area)
                     if box["width"] <= 1 or box["height"] <= 1 or not _box_in_area(box, area):
                         continue
                     boxes.append(box)
+                if early_stop_hit_frames > 0 and len({box["frame"] for box in boxes}) >= early_stop_hit_frames:
+                    break
     finally:
         video_cap.release()
 
-    detected_area, raw_area, selected_boxes, confidence = _choose_subtitle_area(boxes, width, height, options)
+    detected_area, raw_area, selected_boxes, confidence = _choose_subtitle_area(boxes, width, height, effective_options)
     max_boxes = options["max_boxes"]
     return {
         "video_size": {"width": width, "height": height},
@@ -3128,7 +3218,7 @@ def _run_subtitle_area_detection(video_path, area, options):
         "fps": round(fps, 3),
         "sample_method": "uniform_midpoint_frames",
         "random": False,
-        "sample_count_requested": options["sample_count"],
+        "sample_count_requested": sample_count,
         "frames_sampled": frames_sampled,
         "box_count": len(boxes),
         "area": detected_area,
@@ -3139,7 +3229,7 @@ def _run_subtitle_area_detection(video_path, area, options):
         "boxes": boxes[:max_boxes],
         "selected_boxes": selected_boxes[:max_boxes],
         "input_area": list(area) if area is not None else None,
-        "detect_options": options,
+        "detect_options": effective_options,
     }
 
 
