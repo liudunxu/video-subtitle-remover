@@ -3150,8 +3150,11 @@ def _run_subtitle_area_detection(video_path, area, options):
     if non_hpi_fast and not options.get("_crop_to_band_explicit"):
         effective_options["crop_to_band"] = True
         effective_options["band_extra_pct"] = 6
-    if non_hpi_fast and not options.get("_max_center_y_pct_explicit"):
-        effective_options["max_center_y_pct"] = max(int(effective_options["max_center_y_pct"]), 90)
+    if non_hpi_fast and int(effective_options["max_center_y_pct"]) <= 82:
+        # Dubbing batch sends 82 explicitly as its historical default. In the
+        # non-HPI fast path the detector sees fewer/tighter boxes, so bottom
+        # subtitles can land just below that cutoff; widen only this fallback.
+        effective_options["max_center_y_pct"] = 90
     early_stop_hit_frames = max(0, int(options.get("early_stop_hit_frames") or 0))
     if non_hpi_fast and not options.get("_early_stop_hit_frames_explicit"):
         early_stop_hit_frames = 8
