@@ -2756,6 +2756,7 @@ def _normalize_detect_options(payload):
     sample_count_value = merged.get("sample_count", merged.get("detect_sample_count"))
     crop_to_band_value = merged.get("crop_to_band")
     early_stop_hit_frames_value = merged.get("early_stop_hit_frames")
+    max_center_y_pct_value = merged.get("max_center_y_pct")
     return {
         "sample_count": _bounded_int(
             sample_count_value,
@@ -2766,7 +2767,8 @@ def _normalize_detect_options(payload):
         ),
         "_sample_count_explicit": sample_count_value not in (None, ""),
         "min_center_y_pct": _bounded_int(merged.get("min_center_y_pct"), "min_center_y_pct", 50, 0, 95),
-        "max_center_y_pct": _bounded_int(merged.get("max_center_y_pct"), "max_center_y_pct", 82, 50, 100),
+        "max_center_y_pct": _bounded_int(max_center_y_pct_value, "max_center_y_pct", 82, 50, 100),
+        "_max_center_y_pct_explicit": max_center_y_pct_value not in (None, ""),
         "preferred_center_y_pct": _bounded_int(merged.get("preferred_center_y_pct"), "preferred_center_y_pct", 68, 40, 98),
         "allow_outside_band": _to_bool(merged.get("allow_outside_band", False)),
         "padding_x": _bounded_int(merged.get("padding_x"), "padding_x", 16, 0, 240),
@@ -3143,12 +3145,17 @@ def _run_subtitle_area_detection(video_path, area, options):
     sample_count = int(options["sample_count"])
     if non_hpi_fast and not options.get("_sample_count_explicit"):
         sample_count = min(sample_count, 24)
+    effective_options["sample_count"] = sample_count
+    effective_options["ocr_preset"] = ocr_preset_name
     if non_hpi_fast and not options.get("_crop_to_band_explicit"):
         effective_options["crop_to_band"] = True
         effective_options["band_extra_pct"] = 6
+    if non_hpi_fast and not options.get("_max_center_y_pct_explicit"):
+        effective_options["max_center_y_pct"] = max(int(effective_options["max_center_y_pct"]), 90)
     early_stop_hit_frames = max(0, int(options.get("early_stop_hit_frames") or 0))
     if non_hpi_fast and not options.get("_early_stop_hit_frames_explicit"):
         early_stop_hit_frames = 8
+    effective_options["early_stop_hit_frames"] = early_stop_hit_frames
     print(f"INFO: _run_subtitle_area_detection hpi_available={hpi_available}, non_hpi_fast={non_hpi_fast}, ocr_preset={ocr_preset_name}, det_db_thresh={det_db_thresh}, det_db_box_thresh={det_db_box_thresh}, det_limit_side_len={det_limit_side_len}, detect_max_edge={detect_max_edge}, ocr_bbox_y_pad={ocr_bbox_y_pad}, sample_count={sample_count}, crop_to_band={effective_options.get('crop_to_band')}, early_stop_hit_frames={early_stop_hit_frames}")
 
     video_cap = cv2.VideoCapture(str(video_path))
