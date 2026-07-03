@@ -3,8 +3,6 @@
 FROM pytorch/pytorch:2.8.0-cuda12.6-cudnn9-runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG TORCH_VERSION=2.8.0
-ARG TORCHVISION_VERSION=0.23.0
 ARG PADDLE_VERSION=3.0.0
 ARG PADDLEX_VERSION=3.4.0
 ARG ONNXRUNTIME_GPU_VERSION=1.22.0
@@ -63,35 +61,38 @@ RUN python -m pip install \
     paddlex==${PADDLEX_VERSION} \
     -r requirements.txt
 
+# Paddle 3.0's wheel metadata pins older CUDA Python packages than the PyTorch
+# 2.8 CUDA 12.6 image. Restore PyTorch's exact runtime library pins after Paddle
+# is installed; the entrypoint verifies both frameworks on a real GPU at start.
+RUN python -m pip install --force-reinstall --no-deps \
+    nvidia-cudnn-cu12==9.10.2.21 \
+    nvidia-cusparselt-cu12==0.7.1 \
+    nvidia-nccl-cu12==2.27.3
+
 RUN mkdir -p /workspace/.cache/matplotlib /workspace/video_subtitle_remover_api
 
-# Build-time import checks catch accidental CPU wheels or missing PaddleX/HPI
-# packages before the image reaches Vast.ai. Runtime GPU visibility is checked
-# again by the entrypoint because Docker builds usually do not expose a GPU.
+# Docker builds do not expose libcuda.so.1, so do not import Paddle here. The
+# entrypoint performs strict torch/Paddle/ONNX GPU checks on the Vast.ai host.
 RUN python - <<'PY'
+from importlib import metadata
+
 import onnxruntime as ort
-import paddle
-import paddlex
-import paddleocr
 import torch
-from paddle import inference  # noqa: F401
 
 if not torch.__version__.startswith("2.8.0"):
     raise SystemExit(f"unexpected torch version: {torch.__version__}")
 if not torch.version.cuda:
     raise SystemExit("torch is not a CUDA build")
-if not paddle.device.is_compiled_with_cuda():
-    raise SystemExit("paddlepaddle is not a CUDA build")
 providers = ort.get_available_providers()
 if "CUDAExecutionProvider" not in providers:
     raise SystemExit(f"onnxruntime-gpu CUDA provider missing: {providers}")
 
 print("GPU package checks passed:")
 print(f"  torch={torch.__version__} cuda={torch.version.cuda}")
-print(f"  paddle={paddle.__version__} cuda_build={paddle.device.is_compiled_with_cuda()}")
+print(f"  paddlepaddle-gpu={metadata.version('paddlepaddle-gpu')}")
 print(f"  onnxruntime_providers={providers}")
-print(f"  paddleocr={getattr(paddleocr, '__version__', 'unknown')}")
-print(f"  paddlex={getattr(paddlex, '__version__', 'unknown')}")
+print(f"  paddleocr={metadata.version('paddleocr')}")
+print(f"  paddlex={metadata.version('paddlex')}")
 PY
 
 EXPOSE 6006
