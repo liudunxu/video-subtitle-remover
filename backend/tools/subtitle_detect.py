@@ -46,11 +46,10 @@ class SubtitleDetect:
         paddle.disable_signal_handler()
         from paddleocr import TextDetection
         model_config = ModelConfig()
-        # 仅在 paddle_inference 插件（HPIP）已安装时启用 HPI。
-        # 旧版本使用 onnxruntime 跑检测，升级到 paddleocr 3.x 后，enable_hpi 走的是
-        # PaddleX 的 C++ HPIP 路径（与 inpaint 用的标准 torch 推理不同），需要单独安装
-        # paddle_inference 才会可用。未安装时必须置为 False，否则 PaddleX 的
-        # require_hpip() 会抛 DependencyError。
+        # PaddleX 的 HPI 路径依赖单独的高性能推理插件；普通
+        # paddlepaddle-gpu 自带的 `paddle.inference` 不等价于该插件。
+        # Vast GPU 镜像走常规 Paddle GPU 推理路径，避免 require_hpip()
+        # 在未安装 HPI 插件时抛 DependencyError。
         enable_hpi = _hpi_plugin_available()
         # PaddlePaddle 自带的 CUDA 探测。注意：不能用 torch.cuda.is_available()，
         # PyTorch 有 CUDA 不代表 PaddlePaddle 也有——两者依赖各自绑定的 libcudart。
@@ -307,16 +306,13 @@ class SubtitleDetect:
 
 
 def _hpi_plugin_available() -> bool:
-    """Detect whether the PaddlePaddle high-performance inference plugin is installed.
+    """Return whether PaddleX high-performance inference should be enabled.
 
     PaddleOCR 3.x's ``enable_hpi=True`` path goes through PaddleX's HPIP, which is
     a separate C++ binding (shipped via the ``paddle_inference`` wheel) — *not* the
     same as the regular ``paddlepaddle`` / ``paddlepaddle-gpu`` wheel. If it isn't
     installed, enabling HPI raises ``paddlex.utils.deps.DependencyError: The
-    high-performance inference plugin is not available``.
+    high-performance inference plugin is not available``. Keep it disabled in the
+    Vast GPU image and use PaddleOCR's regular Paddle GPU path.
     """
-    try:
-        from paddle import inference  # noqa: F401
-    except ImportError:
-        return False
-    return True
+    return False
