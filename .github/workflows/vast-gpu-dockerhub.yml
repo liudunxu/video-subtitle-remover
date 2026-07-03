@@ -5,7 +5,7 @@ on:
     inputs:
       image_name:
         description: Docker Hub image name, including namespace
-        required: true
+        required: false
         default: ""
       tag:
         description: Image tag to publish
