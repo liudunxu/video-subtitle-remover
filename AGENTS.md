@@ -74,6 +74,9 @@ Use this convention for this project's GPU API deployment:
 - Prefer resolving the Docker Hub tag to the current linux/amd64 digest before creating a Vast.ai instance, then pass `liudunxu/video-subtitle-remover@sha256:<digest>` to Vast.ai.
 - Runtime type: `args`
 - Default disk: `70`
+- Minimum GPU VRAM: `12000` MB (12 GB); RTX 3060/3060 Ti/4060 Ti/4070/3090 class GPUs are acceptable.
+- CPU preference: modern x86-64 CPUs with AVX2 and FMA support. Avoid very old Intel Xeon E5 v2/v3 without AVX2, and avoid `Common KVM processor` / unknown generic CPUs. AMD EPYC 7xx2/7xx3/7K62/7402/7452/7502/7532/7551P or newer, and Intel Xeon E5-2673 v4 / E5-2686 v4 / E5-2690 v4 / E5-2695 v4 / E5-2696 v4 / Xeon W / Xeon Gold/Silver / Core i5/i7/i9 6th-gen or newer are preferred.
+- Region preference: prefer East Asia, Southeast Asia, and West Asia (CN/HK/TW/SG/JP/KR/VN/TH/IN/TR/AE). Fall back to Americas (US/CA) only when no suitable Asia offer is available.
 - Required env:
   - `-p 6006:6006=1`
   - `HOST=0.0.0.0`
@@ -95,9 +98,35 @@ When the user says "开启vast.ai实例" or equivalent:
 
 - Query current Vast.ai instances first.
 - If a matching `video-subtitle-remover-api*` instance is already running, reuse it and report its public URL.
-- Otherwise search verified rentable on-demand offers for one RTX 3090 with at least 24GB VRAM, at least one direct port, and enough disk space.
-- Prefer Asia-region offers that can pull from Docker Hub reliably; if no suitable Asia offer is available, fall back to Americas-region offers with good reliability and network.
+- Otherwise search verified rentable on-demand offers for one GPU with at least 12000 MB VRAM, at least one direct port, and enough disk space.
+- Prefer offers with modern x86-64 CPUs that support AVX2 and FMA (e.g. AMD EPYC 7xx2/7xx3/7K62/7402/7452/7502/7532/7551P or newer; Intel Xeon E5-2673 v4 / E5-2686 v4 / E5-2690 v4 / E5-2695 v4 / E5-2696 v4 / Xeon W / Xeon Gold/Silver / Core i5/i7/i9 6th-gen or newer). Avoid very old CPUs without AVX2 and generic `Common KVM processor` labels.
+- Prefer East Asia, Southeast Asia, and West Asia offers (CN/HK/TW/SG/JP/KR/VN/TH/IN/TR/AE) that can pull from Docker Hub reliably; fall back to Americas-region offers (US/CA) only when no suitable Asia offer is available.
 - Avoid machines that recently failed Docker Hub pulls.
 - Create exactly one instance using label `video-subtitle-remover-api-mvp`.
 - After creation, poll until `actual_status=running` and port `6006/tcp` is assigned.
 - Verify `GET /health` on the public URL and read Vast logs to confirm `GPU runtime check passed`.
+
+## 6. Reusable Vast.ai Manager Script
+
+A reusable Python script encapsulates the operations above:
+
+- Path: `scripts/vast_ai_manager.py`
+- Authentication: reads `VAST_API_KEY` from the environment (or `--api-key`)
+
+Common commands:
+
+```bash
+# List matching instances
+python scripts/vast_ai_manager.py status
+
+# Start (or reuse) an instance with the latest Docker Hub digest
+python scripts/vast_ai_manager.py start
+
+# Stop and delete all matching instances
+python scripts/vast_ai_manager.py stop
+
+# Fetch logs for an instance
+python scripts/vast_ai_manager.py logs <instance_id>
+```
+
+The `start` command resolves `liudunxu/video-subtitle-remover:vast-gpu` to its current linux/amd64 digest, searches for a GPU with at least 12GB VRAM (preferring modern AVX2/FMA CPUs and Asia-region offers), creates the instance, polls until it is running, checks `/health`, and verifies "GPU runtime check passed" in the logs.

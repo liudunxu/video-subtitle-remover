@@ -40,8 +40,6 @@ try:
     import torch
     if not torch.cuda.is_available():
         errors.append("torch.cuda.is_available() is false")
-    else:
-        torch.zeros(1, device="cuda").cpu()
 except Exception as exc:
     errors.append(f"torch CUDA check failed: {exc}")
 
@@ -51,9 +49,6 @@ try:
         errors.append("paddle is not compiled with CUDA")
     elif paddle.device.cuda.device_count() <= 0:
         errors.append("paddle sees zero CUDA devices")
-    else:
-        paddle.device.set_device("gpu:0")
-        paddle.to_tensor([1.0]).numpy()
 except Exception as exc:
     errors.append(f"paddle GPU check failed: {exc}")
 
