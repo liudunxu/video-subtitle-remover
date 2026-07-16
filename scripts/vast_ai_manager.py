@@ -5,12 +5,13 @@ Reads the API key from the VAST_API_KEY environment variable.
 """
 
 import argparse
+import datetime
 import json
 import os
 import sys
 import time
 import urllib.parse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import requests
 
@@ -24,6 +25,7 @@ DEFAULT_PORT = 6006
 DEFAULT_DISK = 70
 DEFAULT_GPU = "RTX 3090"
 DEFAULT_MIN_VRAM_MB = 12000
+KNOWN_GOOD_FILE = os.path.join(os.path.dirname(__file__), "vast_known_good.json")
 
 # Preferred CPU families for the current image stack (PyTorch 2.8 + PaddlePaddle 3.0).
 # These CPUs are known to support AVX2/FMA and avoid the Illegal instruction crashes
@@ -238,6 +240,45 @@ def _public_url(instance: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def load_known_good(path: str = KNOWN_GOOD_FILE) -> List[Dict[str, Any]]:
+    """Load the known-good instance ledger from JSON."""
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("instances", []) or []
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"Warning: could not read known-good file {path}: {e}", file=sys.stderr)
+        return []
+
+
+def save_known_good(instances: List[Dict[str, Any]], path: str = KNOWN_GOOD_FILE) -> None:
+    """Persist the known-good instance ledger to JSON."""
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"instances": instances}, f, indent=2, ensure_ascii=False)
+        print(f"Updated known-good instances in {path}")
+    except OSError as e:
+        print(f"Warning: could not write known-good file {path}: {e}", file=sys.stderr)
+
+
+def _build_known_good_entry(instance_id: int, offer: Dict[str, Any], image: str) -> Dict[str, Any]:
+    """Build a ledger entry for a successfully started instance."""
+    return {
+        "instance_id": instance_id,
+        "machine_id": offer.get("machine_id"),
+        "gpu_name": offer.get("gpu_name"),
+        "cpu_name": offer.get("cpu_name"),
+        "country_code": offer.get("country_code"),
+        "region": _offer_region(offer),
+        "image": image,
+        "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "notes": "GPU runtime check passed",
+    }
+
+
 def _offer_region(offer: Dict[str, Any]) -> str:
     geo = (offer.get("geolocation") or "").lower()
     country = (offer.get("country_code") or "").upper()
@@ -258,13 +299,15 @@ def _cpu_score(offer: Dict[str, Any]) -> int:
     return 50
 
 
-def _score_offer(offer: Dict[str, Any]) -> tuple:
-    # Prefer Asia, then known-good CPUs, then reliability, then lower price.
+def _score_offer(offer: Dict[str, Any], known_good_machine_ids: Optional[Set[int]] = None) -> tuple:
+    # Prefer known-good machines, then Asia, then known-good CPUs, then reliability, then lower price.
+    machine_id = offer.get("machine_id")
+    is_known_good = bool(known_good_machine_ids and machine_id in known_good_machine_ids)
     region_rank = {"asia": 0, "americas": 1, "other": 2}.get(_offer_region(offer), 2)
     cpu_rank = _cpu_score(offer)
     reliability = offer.get("reliability", 0) or 0
     dph = offer.get("dph_total", float("inf")) or float("inf")
-    return (region_rank, cpu_rank, -reliability, dph)
+    return (0 if is_known_good else 1, region_rank, cpu_rank, -reliability, dph)
 
 
 def cmd_status(key: str, args: argparse.Namespace) -> int:
@@ -341,7 +384,15 @@ def cmd_start(key: str, args: argparse.Namespace) -> int:
             "Continuing to create a new one."
         )
 
-    # 2. Search offers
+    # 2. Load known-good history and search offers
+    known_good = load_known_good(args.known_good_file)
+    known_good_machine_ids = {i.get("machine_id") for i in known_good if i.get("machine_id")}
+    if known_good_machine_ids:
+        print(
+            f"Loaded {len(known_good)} known-good instance(s); "
+            f"preferring machine_ids: {sorted(known_good_machine_ids)}"
+        )
+
     print(
         f"Searching on-demand offers for {args.gpu} with >= {args.min_vram_mb} MB VRAM ..."
     )
@@ -358,11 +409,12 @@ def cmd_start(key: str, args: argparse.Namespace) -> int:
     if not direct_offers:
         _die("No offers with direct ports found.")
 
-    direct_offers.sort(key=_score_offer)
+    direct_offers.sort(key=lambda o: _score_offer(o, known_good_machine_ids))
     print(f"Found {len(direct_offers)} offer(s) with direct ports.")
 
     # 3. Try creating from best offers
     created_id: Optional[int] = None
+    chosen_offer: Optional[Dict[str, Any]] = None
     for offer in direct_offers[:5]:
         offer_id = offer.get("id")
         region = _offer_region(offer)
@@ -383,6 +435,7 @@ def cmd_start(key: str, args: argparse.Namespace) -> int:
             )
             created_id = result.get("new_contract")
             if created_id:
+                chosen_offer = offer
                 print(f"Created instance {created_id} from offer {offer_id}.")
                 break
         except requests.HTTPError as e:
@@ -431,9 +484,11 @@ def cmd_start(key: str, args: argparse.Namespace) -> int:
 
     # 6. Logs
     print("Fetching recent logs for GPU runtime check ...")
+    gpu_runtime_ok = False
     try:
         logs = instance_logs(key, created_id)
         if "GPU runtime check passed" in logs:
+            gpu_runtime_ok = True
             print("  Confirmed: GPU runtime check passed.")
         else:
             print("  GPU runtime check message not found in recent logs.")
@@ -445,6 +500,12 @@ def cmd_start(key: str, args: argparse.Namespace) -> int:
 
     if not health_ok:
         _die("Health check did not succeed within timeout.")
+
+    # Persist known-good entry
+    if gpu_runtime_ok and not args.no_save_known_good and chosen_offer is not None:
+        entry = _build_known_good_entry(created_id, chosen_offer, image)
+        known_good.append(entry)
+        save_known_good(known_good, args.known_good_file)
 
     print(f"\nInstance ready: {created_id}")
     print(f"Public URL: {public_url}")
@@ -485,6 +546,16 @@ def main(argv: List[str] = None) -> int:
     p_start.add_argument("--health-timeout", type=int, default=300, help="Seconds to wait for /health")
     p_start.add_argument("--interval", type=int, default=10, help="Polling interval seconds")
     p_start.add_argument("--show-logs", action="store_true", help="Print logs after startup")
+    p_start.add_argument(
+        "--known-good-file",
+        default=KNOWN_GOOD_FILE,
+        help="Path to known-good instances JSON ledger",
+    )
+    p_start.add_argument(
+        "--no-save-known-good",
+        action="store_true",
+        help="Do not append a successful instance to the known-good ledger",
+    )
 
     p_logs = sub.add_parser("logs", help="Fetch logs for an instance")
     p_logs.add_argument("instance_id", help="Instance ID")

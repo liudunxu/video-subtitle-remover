@@ -129,4 +129,32 @@ python scripts/vast_ai_manager.py stop
 python scripts/vast_ai_manager.py logs <instance_id>
 ```
 
-The `start` command resolves `liudunxu/video-subtitle-remover:vast-gpu` to its current linux/amd64 digest, searches for a GPU with at least 12GB VRAM (preferring modern AVX2/FMA CPUs and Asia-region offers), creates the instance, polls until it is running, checks `/health`, and verifies "GPU runtime check passed" in the logs.
+The `start` command resolves `liudunxu/video-subtitle-remover:vast-gpu` to its current linux/amd64 digest, searches for a GPU with at least 12GB VRAM (preferring modern AVX2/FMA CPUs and Asia-region offers), creates the instance, polls until it is running, checks `/health`, verifies "GPU runtime check passed" in the logs, and appends the successful instance to `scripts/vast_known_good.json`. Pass `--no-save-known-good` to skip persistence.
+
+## 7. Known-good Vast.ai Instances
+
+Keep a ledger of Vast.ai instances that started successfully and passed the GPU runtime check so future `start` commands can prefer proven machines.
+
+Storage: `scripts/vast_known_good.json`
+
+Schema for each entry:
+
+| Field | Description |
+|---|---|
+| `instance_id` | Vast.ai contract ID from the successful run |
+| `machine_id` | Stable Vast.ai machine ID; this is the matching key |
+| `gpu_name` | GPU model, e.g. `RTX 3090` |
+| `cpu_name` | CPU model reported by Vast.ai |
+| `country_code` | Two-letter country code, e.g. `SG` |
+| `region` | `asia`, `americas`, or `other` |
+| `image` | Exact Docker image digest used |
+| `started_at` | ISO-8601 UTC timestamp |
+| `notes` | e.g. `GPU runtime check passed` |
+
+Operation rules:
+
+- Only append an entry after `python scripts/vast_ai_manager.py start` reports success: `actual_status=running`, public URL assigned, `GET /health` returns 200, and logs contain `GPU runtime check passed`.
+- The manager loads `scripts/vast_known_good.json` automatically and ranks any offer whose `machine_id` matches a known-good entry above other offers.
+- If no known-good machine is currently rentable, fall back to the normal scoring in section 5.
+- To disable automatic persistence, pass `--no-save-known-good`.
+- When adding entries manually, prefer `machine_id` over `offer_id` because the same physical machine can appear under multiple offers.

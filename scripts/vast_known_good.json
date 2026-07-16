@@ -1,0 +1,15 @@
+{
+  "instances": [
+    {
+      "instance_id": 44038482,
+      "machine_id": 38109,
+      "gpu_name": "RTX 3090",
+      "cpu_name": "AMD Ryzen 9 7950X3D 16-Core Processor",
+      "country_code": null,
+      "region": "asia",
+      "image": "liudunxu/video-subtitle-remover@sha256:c2ad2d3c80c64d878f031ba9985c01c0ba7bf98cbf61e286898aab40f07c59bc",
+      "started_at": "2026-07-06T15:21:02.240690+00:00",
+      "notes": "GPU runtime check passed"
+    }
+  ]
+}
