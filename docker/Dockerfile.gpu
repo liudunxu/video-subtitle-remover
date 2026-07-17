@@ -22,6 +22,16 @@ ENV PYTHONUNBUFFERED=1 \
     FLAGS_cudnn_deterministic=1 \
     FLAGS_cudnn_exhaustive_search=0
 
+# STTN_DET 画质调优旋钮（默认值即代码内默认，这里显式暴露便于调整）：
+# - VSR_STTN_BAND_MARGIN：mask 驱动的 crop 带高余量（px）。crop 高度 =
+#   最高字幕带高度 + 2*margin，同时作为相邻字幕行合并为同一带的最大间隙。
+# - VSR_STTN_INPUT_WIDTH/HEIGHT：STTN_DET 模型输入尺寸。受 STTN 注意力
+#   patch 网格约束，宽必须是 432 的整数倍、高必须是 240 的整数倍，
+#   且封顶 864x480；非法值会被忽略并回退 432x240（日志有 warning）。
+ENV VSR_STTN_BAND_MARGIN=40 \
+    VSR_STTN_INPUT_WIDTH=432 \
+    VSR_STTN_INPUT_HEIGHT=240
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \

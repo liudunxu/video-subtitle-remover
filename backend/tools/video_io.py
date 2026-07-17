@@ -84,7 +84,7 @@ class FFmpegVideoWriter:
     接口兼容 cv2.VideoWriter（write/release）。
     """
 
-    def __init__(self, output_path, fps, size):
+    def __init__(self, output_path, fps, size, crf=18, preset="fast"):
         w, h = size
         cmd = [
             FFmpegCLI.instance().ffmpeg_path,
@@ -97,8 +97,8 @@ class FFmpegVideoWriter:
             '-i', '-',
             '-c:v', 'libx264',
             '-pix_fmt', 'yuv420p',
-            '-crf', '18',
-            '-preset', 'fast',
+            '-crf', str(crf),
+            '-preset', str(preset),
             '-loglevel', 'error',
             output_path
         ]

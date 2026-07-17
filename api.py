@@ -178,6 +178,16 @@ def _bounded_int(value, field_name, default, minimum, maximum):
     return max(minimum, min(maximum, number))
 
 
+def _bounded_float(value, field_name, default, minimum, maximum):
+    if value in (None, ""):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise RequestError(HTTPStatus.BAD_REQUEST, f"{field_name} must be a number")
+    return max(minimum, min(maximum, number))
+
+
 def _normalize_ocr_preset_name(value):
     preset = str(value or "default").strip().lower().replace("-", "_")
     aliases = {
@@ -222,6 +232,9 @@ def _normalize_options(payload):
         "post_refine_inpaint_radius",
         "post_refine_feather",
         "ocr_preset",
+        "bbox_min_inside_ratio",
+        "ocr_sample_step",
+        "empty_detection_full_inpaint",
         "post_verify_blur",
         "post_verify_blur_force",
         "post_verify_blur_sample_every",
@@ -303,6 +316,14 @@ def _normalize_options(payload):
         "post_refine_inpaint_radius": _bounded_int(merged.get("post_refine_inpaint_radius"), "post_refine_inpaint_radius", 4, 1, 12),
         "post_refine_feather": _bounded_int(merged.get("post_refine_feather"), "post_refine_feather", 3, 0, 12),
         "ocr_preset": _normalize_ocr_preset_name(merged.get("ocr_preset")),
+        # 检测框与字幕区域交集面积占比下限：1.0 = 完全落在区域内（旧行为），
+        # 调小可放宽跨边界的检测框（如字幕正好压在区域边缘）。
+        "bbox_min_inside_ratio": _bounded_float(merged.get("bbox_min_inside_ratio"), "bbox_min_inside_ratio", 1.0, 0.0, 1.0),
+        # OCR 采样间隔：0 = 按帧率自适应（旧行为），1 = 逐帧，最大 30。
+        "ocr_sample_step": _bounded_int(merged.get("ocr_sample_step"), "ocr_sample_step", 0, 0, 30),
+        # 检测不到字幕时的兜底：True = 整区每帧 STTN_AUTO 重绘（旧行为），
+        # False = 直接报错，让调用方知道检测为空而不是默默整帧重绘。
+        "empty_detection_full_inpaint": _to_bool(merged.get("empty_detection_full_inpaint", True)),
         # Auto residual cleanup tail pass — see _run_residual_cleanup.
         # Default is off. The multiline OCR preset may enable it internally
         # for only the frames where 3+ subtitle lines were detected.
@@ -649,12 +670,18 @@ def _apply_config_options(config, options):
         "LAMA_SUPER_FAST": options["lama_super_fast"],
     }
 
+    # `config` 是 backend.config 模块；ConfigItem（inpaintMode 等）挂在单例
+    # 实例 backend.config.config 上，模块本身没有这些属性。历史上这里直接
+    # 在模块上 getattr，全部返回 None，导致 config_overrides 静默空转——
+    # mode=sttn 实际一直跑的是默认的 STTN_AUTO 整区重绘。修正为解析到实例。
+    cfg = getattr(config, "config", config)
+
     old_values = {}
     for name, value in config_overrides.items():
-        item = getattr(config, name, None)
+        item = getattr(cfg, name, None)
         if item is not None and hasattr(item, "value"):
             old_values[name] = (item, item.value)
-            config.set(item, value)
+            cfg.set(item, value, save=False)
 
     for name, value in dynamic_overrides.items():
         old_values[name] = getattr(config, name, None)
@@ -664,10 +691,11 @@ def _apply_config_options(config, options):
 
 
 def _restore_config_options(config, old_values):
+    cfg = getattr(config, "config", config)
     for name, entry in old_values.items():
         if isinstance(entry, tuple) and len(entry) == 2:
             item, old_value = entry
-            config.set(item, old_value)
+            cfg.set(item, old_value, save=False)
         else:
             setattr(config, name, entry)
 
@@ -873,29 +901,34 @@ def _run_blur_cover(video_path, area, options, ocr_preset=None):
 
     # Step 1: 使用 SubtitleRemover 查找字幕帧和位置
     remover = SubtitleRemover(str(video_path), sub_area=area)
-    detector_kwargs = {}
+    detector_kwargs = {
+        "bbox_min_inside_ratio": options.get("bbox_min_inside_ratio", 1.0),
+        "ocr_sample_step": options.get("ocr_sample_step", 0),
+    }
     if det_db_thresh is not None:
-        detector_kwargs = {
+        detector_kwargs.update({
             "det_db_thresh": det_db_thresh,
             "det_db_box_thresh": det_db_box_thresh,
             "det_limit_side_len": det_limit_side_len,
-        }
-    if detector_kwargs or ocr_bbox_y_pad > 0:
-        remover.sub_detector = _build_padded_subtitle_detector(
-            SubtitleDetect, video_path, area, ocr_bbox_y_pad, **detector_kwargs
-        )
+        })
+    # 始终注入检测器：blur_cover 直接访问 remover.sub_detector，默认
+    # preset + 无 y_pad 时不注入会 AttributeError 被当成"检测失败"，
+    # 静默退回原视频。
+    remover.sub_detector = _build_padded_subtitle_detector(
+        SubtitleDetect, video_path, area, ocr_bbox_y_pad, **detector_kwargs
+    )
 
     # 查找字幕位置（检测可能因CUDNN失败，降级处理）
     try:
         sub_list = remover.sub_detector.find_subtitle_frame_no(sub_remover=remover)
     except Exception as detect_err:
         print(f"WARNING: _run_blur_cover detection failed: {detect_err}, skipping blur")
-        # 检测失败时直接复制原视频
+        # 检测失败时直接复制原视频（复制件自带音轨；不要再调
+        # merge_audio_to_video——它会把 0 帧的空临时视频合并覆盖掉好文件）
         remover.video_cap.release()
         remover.video_writer.release()
         import shutil
         shutil.copy2(video_path, remover.video_out_name)
-        remover.merge_audio_to_video()
         return Path(remover.video_out_name)
     if not sub_list:
         print("WARNING: _run_blur_cover no subtitles detected, skipping blur")
@@ -904,7 +937,6 @@ def _run_blur_cover(video_path, area, options, ocr_preset=None):
         remover.video_writer.release()
         import shutil
         shutil.copy2(video_path, remover.video_out_name)
-        remover.merge_audio_to_video()
         return Path(remover.video_out_name)
 
     # Step 1.5: Temporal smoothing of detected box positions to reduce
@@ -1080,7 +1112,6 @@ def _run_text_trace_refine(video_path, mask_source_path, area, options, progress
     """
     _patch_numpy_compat()
     import cv2
-    import subprocess
     import tempfile
 
     def _report(percent, stage="inpainting"):
@@ -1106,8 +1137,12 @@ def _run_text_trace_refine(video_path, mask_source_path, area, options, progress
     mask_cap = cv2.VideoCapture(str(mask_source_path))
     temp_video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     temp_video.close()
-    writer = cv2.VideoWriter(temp_video.name, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-    if not writer.isOpened():
+    # 中间文件直接写成 libx264（crf 12），而不是 cv2 mp4v + 后续 ffmpeg
+    # crf20 转码：少一代有损编码，且后面的音频合并可以 -c:v copy。
+    from backend.tools.video_io import FFmpegVideoWriter
+    try:
+        writer = FFmpegVideoWriter(temp_video.name, fps, (width, height), crf=12, preset="veryfast")
+    except Exception as writer_exc:
         src_cap.release()
         if mask_cap.isOpened():
             mask_cap.release()
@@ -1115,7 +1150,10 @@ def _run_text_trace_refine(video_path, mask_source_path, area, options, progress
             os.remove(temp_video.name)
         except OSError:
             pass
-        raise RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "Text-trace refinement: cannot open video writer")
+        raise RequestError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            f"Text-trace refinement: cannot open video writer ({writer_exc})",
+        )
 
     output_path = Path(str(video_path)).with_name(Path(str(video_path)).stem + "_refined.mp4").resolve()
     if output_path.is_file():
@@ -1273,66 +1311,18 @@ def _run_text_trace_refine(video_path, mask_source_path, area, options, progress
             pass
         raise RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "Text-trace refinement: no frames decoded from input")
 
-    # Mux source audio onto the refined video via ffmpeg stream copy when
-    # possible (much faster than re-encoding).
-    ffmpeg_path = "ffmpeg"
+    # Mux source audio onto the refined video. The temp file is already
+    # libx264 (FFmpegVideoWriter crf 12), so the video stream is copied
+    # without another lossy generation; audio is stream-copied when the
+    # source is AAC and transcoded to AAC 320k otherwise.
     try:
-        from backend import config as _vsr_config  # noqa: WPS433
-        ffmpeg_path = getattr(_vsr_config, "FFMPEG_PATH", "ffmpeg") or "ffmpeg"
-    except Exception:
-        pass
-    # The temp writer uses cv2's mp4v fourcc, which ffmpeg can sometimes
-    # stream-copy directly. When that fails (e.g. ffmpeg can't parse the
-    # mp4v muxer cleanly), fall back to re-encoding with libx264.
-    copy_cmd = [
-        ffmpeg_path, "-y",
-        "-i", temp_video.name,
-        "-i", str(mask_source_path),
-        "-map", "0:v:0",
-        "-map", "1:a:0?",
-        "-c:v", "copy",
-        "-c:a", "copy",
-        "-shortest",
-        "-loglevel", "error",
-        str(output_path),
-    ]
-    reencode_cmd = [
-        ffmpeg_path, "-y",
-        "-i", temp_video.name,
-        "-i", str(mask_source_path),
-        "-map", "0:v:0",
-        "-map", "1:a:0?",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "20",
-        "-c:a", "copy",
-        "-shortest",
-        "-loglevel", "error",
-        str(output_path),
-    ]
-    try:
-        with open(os.devnull) as devnull:
-            try:
-                subprocess.check_output(copy_cmd, stdin=devnull, timeout=600)
-                print("INFO: text_trace_refine: ffmpeg stream-copy mux succeeded")
-            except Exception as copy_exc:
-                print(
-                    f"WARN: text_trace_refine: stream-copy mux failed ({copy_exc}), re-encoding with libx264"
-                )
-                subprocess.check_output(reencode_cmd, stdin=devnull, timeout=600)
-    except Exception:
-        # Fallback: just copy the temp video (no audio mux).
-        try:
-            shutil.copy2(temp_video.name, output_path)
-        except Exception as copy_exc:
-            try:
-                os.remove(temp_video.name)
-            except OSError:
-                pass
-            raise RequestError(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                f"Text-trace refinement: failed to mux audio ({copy_exc})",
-            )
+        _mux_audio_onto_video(temp_video.name, mask_source_path, output_path, timeout=600)
+        print("INFO: text_trace_refine: audio mux succeeded")
+    except Exception as mux_exc:
+        raise RequestError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            f"Text-trace refinement: failed to mux audio ({mux_exc})",
+        ) from mux_exc
     finally:
         try:
             os.remove(temp_video.name)
@@ -1361,7 +1351,6 @@ def _run_post_verify_blur(video_path, area, options, progress_callback=None, sta
     _patch_numpy_compat()
     import cv2
     import numpy as np
-    import subprocess
     import tempfile
     from backend.main import SubtitleDetect
 
@@ -1444,7 +1433,12 @@ def _run_post_verify_blur(video_path, area, options, progress_callback=None, sta
         "det_db_box_thresh": 0.20,
         "det_limit_side_len": 1280,
     }
-    detector = SubtitleDetect(str(video_path), sub_area=area, **det_args)
+    # NOTE: sub_area=None 是有意的。detect_subtitle 的 sub_area 过滤在
+    # 全帧坐标系下比较，而这里喂给它的是 area 裁剪后的 crop（crop 局部
+    # 坐标），传 sub_area=area 会把所有检测框错杀（crop 局部坐标几乎必然
+    # 落在全帧 area 之外）。检测本来就在 crop 内跑，下游 blur 也会钳回
+    # area 内，无需检测器再过滤一次。
+    detector = SubtitleDetect(str(video_path), sub_area=None, **det_args)
 
     # Phase 1: coarse sample — find candidate frame ranges
     _report(0.0, "ocr_sampling")
@@ -1525,14 +1519,21 @@ def _run_post_verify_blur(video_path, area, options, progress_callback=None, sta
     src_cap = cv2.VideoCapture(str(video_path))
     temp_video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     temp_video.close()
-    writer = cv2.VideoWriter(temp_video.name, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-    if not writer.isOpened():
+    # 中间文件直接写 libx264（crf 12），避免 cv2 mp4v + 后续转码的额外
+    # 有损代际；Phase 4 合并音频时视频流可直接 -c:v copy。
+    from backend.tools.video_io import FFmpegVideoWriter
+    try:
+        writer = FFmpegVideoWriter(temp_video.name, fps, (width, height), crf=12, preset="veryfast")
+    except Exception as writer_exc:
         src_cap.release()
         try:
             os.remove(temp_video.name)
         except OSError:
             pass
-        raise RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "verify_blur: cannot open writer")
+        raise RequestError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            f"verify_blur: cannot open writer ({writer_exc})",
+        )
     output_path = Path(str(video_path)).with_name(Path(str(video_path)).stem + "_verified_blur.mp4").resolve()
     if output_path.is_file():
         try:
@@ -1632,44 +1633,28 @@ def _run_post_verify_blur(video_path, area, options, progress_callback=None, sta
         f"INFO: post_verify_blur: blurred {blurred_count} frame(s) at PaddleOCR-detected bbox regions"
     )
 
-    # Phase 4: mux audio (same pattern as _run_text_trace_refine)
-    from backend import config as _vsr_cfg
-    ffmpeg_path = getattr(_vsr_cfg, "FFMPEG_PATH", "ffmpeg") or "ffmpeg"
-    audio_tmp = tempfile.NamedTemporaryFile(suffix=".aac", delete=False)
-    audio_tmp.close()
-    has_audio = False
+    # Phase 4: mux audio. 旧实现引用不存在的 backend.config.USE_H264，
+    # 每次都在构造 merge_cmd 时 AttributeError，被 except 吞掉后把无音轨的
+    # temp 视频复制为输出——一开 post_verify_blur 就丢音频。现在视频流
+    # -c:v copy（temp 已是 libx264），音轨按 codec copy 或转 AAC。
     try:
-        subprocess.check_output(
-            [ffmpeg_path, "-y", "-i", str(video_path), "-acodec", "copy", "-vn", "-loglevel", "error", audio_tmp.name],
-            stdin=open(os.devnull), timeout=600,
-        )
-        has_audio = os.path.exists(audio_tmp.name) and os.path.getsize(audio_tmp.name) > 0
-    except Exception:
-        has_audio = False
-    try:
-        merge_cmd = [ffmpeg_path, "-y", "-i", temp_video.name]
-        if has_audio:
-            merge_cmd += ["-i", audio_tmp.name]
-        merge_cmd += [
-            "-c:v", "libx264" if _vsr_cfg.USE_H264 else "copy",
-            "-c:a", "copy",
-            "-loglevel", "error",
-            str(output_path),
-        ]
-        subprocess.check_output(merge_cmd, stdin=open(os.devnull), timeout=600)
-    except Exception as copy_exc:
-        print(f"WARN: post_verify_blur: mux failed ({copy_exc}), copying raw")
-        shutil.copy2(temp_video.name, output_path)
+        _mux_audio_onto_video(temp_video.name, video_path, output_path, timeout=600)
+        print("INFO: post_verify_blur: audio mux succeeded")
+    except Exception as mux_exc:
+        # 不在这里回退成无声视频——抛错让上游保留带音轨的原输出。
+        try:
+            os.remove(temp_video.name)
+        except OSError:
+            pass
+        raise RequestError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            f"verify_blur: failed to mux audio ({mux_exc})",
+        ) from mux_exc
     finally:
         try:
             os.remove(temp_video.name)
         except OSError:
             pass
-        if os.path.exists(audio_tmp.name):
-            try:
-                os.remove(audio_tmp.name)
-            except OSError:
-                pass
 
     if not output_path.is_file():
         raise RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "verify_blur did not create output file")
@@ -1834,14 +1819,15 @@ def _run_residual_cleanup(input_video_path, output_video_path, area, options, pr
     after each pass and stop early when the residual area drops below the
     configured threshold.
 
-    The output is the same mp4 (same fps / dimensions) as the input. Audio
-    is NOT touched here — caller is expected to mux the source audio on top
-    of the returned file, or to replace the input file with the output and
-    run a no-op audio stream-copy.
+    The output is the same mp4 (same fps / dimensions) as the input, with
+    the input's audio track muxed back on (`-c:v copy` — the intermediate
+    video is written as libx264 crf 12 so no extra transcode generation is
+    needed beyond the single re-encode of the processed frames).
     """
     _patch_numpy_compat()
     import cv2
     import numpy as np
+    import tempfile
 
     src_cap = cv2.VideoCapture(str(input_video_path))
     if not src_cap.isOpened():
@@ -1905,10 +1891,23 @@ def _run_residual_cleanup(input_video_path, output_video_path, area, options, pr
             output_path.unlink()
         except OSError:
             pass
-    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-    if not writer.isOpened():
+    # 处理后的帧先写成 libx264（crf 12）的无声临时文件，最后再把输入的
+    # 音轨 -c:v copy 合并回来——避免 cv2 mp4v + 二次转码的额外有损代际。
+    from backend.tools.video_io import FFmpegVideoWriter
+    temp_video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    temp_video.close()
+    try:
+        writer = FFmpegVideoWriter(temp_video.name, fps, (width, height), crf=12, preset="veryfast")
+    except Exception as writer_exc:
         src_cap.release()
-        raise RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "Residual cleanup: cannot open video writer")
+        try:
+            os.remove(temp_video.name)
+        except OSError:
+            pass
+        raise RequestError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            f"Residual cleanup: cannot open video writer ({writer_exc})",
+        )
 
     def _report(pct_int, stage="cleaning"):
         if progress_callback is None:
@@ -2019,6 +2018,15 @@ def _run_residual_cleanup(input_video_path, output_video_path, area, options, pr
     finally:
         src_cap.release()
         writer.release()
+    # 把输入视频的音轨合并回处理后的视频（视频流 -c:v copy，不再转码）。
+    # 失败时抛错，由调用方决定保留上游输出，绝不静默产出无声视频。
+    try:
+        _mux_audio_onto_video(temp_video.name, input_video_path, output_path, timeout=600)
+    finally:
+        try:
+            os.remove(temp_video.name)
+        except OSError:
+            pass
     print(
         f"INFO: residual_cleanup: scanned {frame_no} frames, "
         f"{frames_with_residual} had residual text, "
@@ -2083,33 +2091,94 @@ def _pad_video_duration(video_path, target_duration, timeout=600):
     return path
 
 
-def _ensure_h264(video_path, timeout=1800):
-    """Re-encode `video_path` to H.264 (libx264) if its video stream is not
-    already H.264. Browsers (Chrome/Safari) cannot play mpeg4 / Xvid inside
-    an MP4 container, so any non-H.264 output from upstream STTN or the
-    text-trace refiner would surface as 'audio only' on the result page.
+def _mux_audio_onto_video(video_only_path, audio_source_path, dest_path, timeout=600):
+    """把 `audio_source_path` 的音轨合并到无声视频 `video_only_path` 上。
 
-    Returns the (possibly-replaced) output path. Stream-copies the audio
-    track to keep transcode cost low. Adds +faststart for web streaming.
+    视频流一律 `-c:v copy`（调用方应保证视频已是目标编码，避免额外一代
+    有损转码）；音轨是 AAC 时流拷贝，其他 codec 转码成 AAC 320k（mp4 容器
+    无法直接装 pcm/opus 等流，直接 copy 会静默失败或产出无声视频）。
+    源视频没有音轨时只拷贝视频流。任何 ffmpeg 失败都抛异常，由调用方决定
+    是否回退，绝不静默产出无声视频。
     """
-    import subprocess
-    import cv2
+    from backend.tools.ffmpeg_cli import FFmpegCLI, probe_audio_codec
 
+    ffmpeg_path = FFmpegCLI.instance().ffmpeg_path
+    audio_codec = probe_audio_codec(str(audio_source_path))
+    if audio_codec is None:
+        cmd = [
+            ffmpeg_path, "-y",
+            "-i", str(video_only_path),
+            "-c:v", "copy",
+            "-loglevel", "error",
+            str(dest_path),
+        ]
+    else:
+        audio_args = ["-c:a", "copy"] if audio_codec == "aac" else ["-c:a", "aac", "-b:a", "320k"]
+        cmd = [
+            ffmpeg_path, "-y",
+            "-i", str(video_only_path),
+            "-i", str(audio_source_path),
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            *audio_args,
+            "-shortest",
+            "-loglevel", "error",
+            str(dest_path),
+        ]
+    with open(os.devnull) as devnull:
+        subprocess.check_output(cmd, stdin=devnull, timeout=timeout)
+    if not Path(dest_path).is_file():
+        raise RequestError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            f"Failed to mux audio onto {video_only_path}",
+        )
+
+
+def _probe_video_codec_name(path):
+    """用 ffprobe 获取首个视频流的 codec 名；探测失败返回 None。"""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "json",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        streams = json.loads(result.stdout).get("streams") or []
+        if streams:
+            return streams[0].get("codec_name")
+    except Exception:
+        pass
+    return None
+
+
+def _ensure_h264(video_path, timeout=1800):
+    """Ensure `video_path` is H.264 inside the MP4 container. Browsers
+    (Chrome/Safari) cannot play mpeg4 / Xvid inside an MP4 container, so any
+    non-H.264 output from upstream STTN or the text-trace refiner would
+    surface as 'audio only' on the result page.
+
+    Already-H.264 input is only remuxed (`-c copy` + faststart) — NOT
+    re-encoded — so the tail chain no longer adds a whole extra lossy
+    generation at the end. Non-H.264 input is transcoded once with libx264.
+
+    Returns the (possibly-replaced) output path.
+    """
     path = Path(video_path)
     if not path.is_file():
         return path
-    cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
-        cap.release()
-        return path
-    fourcc_int = int(cap.get(cv2.CAP_PROP_FOURCC) or 0)
-    cap.release()
-    if fourcc_int:
-        codec_chars = "".join(
-            chr((fourcc_int >> (8 * i)) & 0xFF) for i in range(4)
-        ).lower()
-        if codec_chars in ("avc1", "h264"):
-            return path  # already H.264
+    codec_name = _probe_video_codec_name(path)
 
     # ffmpeg binary (with vendor FFMPEG_PATH override if available).
     ffmpeg_path = "ffmpeg"
@@ -2118,6 +2187,38 @@ def _ensure_h264(video_path, timeout=1800):
         ffmpeg_path = getattr(_vsr_cfg, "FFMPEG_PATH", "ffmpeg") or "ffmpeg"
     except Exception:
         pass
+
+    if codec_name == "h264":
+        # 已是 H.264：只做 faststart remux（把 moov 挪到文件头便于浏览器
+        # 流式播放），不重新编码。remux 失败不致命——原文件本来就能播。
+        remux_path = path.with_name(path.stem + "_remux.mp4")
+        if remux_path.is_file():
+            try:
+                remux_path.unlink()
+            except OSError:
+                pass
+        cmd = [
+            ffmpeg_path, "-y", "-loglevel", "error",
+            "-i", str(path),
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(remux_path),
+        ]
+        try:
+            with open(os.devnull) as devnull:
+                subprocess.check_output(cmd, stdin=devnull, timeout=timeout)
+            if remux_path.is_file():
+                path.unlink()
+                remux_path.replace(path)
+                print(f"INFO: _ensure_h264: remuxed with faststart ({path})")
+        except Exception as remux_exc:
+            print(f"WARN: _ensure_h264: faststart remux failed ({remux_exc}); keeping original file")
+            try:
+                if remux_path.is_file():
+                    remux_path.unlink()
+            except OSError:
+                pass
+        return path
 
     h264_path = path.with_name(path.stem + "_h264.mp4")
     if h264_path.is_file():
@@ -2200,187 +2301,11 @@ def _probe_video_info(path):
         return {"duration": 0, "nb_frames": 0}
 
 
-_STTN_PATCHED = False
-
-
-def _patch_sttn_none_safe_and_quality():
-    global _STTN_PATCHED
-    if _STTN_PATCHED:
-        return
-
-    try:
-        from backend.inpaint.sttn_inpaint import STTNInpaint, STTNVideoInpaint
-    except ImportError:
-        print("WARNING: Cannot import STTNInpaint/STTNVideoInpaint, skip None-safe+quality patch")
-        return
-
-    import copy
-    import cv2
-    import numpy as np
-
-    _original_inpaint_call = STTNInpaint.__call__
-
-    def _safe_sttn_inpaint_call(self, input_frames, input_mask):
-        _, mask = cv2.threshold(input_mask, 127, 1, cv2.THRESH_BINARY)
-        mask = mask[:, :, None]
-        H_ori, W_ori = mask.shape[:2]
-        H_ori = int(H_ori + 0.5)
-        W_ori = int(W_ori + 0.5)
-        split_h = int(W_ori * 3 / 16)
-        from backend.tools.inpaint_tools import get_inpaint_area_by_mask as _get_ia
-        inpaint_area = _get_ia(W_ori, H_ori, split_h, mask)
-
-        none_mask = [f is None for f in input_frames]
-        valid_frames = [f for f in input_frames if f is not None]
-
-        if not valid_frames or not inpaint_area:
-            return [f if f is not None else np.zeros((H_ori, W_ori, 3), dtype=np.uint8) for f in input_frames]
-
-        frames_hr = [f.copy() for f in valid_frames]
-        frames_scaled = {}
-        comps = {}
-
-        for k in range(len(inpaint_area)):
-            frames_scaled[k] = []
-
-        for j in range(len(frames_hr)):
-            image = frames_hr[j]
-            for k in range(len(inpaint_area)):
-                image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], :, :]
-                image_resize = cv2.resize(image_crop, (self.model_input_width, self.model_input_height))
-                frames_scaled[k].append(image_resize)
-
-        for k in range(len(inpaint_area)):
-            comps[k] = self.inpaint(frames_scaled[k])
-
-        FEATHER_SIGMA = 2.0
-
-        if inpaint_area:
-            for j in range(len(frames_hr)):
-                frame = frames_hr[j]
-                for k in range(len(inpaint_area)):
-                    comp_result = comps[k][j]
-                    if comp_result is None:
-                        continue
-                    comp = cv2.resize(comp_result, (W_ori, split_h))
-                    comp = cv2.cvtColor(np.array(comp).astype(np.uint8), cv2.COLOR_BGR2RGB)
-                    mask_area = mask[inpaint_area[k][0]:inpaint_area[k][1], :]
-                    feathered = cv2.GaussianBlur(mask_area.astype(np.float32), (0, 0), FEATHER_SIGMA)
-                    if feathered.ndim == 2:
-                        feathered = feathered[:, :, None]
-                    frame[inpaint_area[k][0]:inpaint_area[k][1], :, :] = (
-                        feathered * comp.astype(np.float32)
-                        + (1.0 - feathered) * frame[inpaint_area[k][0]:inpaint_area[k][1], :, :].astype(np.float32)
-                    ).astype(np.uint8)
-
-        result = []
-        valid_idx = 0
-        for i in range(len(input_frames)):
-            if none_mask[i]:
-                result.append(np.zeros((H_ori, W_ori, 3), dtype=np.uint8))
-            else:
-                result.append(frames_hr[valid_idx])
-                valid_idx += 1
-        return result
-
-    STTNInpaint.__call__ = _safe_sttn_inpaint_call
-
-    _original_video_call = STTNVideoInpaint.__call__
-
-    def _safe_sttn_video_call(self, input_mask=None, input_sub_remover=None, tbar=None):
-        reader, frame_info = self.read_frame_info_from_video()
-        if input_sub_remover is not None:
-            writer = input_sub_remover.video_writer
-        else:
-            writer = cv2.VideoWriter(
-                self.video_out_path,
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                frame_info['fps'],
-                (frame_info['W_ori'], frame_info['H_ori']),
-            )
-        rec_time = (
-            frame_info['len'] // self.clip_gap
-            if frame_info['len'] % self.clip_gap == 0
-            else frame_info['len'] // self.clip_gap + 1
-        )
-        split_h = int(frame_info['W_ori'] * 3 / 16)
-        if input_mask is None:
-            mask = self.sttn_inpaint.read_mask(self.mask_path)
-        else:
-            _, mask = cv2.threshold(input_mask, 127, 1, cv2.THRESH_BINARY)
-            mask = mask[:, :, None]
-        from backend.tools.inpaint_tools import get_inpaint_area_by_mask as _get_ia2
-        inpaint_area = _get_ia2(frame_info['W_ori'], frame_info['H_ori'], split_h, mask)
-
-        FEATHER_SIGMA = 2.0
-        skipped_frames = 0
-
-        for i in range(rec_time):
-            start_f = i * self.clip_gap
-            end_f = min((i + 1) * self.clip_gap, frame_info['len'])
-            print('Processing:', start_f + 1, '-', end_f, ' / Total:', frame_info['len'])
-            frames_hr = []
-            frames = {}
-            comps = {}
-            for k in range(len(inpaint_area)):
-                frames[k] = []
-
-            for j in range(start_f, end_f):
-                success, image = reader.read()
-                if not success or image is None:
-                    skipped_frames += 1
-                    continue
-                frames_hr.append(image)
-                for k in range(len(inpaint_area)):
-                    image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], :, :]
-                    image_resize = cv2.resize(image_crop, (self.sttn_inpaint.model_input_width, self.sttn_inpaint.model_input_height))
-                    frames[k].append(image_resize)
-
-            if not frames_hr:
-                print(f'WARNING: No valid frames in chunk {i}, skipping')
-                continue
-
-            actual_frame_count = len(frames_hr)
-
-            for k in range(len(inpaint_area)):
-                comps[k] = self.sttn_inpaint.inpaint(frames[k])
-
-            if inpaint_area:
-                for j in range(actual_frame_count):
-                    if input_sub_remover is not None and input_sub_remover.gui_mode:
-                        original_frame = copy.deepcopy(frames_hr[j])
-                    else:
-                        original_frame = None
-                    frame = frames_hr[j]
-                    for k in range(len(inpaint_area)):
-                        comp_result = comps[k][j]
-                        if comp_result is None:
-                            continue
-                        comp = cv2.resize(comp_result, (frame_info['W_ori'], split_h))
-                        comp = cv2.cvtColor(np.array(comp).astype(np.uint8), cv2.COLOR_BGR2RGB)
-                        mask_area = mask[inpaint_area[k][0]:inpaint_area[k][1], :]
-                        feathered = cv2.GaussianBlur(mask_area.astype(np.float32), (0, 0), FEATHER_SIGMA)
-                        if feathered.ndim == 2:
-                            feathered = feathered[:, :, None]
-                        frame[inpaint_area[k][0]:inpaint_area[k][1], :, :] = (
-                            feathered * comp.astype(np.float32)
-                            + (1.0 - feathered) * frame[inpaint_area[k][0]:inpaint_area[k][1], :, :].astype(np.float32)
-                        ).astype(np.uint8)
-                    writer.write(frame)
-                    if input_sub_remover is not None:
-                        if tbar is not None:
-                            input_sub_remover.update_progress(tbar, increment=1)
-                        if original_frame is not None and input_sub_remover.gui_mode:
-                            input_sub_remover.preview_frame = cv2.hconcat([original_frame, frame])
-
-        if skipped_frames > 0:
-            print(f'INFO: Skipped {skipped_frames} unreadable frame(s) during STTN processing')
-        writer.release()
-
-    STTNVideoInpaint.__call__ = _safe_sttn_video_call
-
-    _STTN_PATCHED = True
-    print("INFO: Patched STTNInpaint.__call__ and STTNVideoInpaint.__call__ (None-safe + feathered blending)")
+# 历史说明：这里曾有 _patch_sttn_none_safe_and_quality()，试图 monkey-patch
+# backend.inpaint.sttn_inpaint（该模块根本不存在，ImportError 被吞，patch
+# 从未生效）。其中的高斯羽化 mask 内合成逻辑已直接实现在
+# backend/inpaint/sttn_det_inpaint.py 的 STTNDetInpaint.__call__ 中，
+# 死代码 patch 已删除。
 
 
 def _start_progress_poller(remover, phase, scale_end, progress_callback, poll_interval=0.5):
@@ -2425,9 +2350,6 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
             except Exception:
                 pass
 
-    if options["mode"] == "sttn":
-        _patch_sttn_none_safe_and_quality()
-
     ocr_preset_name = options["ocr_preset"]
     ocr_preset = _OCR_PRESETS.get(ocr_preset_name, _OCR_PRESETS["default"])
     ocr_bbox_y_pad = max(0, int(options.get("ocr_bbox_y_pad") or 0))
@@ -2446,36 +2368,47 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
     main_scale_end = 100.0
     remover = None
     poller_stop = None
+    fallback_triggered = False
     phase_label = "sttn" if options["mode"] == "sttn" else options["mode"]
     use_multiline_auto_strategy = _uses_multiline_auto_strategy(options)
     for attempt in range(2):
         remover = SubtitleRemover(str(video_path), sub_area=area)
-        detector_kwargs = {}
+        detector_kwargs = {
+            "bbox_min_inside_ratio": options.get("bbox_min_inside_ratio", 1.0),
+            "ocr_sample_step": options.get("ocr_sample_step", 0),
+        }
         if options.get("sttn_skip_detection", False):
             print(f"INFO: _run_subtitle_remover sttn_skip_detection=True, OCR override not needed")
         else:
             if need_ocr_override:
-                print(f"INFO: _run_subtitle_remover overriding OCR detector: ocr_preset={ocr_preset_name}, det_db_thresh={ocr_preset.get('det_db_thresh')}, det_db_box_thresh={ocr_preset.get('det_db_box_thresh')}, det_limit_side_len={ocr_preset.get('det_limit_side_len')}, ocr_bbox_y_pad={ocr_bbox_y_pad}")
-                detector_kwargs = {
+                print(f"INFO: _run_subtitle_remover overriding OCR detector: ocr_preset={ocr_preset_name}, det_db_thresh={ocr_preset.get('det_db_thresh')}, det_db_box_thresh={ocr_preset.get('det_db_box_thresh')}, det_limit_side_len={ocr_preset.get('det_limit_side_len')}, ocr_bbox_y_pad={ocr_bbox_y_pad}, bbox_min_inside_ratio={detector_kwargs['bbox_min_inside_ratio']}, ocr_sample_step={detector_kwargs['ocr_sample_step']}")
+                detector_kwargs.update({
                     "det_db_thresh": ocr_preset.get("det_db_thresh"),
                     "det_db_box_thresh": ocr_preset.get("det_db_box_thresh"),
                     "det_limit_side_len": ocr_preset.get("det_limit_side_len"),
-                }
+                })
             elif ocr_bbox_y_pad > 0:
                 print(f"INFO: _run_subtitle_remover ocr_bbox_y_pad={ocr_bbox_y_pad}, using built-in OCR thresholds")
-            if detector_kwargs or ocr_bbox_y_pad > 0:
-                remover.sub_detector = _build_padded_subtitle_detector(
-                    SubtitleDetect, video_path, area, ocr_bbox_y_pad, **detector_kwargs
-                )
-        old_values = _apply_config_options(config, options)
+            # 始终注入检测器：bbox_min_inside_ratio / ocr_sample_step 对默认
+            # preset 同样生效，且 detector peek 依赖 remover.sub_detector 存在
+            # （历史上默认 preset + 无 y_pad 时 sub_detector 未注入，peek 直接
+            # AttributeError，空检测兜底永远不触发）。
+            remover.sub_detector = _build_padded_subtitle_detector(
+                SubtitleDetect, video_path, area, ocr_bbox_y_pad, **detector_kwargs
+            )
+        # 只在首次 attempt 捕获 old_values；CUDNN 重试时重新应用即可，
+        # 否则恢复时会把 attempt 1 改过的值当成"原始值"恢复回去。
+        new_old_values = _apply_config_options(config, options)
+        if attempt == 0:
+            old_values = new_old_values
         # Detector-empty fallback: if STTN is the engine and the user did
         # NOT explicitly request skip_detection, peek at the OCR result
         # first. If sub_list is empty (PaddleOCR missed the subtitles —
         # common with thick-black-stroke + AA-fringe hardcoded subs on
-        # 1080p), flip STTN_SKIP_DETECTION=True so sttn_mode() takes the
-        # sttn_mode_with_no_detection branch and inpaints the entire
-        # sub_area. Without this, an OCR miss means every frame gets
-        # written unchanged and the user sees the original subtitle.
+        # 1080p), switch inpaintMode to STTN_AUTO so the whole sub_area is
+        # inpainted instead of silently writing the original frames back.
+        # empty_detection_full_inpaint=False turns this into a hard error
+        # so the caller knows detection came up empty.
         if (
             options["mode"] == "sttn"
             and not options.get("sttn_skip_detection", False)
@@ -2487,13 +2420,21 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
                 print(f"WARN: detector peek failed ({type(peek_exc).__name__}: {peek_exc}), proceeding without fallback")
                 peek_list = None
             if peek_list is not None and len(peek_list) == 0:
+                if not options.get("empty_detection_full_inpaint", True):
+                    _restore_config_options(config, old_values)
+                    raise RequestError(
+                        HTTPStatus.UNPROCESSABLE_ENTITY,
+                        "OCR 在字幕区域内没有检测到任何字幕（empty_detection_full_inpaint=false）。"
+                        "请检查 sub_area 是否覆盖字幕，或换用更灵敏的 ocr_preset。",
+                    )
                 print(
                     "WARN: STTN detector found no subtitle frames in sub_area — "
-                    "falling back to STTN_SKIP_DETECTION=True (use the entire "
-                    "sub_area as the inpaint mask). Override with "
-                    "sttn_skip_detection=False to keep the empty result."
+                    "falling back to STTN_AUTO (use the entire sub_area as the "
+                    "inpaint mask). Set empty_detection_full_inpaint=False to "
+                    "turn this into an error instead."
                 )
-                config.STTN_SKIP_DETECTION = True
+                config.config.set(config.config.inpaintMode, config.InpaintMode.STTN_AUTO, save=False)
+                fallback_triggered = True
             else:
                 if use_multiline_auto_strategy and peek_list:
                     max_lines, max_line_frame = _max_subtitle_line_count(peek_list)
@@ -2519,10 +2460,6 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
                             "INFO: multiline OCR preset did not find 3-line subtitles "
                             f"(max_lines={max_lines}); using normal repair chain"
                         )
-                # Restore whatever the original value was so a non-empty
-                # detector result doesn't accidentally trigger skip mode
-                # later if a downstream pass re-reads config.
-                config.STTN_SKIP_DETECTION = bool(options.get("sttn_skip_detection", False))
         has_refine = bool(options.get("post_lama_refine") and options["mode"] == "sttn")
         has_residual_tail = bool(
             options["mode"] != "blur_cover"
@@ -2725,7 +2662,7 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
     except Exception as h264_exc:
         print(f"WARN: _ensure_h264 failed: {h264_exc}; returning original output")
     print(f"[phase] _run_subtitle_remover: done (total={time.time() - _sr_t0:.1f}s)", flush=True)
-    return output_path
+    return output_path, fallback_triggered
 
 
 def _normalize_detect_options(payload):
@@ -2747,6 +2684,7 @@ def _normalize_detect_options(payload):
         "raw_area_buffer_y",
         "max_boxes",
         "ocr_preset",
+        "bbox_min_inside_ratio",
         "crop_to_band",
         "band_extra_pct",
         "early_stop_hit_frames",
@@ -2779,6 +2717,8 @@ def _normalize_detect_options(payload):
         "raw_area_buffer_y": _bounded_int(merged.get("raw_area_buffer_y"), "raw_area_buffer_y", 60, 0, 120),
         "max_boxes": _bounded_int(merged.get("max_boxes"), "max_boxes", 240, 20, 1000),
         "ocr_preset": ocr_preset_raw,
+        # 检测框与字幕区域交集面积占比下限：1.0 = 完全落在区域内（旧行为）。
+        "bbox_min_inside_ratio": _bounded_float(merged.get("bbox_min_inside_ratio"), "bbox_min_inside_ratio", 1.0, 0.0, 1.0),
         "crop_to_band": _to_bool(merged.get("crop_to_band", False)),
         "_crop_to_band_explicit": crop_to_band_value not in (None, ""),
         "band_extra_pct": _bounded_int(merged.get("band_extra_pct"), "band_extra_pct", 10, 0, 30),
@@ -2831,6 +2771,20 @@ def _box_in_area(box, area):
     box_xmax = box["x"] + box["width"]
     box_ymax = box["y"] + box["height"]
     return xmin <= box["x"] and box_xmax <= xmax and ymin <= box["y"] and box_ymax <= ymax
+
+
+def _box_meets_inside_ratio(box, area, min_inside_ratio):
+    """检测框与 area 的交集面积 / 检测框面积 >= min_inside_ratio 时保留。
+    ratio=1.0 等价于完全落在区域内；area 为空或 ratio<=0 不过滤。"""
+    if area is None or min_inside_ratio <= 0:
+        return True
+    ymin, ymax, xmin, xmax = area
+    box_xmax = box["x"] + box["width"]
+    box_ymax = box["y"] + box["height"]
+    inter_w = max(0, min(box_xmax, xmax) - max(box["x"], xmin))
+    inter_h = max(0, min(box_ymax, ymax) - max(box["y"], ymin))
+    box_area = max(1, box["width"] * box["height"])
+    return (inter_w * inter_h) / float(box_area) >= min_inside_ratio
 
 
 def _clamp_box_to_area(box, area):
@@ -3159,7 +3113,7 @@ def _run_subtitle_area_detection(video_path, area, options):
     if non_hpi_fast and not options.get("_early_stop_hit_frames_explicit"):
         early_stop_hit_frames = 8
     effective_options["early_stop_hit_frames"] = early_stop_hit_frames
-    print(f"INFO: _run_subtitle_area_detection hpi_available={hpi_available}, non_hpi_fast={non_hpi_fast}, ocr_preset={ocr_preset_name}, det_db_thresh={det_db_thresh}, det_db_box_thresh={det_db_box_thresh}, det_limit_side_len={det_limit_side_len}, detect_max_edge={detect_max_edge}, ocr_bbox_y_pad={ocr_bbox_y_pad}, sample_count={sample_count}, crop_to_band={effective_options.get('crop_to_band')}, early_stop_hit_frames={early_stop_hit_frames}")
+    print(f"INFO: _run_subtitle_area_detection hpi_available={hpi_available}, non_hpi_fast={non_hpi_fast}, ocr_preset={ocr_preset_name}, det_db_thresh={det_db_thresh}, det_db_box_thresh={det_db_box_thresh}, det_limit_side_len={det_limit_side_len}, detect_max_edge={detect_max_edge}, ocr_bbox_y_pad={ocr_bbox_y_pad}, bbox_min_inside_ratio={options.get('bbox_min_inside_ratio')}, sample_count={sample_count}, crop_to_band={effective_options.get('crop_to_band')}, early_stop_hit_frames={early_stop_hit_frames}")
 
     video_cap = cv2.VideoCapture(str(video_path))
     if not video_cap.isOpened():
@@ -3170,11 +3124,16 @@ def _run_subtitle_area_detection(video_path, area, options):
         width = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         height = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
         frame_numbers = _sample_frame_numbers(frame_count, sample_count)
+        # sub_area=None 是有意的：detect_subtitle 的 sub_area 过滤在全帧
+        # 坐标系下比较，而这里喂给它的是 ROI 裁剪帧（crop 局部坐标），传
+        # sub_area=area 会把检测框全部错杀。区域过滤改为在下方还原到全帧
+        # 坐标后按 bbox_min_inside_ratio 在 API 层执行。
         detector = SubtitleDetect(
-            str(video_path), sub_area=area,
+            str(video_path), sub_area=None,
             det_db_thresh=det_db_thresh, det_db_box_thresh=det_db_box_thresh,
             det_limit_side_len=det_limit_side_len,
         )
+        min_inside_ratio = float(options.get("bbox_min_inside_ratio", 1.0))
         boxes = []
         frames_sampled = []
 
@@ -3191,6 +3150,8 @@ def _run_subtitle_area_detection(video_path, area, options):
                 detect_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2]
                 for coord in _detect_subtitle_on_frame(detector, detect_frame, width, height, detect_max_edge, ocr_bbox_y_pad, roi_x1, roi_y1):
                     box = _box_from_coords(frame_no, coord, width, height)
+                    if not _box_meets_inside_ratio(box, area, min_inside_ratio):
+                        continue
                     box = _clamp_box_to_area(box, area)
                     if box["width"] <= 1 or box["height"] <= 1 or not _box_in_area(box, area):
                         continue
@@ -3211,6 +3172,8 @@ def _run_subtitle_area_detection(video_path, area, options):
                 detect_frame = frame[roi_y1:roi_y2, roi_x1:roi_x2]
                 for coord in _detect_subtitle_on_frame(detector, detect_frame, width, height, detect_max_edge, ocr_bbox_y_pad, roi_x1, roi_y1):
                     box = _box_from_coords(current_frame, coord, width, height)
+                    if not _box_meets_inside_ratio(box, area, min_inside_ratio):
+                        continue
                     box = _clamp_box_to_area(box, area)
                     if box["width"] <= 1 or box["height"] <= 1 or not _box_in_area(box, area):
                         continue
@@ -3423,7 +3386,7 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                     )
 
             with PROCESS_LOCK:
-                output_path = _run_subtitle_remover(
+                output_path, fallback_triggered = _run_subtitle_remover(
                     source_path, area, options, refine_area,
                     progress_callback=_job_progress,
                 )
@@ -3441,6 +3404,8 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                     "area": list(area) if area is not None else None,
                     "refine_area": list(refine_area) if refine_area is not None else None,
                     "options": options,
+                    # OCR 检测为空时是否触发了整区 STTN_AUTO 重绘兜底
+                    "fallback_triggered": fallback_triggered,
                     "elapsed_seconds": round(time.time() - started_at, 3),
                 },
             )

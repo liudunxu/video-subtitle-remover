@@ -1,5 +1,7 @@
+import json
 import os
 import stat
+import subprocess
 
 import platform
 from .common_tools import merge_big_file_if_not_exists
@@ -34,3 +36,43 @@ class FFmpegCLI:
             return os.path.join(BASE_DIR, 'ffmpeg',  'linux_x64', 'ffmpeg')
         else:
             return os.path.join(BASE_DIR, 'ffmpeg', 'macos', 'ffmpeg')
+
+    @property
+    def ffprobe_path(self):
+        """优先使用与 vendored ffmpeg 同目录的 ffprobe，否则回退 PATH 上的 ffprobe。"""
+        sibling = os.path.join(
+            os.path.dirname(self.ffmpeg_path),
+            'ffprobe.exe' if platform.system() == "Windows" else 'ffprobe',
+        )
+        if os.path.isfile(sibling):
+            return sibling
+        return 'ffprobe'
+
+
+def probe_audio_codec(video_path):
+    """探测视频首个音轨的 codec 名（如 'aac' / 'mp3'）。
+
+    Returns:
+        codec 名字符串；源视频没有音轨时返回 None；探测失败（ffprobe
+        缺失/超时/输出异常）返回 'unknown'，调用方应按未知 codec 走
+        安全的转码路径而不是静默放弃音轨。
+    """
+    try:
+        output = subprocess.check_output(
+            [
+                FFmpegCLI.instance().ffprobe_path,
+                '-v', 'error',
+                '-select_streams', 'a:0',
+                '-show_entries', 'stream=codec_name',
+                '-of', 'json',
+                str(video_path),
+            ],
+            stdin=subprocess.DEVNULL,
+            timeout=60,
+        )
+        streams = json.loads(output.decode('utf-8')).get('streams') or []
+        if not streams:
+            return None
+        return streams[0].get('codec_name') or 'unknown'
+    except Exception:
+        return 'unknown'

@@ -1,3 +1,4 @@
+import inspect
 import sys
 from functools import cached_property
 
@@ -12,6 +13,58 @@ from backend.scenedetect import scene_detect
 from backend.scenedetect.detectors import ContentDetector
 from backend.tools.inpaint_tools import is_frame_number_in_ab_sections
 
+# OCR 阈值参数在不同 paddleocr 大版本下的构造参数名映射：
+# 2.x 用 det_db_thresh / det_db_box_thresh / det_limit_side_len，
+# 3.x（PaddleX 后端）改名为 thresh / box_thresh / limit_side_len。
+_DET_PARAM_ALIASES = {
+    "det_db_thresh": ("det_db_thresh", "thresh"),
+    "det_db_box_thresh": ("det_db_box_thresh", "box_thresh"),
+    "det_limit_side_len": ("det_limit_side_len", "limit_side_len"),
+    "det_limit_type": ("det_limit_type", "limit_type"),
+    "det_db_unclip_ratio": ("det_db_unclip_ratio", "unclip_ratio"),
+}
+
+
+def _accepted_init_params(cls):
+    """返回 (形参名集合, 是否带 **kwargs)。取不到签名时保守返回带 **kwargs。"""
+    try:
+        parameters = inspect.signature(cls.__init__).parameters.values()
+    except (TypeError, ValueError):
+        return set(), True
+    names = set()
+    has_var_keyword = False
+    for param in parameters:
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            has_var_keyword = True
+        elif param.name != "self":
+            names.add(param.name)
+    return names, has_var_keyword
+
+
+def _map_detector_threshold_kwargs(detector_cls, raw_kwargs):
+    """把 det_db_* 形式的阈值 kwargs 映射为当前 paddleocr 版本
+    TextDetection 真正接受的参数名。返回 (映射后的 dict, 被跳过的参数名列表)。
+    """
+    accepted, has_var_keyword = _accepted_init_params(detector_cls)
+    mapped = {}
+    skipped = []
+    for legacy_name, (v2_name, v3_name) in _DET_PARAM_ALIASES.items():
+        value = raw_kwargs.get(legacy_name)
+        if value is None:
+            continue
+        if v3_name in accepted:
+            mapped[v3_name] = value
+        elif v2_name in accepted:
+            mapped[v2_name] = value
+        elif has_var_keyword:
+            # 签名里看不到具体形参（只有 **kwargs）时按 3.x 命名传入，
+            # 构造失败会在 text_detector 里回退到无阈值构造。
+            mapped[v3_name] = value
+        else:
+            skipped.append(legacy_name)
+    return mapped, skipped
+
+
 class SubtitleDetect:
     """
     文本框检测类，用于检测视频帧中是否存在文本框
@@ -20,16 +73,29 @@ class SubtitleDetect:
     # 采样间隔，根据视频帧率在 _init_sample_step 中自适应设置
     SAMPLE_STEP = 3
 
-    def __init__(self, video_path, sub_areas=[], sub_area=None, **kwargs):
+    def __init__(self, video_path, sub_areas=[], sub_area=None,
+                 bbox_min_inside_ratio=1.0, ocr_sample_step=0, **kwargs):
         self.video_path = video_path
         self.sub_areas = sub_areas
         if sub_area is not None:
             self.sub_areas = [sub_area]
+        # 检测框与字幕区域交集面积占比下限：1.0 = 完全落在区域内才保留（旧行为）
+        if bbox_min_inside_ratio is None:
+            bbox_min_inside_ratio = 1.0
+        self.bbox_min_inside_ratio = max(0.0, min(1.0, float(bbox_min_inside_ratio)))
+        # OCR 采样间隔覆盖：0 = 按帧率自适应（旧行为），>=1 时强制（1 = 逐帧）
+        self.ocr_sample_step = max(0, int(ocr_sample_step or 0))
         self._kwargs = kwargs
+        # 构造 TextDetection 被拒收阈值时退化为 predict 层按 box_thresh 过滤低分框
+        self._score_filter_min = None
         self._init_sample_step()
 
     def _init_sample_step(self):
-        """根据视频帧率自适应设置采样间隔，保持每秒至少采样8帧"""
+        """根据视频帧率自适应设置采样间隔，保持每秒至少采样8帧。
+        ocr_sample_step >= 1 时直接使用覆盖值。"""
+        if self.ocr_sample_step >= 1:
+            self.SAMPLE_STEP = self.ocr_sample_step
+            return
         cap = cv2.VideoCapture(get_readable_path(self.video_path))
         fps = cap.get(cv2.CAP_PROP_FPS)
         cap.release()
@@ -58,20 +124,76 @@ class SubtitleDetect:
         # 来探测运行时 GPU 是否真的可见（编译期有 CUDA ≠ 运行时能找到设备）。
         use_gpu = paddle.device.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0
         device = "gpu" if use_gpu else "cpu"
-        return TextDetection(
+        # 把 det_db_* 阈值映射为当前 paddleocr 版本真正接受的参数名
+        # （2.x: det_db_thresh/det_db_box_thresh/det_limit_side_len；
+        #  3.x: thresh/box_thresh/limit_side_len），否则阈值会被静默忽略，
+        # 导致 OCR 灵敏度 preset 完全不生效。
+        threshold_kwargs, skipped = _map_detector_threshold_kwargs(TextDetection, self._kwargs)
+        if skipped:
+            print(f"WARNING: SubtitleDetect thresholds not supported by this paddleocr version, ignored: {skipped}")
+        base_kwargs = dict(
             model_name=model_config.DET_MODEL_NAME,
             model_dir=model_config.DET_MODEL_DIR,
             device=device,
             enable_hpi=enable_hpi,
         )
+        try:
+            detector = TextDetection(**base_kwargs, **threshold_kwargs)
+        except Exception as exc:
+            if not threshold_kwargs:
+                raise
+            # 构造器拒收阈值（版本签名不匹配）：退回无阈值构造，
+            # 并在 predict 层用 det_db_box_thresh 过滤低分框作为兜底。
+            print(
+                f"WARNING: TextDetection rejected OCR thresholds {threshold_kwargs} "
+                f"({type(exc).__name__}: {exc}); falling back to model defaults "
+                f"+ score filtering"
+            )
+            self._score_filter_min = self._kwargs.get("det_db_box_thresh")
+            detector = TextDetection(**base_kwargs)
+        # 验证阈值确实被底层 predictor 接受（paddlex 3.x 会把
+        # thresh/box_thresh/limit_side_len 存为 predictor 属性）
+        applied = {}
+        for name in ("thresh", "box_thresh", "limit_side_len"):
+            try:
+                applied[name] = getattr(detector.paddlex_predictor, name, None)
+            except Exception:
+                applied[name] = "?"
+        print(f"INFO: SubtitleDetect TextDetection init: device={device}, thresholds={threshold_kwargs or 'default'}, applied={applied}")
+        return detector
+
+    @staticmethod
+    def _box_inside_ratio(box, area):
+        """检测框与字幕区域的交集面积 / 检测框面积。area 为 (ymin, ymax, xmin, xmax)。"""
+        xmin, xmax, ymin, ymax = box
+        s_ymin, s_ymax, s_xmin, s_xmax = area
+        inter_w = max(0, min(xmax, s_xmax) - max(xmin, s_xmin))
+        inter_h = max(0, min(ymax, s_ymax) - max(ymin, s_ymin))
+        box_area = max(1, (xmax - xmin) * (ymax - ymin))
+        return (inter_w * inter_h) / float(box_area)
+
+    def _filter_scores(self, res, dt_polys):
+        """构造器阈值被拒时的兜底：按 det_db_box_thresh 过滤低分框。"""
+        if self._score_filter_min is None or dt_polys is None or len(dt_polys) == 0:
+            return dt_polys
+        try:
+            scores = res["dt_scores"]
+        except Exception:
+            return dt_polys
+        if scores is None or len(scores) != len(dt_polys):
+            return dt_polys
+        keep = [i for i, score in enumerate(scores) if float(score) >= float(self._score_filter_min)]
+        return dt_polys[keep]
 
     def detect_subtitle(self, img):
         temp_list = []
         results = self.text_detector.predict(img)
         sub_areas = self.sub_areas
         has_areas = sub_areas is not None and len(sub_areas) > 0
+        min_inside_ratio = self.bbox_min_inside_ratio
         for res in results:
             dt_polys = res['dt_polys']
+            dt_polys = self._filter_scores(res, dt_polys)
             if dt_polys is None or len(dt_polys) == 0:
                 continue
             coordinate_list = get_coordinates(dt_polys.tolist())
@@ -81,15 +203,14 @@ class SubtitleDetect:
                 temp_list.extend(coordinate_list)
             elif len(sub_areas) == 1:
                 # 单区域快速路径（最常见场景）
-                s_ymin, s_ymax, s_xmin, s_xmax = sub_areas[0]
-                for xmin, xmax, ymin, ymax in coordinate_list:
-                    if s_xmin <= xmin and xmax <= s_xmax and s_ymin <= ymin and ymax <= s_ymax:
-                        temp_list.append((xmin, xmax, ymin, ymax))
+                for coord in coordinate_list:
+                    if self._box_inside_ratio(coord, sub_areas[0]) >= min_inside_ratio:
+                        temp_list.append(coord)
             else:
-                for xmin, xmax, ymin, ymax in coordinate_list:
-                    for s_ymin, s_ymax, s_xmin, s_xmax in sub_areas:
-                        if s_xmin <= xmin and xmax <= s_xmax and s_ymin <= ymin and ymax <= s_ymax:
-                            temp_list.append((xmin, xmax, ymin, ymax))
+                for coord in coordinate_list:
+                    for area in sub_areas:
+                        if self._box_inside_ratio(coord, area) >= min_inside_ratio:
+                            temp_list.append(coord)
                             break
         return temp_list
 

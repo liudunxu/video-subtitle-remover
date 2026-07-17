@@ -39,5 +39,10 @@ RUN --mount=type=cache,target=/root/.cache,sharing=private \
 ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib/
 ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib/
 ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/
+# STTN_DET 画质调优旋钮（含义见 docker/Dockerfile.gpu 注释）：crop 带高
+# 余量与模型输入尺寸；非法输入尺寸会被忽略并回退 432x240。
+ENV VSR_STTN_BAND_MARGIN=40
+ENV VSR_STTN_INPUT_WIDTH=432
+ENV VSR_STTN_INPUT_HEIGHT=240
 WORKDIR /vsr
 CMD ["python", "/vsr/backend/main.py"]

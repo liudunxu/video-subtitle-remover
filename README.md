@@ -146,6 +146,22 @@ API 服务的 `/api/remove-subtitle` 和 `/api/detect-subtitle-area` 支持两�
 JSON 里的 `video_url`（HTTP/file/local path）或 `multipart/form-data` 的 `video` 文件字段。
 100MB+ 视频不要用 base64 JSON；远程调用推荐 multipart，参数放在 `payload` JSON 字段。
 检测灵敏度 `ocr_preset` 支持 `default` / `fuzzy` / `ultra` / `multiline` / `aggressive`；其中 `multiline` 会在检测到 3 行及以上字幕时自动启用 STTN 修边和残字兜底修复，但只应用到对应的多行字幕帧，其他帧保持默认处理链。
+preset 的 `det_db_thresh` / `det_db_box_thresh` / `det_limit_side_len` 会按安装的大版本映射成 PaddleOCR 真正接受的参数名（2.x 同名；3.x/PaddleX 为 `thresh` / `box_thresh` / `limit_side_len`），构造日志会打印实际生效值。
+
+`/api/remove-subtitle` 的 `options` 还支持：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `bbox_min_inside_ratio` | 1.0 | OCR 检测框与字幕区域的交集面积占比下限；1.0 = 完全落在区域内才保留（旧行为），调小（如 0.6）可保留压在区域边缘的检测框 |
+| `ocr_sample_step` | 0 | OCR 采样间隔；0 = 按帧率自适应（旧行为），1 = 逐帧检测（最慢但最不易漏），最大 30 |
+| `empty_detection_full_inpaint` | true | OCR 检测不到字幕时：true = 整区每帧 STTN_AUTO 重绘（旧行为）；false = 返回 422 报错让调用方感知。响应里的 `fallback_triggered` 字段标记本次是否触发了整区重绘兜底 |
+
+STTN 修复相关环境变量（docker 镜像已内置默认值）：
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `VSR_STTN_BAND_MARGIN` | 40 | STTN_DET 的 crop 高度按 mask 字幕带自适应：最高字幕带 + 2×margin（px），空 mask 回退旧的比例逻辑 |
+| `VSR_STTN_INPUT_WIDTH` / `VSR_STTN_INPUT_HEIGHT` | 432 / 240 | STTN_DET 模型输入尺寸；受注意力 patch 网格约束仅允许 432/240 的整数倍且 ≤864×480，非法值回退 432×240 |
 
 ---
 

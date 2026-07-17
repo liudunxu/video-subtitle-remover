@@ -422,47 +422,65 @@ class SubtitleRemover:
         self.append_output(tr['Main']['SubtitleDetectionModel'].format(f"{detect_mode_name}{providers_str}"))
 
     def merge_audio_to_video(self):
+        """把源视频的音轨合并到去字幕后生成的无声视频上。
+
+        源音频是 AAC 时直接流拷贝；其他 codec（mp3/opus/pcm 等）转码成
+        AAC 320k——旧逻辑一律 `-acodec copy` 抽成 .aac，非 AAC 源会静默
+        产出无声视频。源视频本身没有音轨时直接输出无声视频（合理结果）。
+        抽取或合并失败一律抛异常，不再静默回退成无声视频。
+        """
+        from backend.tools.ffmpeg_cli import probe_audio_codec
+        ffmpeg_path = FFmpegCLI.instance().ffmpeg_path
+        use_shell = True if os.name == "nt" else False
+
+        audio_codec = probe_audio_codec(self.video_path)
+        if audio_codec is None:
+            # 源视频没有音轨：处理后视频直接作为输出
+            self.append_output('No audio track in source video, output video-only file')
+            shutil.copy2(self.video_temp_file.name, self.video_out_path)
+            self.is_successful_merged = True
+            self.video_temp_file.close()
+            return
+
         # 创建音频临时对象，windows下delete=True会有permission denied的报错
         temp = tempfile.NamedTemporaryFile(suffix='.aac', delete=False)
-        audio_extract_command = [FFmpegCLI.instance().ffmpeg_path,
-                                 "-y", "-i", self.video_path,
-                                 "-acodec", "copy",
-                                 "-vn", "-loglevel", "error", temp.name]
-        use_shell = True if os.name == "nt" else False
+        temp.close()
         try:
-            subprocess.check_output(audio_extract_command, stdin=open(os.devnull), shell=use_shell, timeout=600)
-        except Exception as e:
-            traceback.print_exc()
-            self.append_output(tr['Main']['FailToExtractAudio'].format(str(e)))
-            return
-        else:
-            if os.path.exists(self.video_temp_file.name):
-                audio_merge_command = [FFmpegCLI.instance().ffmpeg_path,
-                                       "-y", "-i", self.video_temp_file.name,
-                                       "-i", temp.name,
-                                       "-vcodec", "copy",
-                                       "-acodec", "copy",
-                                       "-loglevel", "error", self.video_out_path]
-                try:
-                    subprocess.check_output(audio_merge_command, stdin=open(os.devnull), shell=use_shell, timeout=600)
-                except Exception as e:
-                    traceback.print_exc()
-                    self.append_output(tr['Main']['FailToMergeAudio'].format(str(e)))
-                    return
+            if audio_codec == 'aac':
+                audio_extract_command = [ffmpeg_path,
+                                         "-y", "-i", self.video_path,
+                                         "-acodec", "copy",
+                                         "-vn", "-loglevel", "error", temp.name]
+            else:
+                self.append_output(f'Source audio codec is {audio_codec}, transcoding to AAC 320k')
+                audio_extract_command = [ffmpeg_path,
+                                         "-y", "-i", self.video_path,
+                                         "-c:a", "aac", "-b:a", "320k",
+                                         "-vn", "-loglevel", "error", temp.name]
+            try:
+                subprocess.check_output(audio_extract_command, stdin=open(os.devnull), shell=use_shell, timeout=600)
+            except Exception as e:
+                raise RuntimeError(f'Failed to extract audio (codec={audio_codec}) from {self.video_path}: {e}') from e
+            if not os.path.exists(self.video_temp_file.name):
+                raise RuntimeError(f'Processed video is missing before audio merge: {self.video_temp_file.name}')
+            audio_merge_command = [ffmpeg_path,
+                                   "-y", "-i", self.video_temp_file.name,
+                                   "-i", temp.name,
+                                   "-vcodec", "copy",
+                                   "-acodec", "copy",
+                                   "-loglevel", "error", self.video_out_path]
+            try:
+                subprocess.check_output(audio_merge_command, stdin=open(os.devnull), shell=use_shell, timeout=600)
+            except Exception as e:
+                raise RuntimeError(f'Failed to merge audio (codec={audio_codec}) onto {self.video_out_path}: {e}') from e
+            self.is_successful_merged = True
+        finally:
             if os.path.exists(temp.name):
                 try:
                     os.remove(temp.name)
                 except Exception:
                     #ignore
                     pass
-            self.is_successful_merged = True
-        finally:
-            temp.close()
-            if not self.is_successful_merged:
-                try:
-                    shutil.copy2(self.video_temp_file.name, self.video_out_path)
-                except IOError as e:
-                    self.append_output(tr['Main']['CopyFileFailed'].format(self.video_temp_file.name, self.video_out_path, str(e)))
             self.video_temp_file.close()
 
     @cached_property

@@ -1,4 +1,5 @@
 import multiprocessing
+import os
 import cv2
 import numpy as np
 
@@ -96,6 +97,80 @@ def create_mask(size, coords_list):
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
 
     return mask
+
+def get_band_driven_split_h(mask, frame_h, frame_w, margin, min_h=96):
+    """根据 mask 非零行的纵向分布计算 STTN crop 高度（split_h）。
+
+    旧逻辑用固定比例（竖屏 H*5/9、横屏 W*5/18），竖屏 1080x1920 时 crop
+    接近正方形，硬压到模型输入 432x240 形变/降质严重。改为 mask 驱动：
+    把含 mask 像素的行按 margin 间隔聚成若干字幕带，取最高字幕带高度
+    + 2*margin，并 clamp 到 [min_h, frame_h]。mask 为空时回退旧比例逻辑。
+
+    Args:
+        mask: (H, W) 或 (H, W, 1) 的 uint8 mask（非零表示待修复区域）
+        frame_h / frame_w: 帧尺寸
+        margin: 字幕带上下各扩的像素，同时作为相邻行带合并的最大间隙
+        min_h: split_h 下限，避免 crop 太小丢失上下文
+
+    Returns:
+        int split_h（保证 1 <= split_h <= frame_h）
+    """
+    if mask is None or mask.size == 0 or not np.any(mask > 0):
+        # 空 mask 回退到旧的比例逻辑
+        if frame_h > frame_w:
+            return int(frame_h * 5 / 9)
+        return int(frame_w * 5 / 18)
+    rows = np.any(mask > 0, axis=tuple(i for i in range(1, mask.ndim)))
+    row_indices = np.flatnonzero(rows)
+    # 相邻非零行间隔 <= margin 的合并为同一字幕带
+    max_band_h = 1
+    band_start = row_indices[0]
+    prev_row = row_indices[0]
+    for row in row_indices[1:]:
+        if row - prev_row > margin:
+            max_band_h = max(max_band_h, prev_row - band_start + 1)
+            band_start = row
+        prev_row = row
+    max_band_h = max(max_band_h, prev_row - band_start + 1)
+    split_h = max_band_h + 2 * int(margin)
+    return max(int(min_h), min(int(frame_h), split_h))
+
+
+def resolve_sttn_det_input_size(environ=None):
+    """解析 STTN_DET 模型输入尺寸（env VSR_STTN_INPUT_WIDTH / VSR_STTN_INPUT_HEIGHT）。
+
+    STTN 的 MultiHeadedAttention 用固定 patchsize [(108, 60), (36, 20),
+    (18, 10), (9, 5)] 对特征图（输入的 1/4）做 reshape，因此特征图宽必须
+    被 108 整除、高必须被 60 整除，即输入宽必须是 432 的整数倍、高必须是
+    240 的整数倍，否则 view() 会直接抛错。合法且封顶 864x480（2x）以内的
+    组合：432x240 / 864x240 / 432x480 / 864x480。校验不过时打 warning 并
+    回退默认 432x240。
+
+    Returns:
+        (width, height) 二元组
+    """
+    environ = os.environ if environ is None else environ
+    default_w, default_h = 432, 240
+    max_w, max_h = 864, 480
+    try:
+        width = int(environ.get("VSR_STTN_INPUT_WIDTH", default_w))
+        height = int(environ.get("VSR_STTN_INPUT_HEIGHT", default_h))
+    except (TypeError, ValueError):
+        print(f"WARNING: invalid VSR_STTN_INPUT_WIDTH/HEIGHT, fallback to {default_w}x{default_h}")
+        return default_w, default_h
+    if (width, height) == (default_w, default_h):
+        return width, height
+    if width % 432 == 0 and height % 240 == 0 and 0 < width <= max_w and 0 < height <= max_h:
+        print(f"INFO: STTN_DET model input size overridden by env: {width}x{height}")
+        return width, height
+    print(
+        f"WARNING: VSR_STTN_INPUT_WIDTH/HEIGHT={width}x{height} rejected "
+        f"(width must be a multiple of 432 and <= {max_w}, height a multiple "
+        f"of 240 and <= {max_h}; the STTN attention patch grid requires it). "
+        f"Fallback to {default_w}x{default_h}."
+    )
+    return default_w, default_h
+
 
 def get_inpaint_area_by_mask(W, H, h, mask, multiple=1):
     """

@@ -12,7 +12,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from backend.config import config
 from backend.inpaint.sttn.network_sttn import InpaintGenerator
 from backend.inpaint.utils.sttn_utils import Stack, ToTorchFormatTensor
-from backend.tools.inpaint_tools import get_inpaint_area_by_mask
+from backend.tools.inpaint_tools import get_inpaint_area_by_mask, get_band_driven_split_h, resolve_sttn_det_input_size
+
+# 合成时 mask 边缘的高斯羽化强度（sigma≈2，过渡带约 5-6px）
+FEATHER_SIGMA = 2.0
 
 # 定义图像预处理方式
 _to_tensors = transforms.Compose([
@@ -29,11 +32,17 @@ class STTNDetInpaint:
         self.model.load_state_dict(torch.load(model_path, map_location='cpu')['netG'])
         # 3. # 将模型设置为评估模式
         self.model.eval()
-        # 模型输入用的宽和高
-        self.model_input_width, self.model_input_height = 432, 240
+        # 模型输入用的宽和高（env VSR_STTN_INPUT_WIDTH/HEIGHT 可调；
+        # 受 STTN 注意力 patch 网格约束，仅允许 432/240 的整数倍且封顶 864x480）
+        self.model_input_width, self.model_input_height = resolve_sttn_det_input_size()
         # 2. 设置相连帧数
         self.neighbor_stride = config.sttnNeighborStride.value
         self.ref_length = config.sttnReferenceLength.value
+        # mask 驱动的 crop 带高余量（env VSR_STTN_BAND_MARGIN 可调）
+        try:
+            self.band_margin = max(0, min(200, int(os.environ.get("VSR_STTN_BAND_MARGIN", "40"))))
+        except (TypeError, ValueError):
+            self.band_margin = 40
 
     def __call__(self, input_frames: List[np.ndarray], input_mask: np.ndarray):
         """
@@ -44,11 +53,10 @@ class STTNDetInpaint:
         H_ori, W_ori = mask.shape[:2]
         H_ori = int(H_ori + 0.5)
         W_ori = int(W_ori + 0.5)
-        # 确定去字幕的垂直高度部分
-        if H_ori > W_ori:
-            split_h = int(H_ori * 5 / 9)
-        else:
-            split_h = int(W_ori * 5 / 18)
+        # 确定去字幕的垂直高度部分：按 mask 非零行的纵向范围决定 crop 高度，
+        # 不再用固定比例（竖屏 1080x1920 旧逻辑 crop 高达 1066px，硬压到
+        # 432x240 再放大贴回形变/降质严重）；空 mask 时回退旧比例逻辑。
+        split_h = get_band_driven_split_h(mask, H_ori, W_ori, self.band_margin)
         inpaint_area = get_inpaint_area_by_mask(W_ori, H_ori, split_h, mask)
         # 初始化帧存储变量
         # 高分辨率帧存储列表（浅拷贝 + 逐帧 copy，避免 deepcopy 开销）
@@ -85,12 +93,29 @@ class STTNDetInpaint:
                 frame = frames_hr[j]  # 取出原始帧
                 # 对于模式中的每一个段落
                 for k in range(len(inpaint_area)):
-                    comp = cv2.resize(comps[k][j], (W_ori, split_h))  # 将补全帧缩放回原大小
+                    y0, y1 = inpaint_area[k][0], inpaint_area[k][1]
+                    crop_h = y1 - y0
+                    comp_result = comps[k][j]
+                    if comp_result is None:
+                        continue
+                    comp = cv2.resize(comp_result, (W_ori, crop_h))  # 将补全帧缩放回原大小
                     comp = cv2.cvtColor(comp.astype(np.uint8), cv2.COLOR_BGR2RGB)  # 转换颜色空间
-                    # 获取遮罩区域并进行图像合成
-                    mask_area = mask[inpaint_area[k][0]:inpaint_area[k][1], :]  # 取出遮罩区域
-                    # 实现遮罩区域内的图像融合
-                    frame[inpaint_area[k][0]:inpaint_area[k][1], :, :] = comp
+                    # 只在（高斯羽化后的）mask 范围内与原始帧混合，mask 外的
+                    # 画面保持原始帧不动——避免整条 crop 带被 432x240 低分辨率
+                    # round-trip 覆盖导致整带发软。
+                    mask_area = mask[y0:y1, :, :]  # 取出遮罩区域
+                    alpha = cv2.GaussianBlur(
+                        (mask_area[:, :, 0] > 127).astype(np.float32), (0, 0), FEATHER_SIGMA
+                    )[:, :, None]
+                    # 高斯羽化在 mask 边界内外都衰减，mask 核心只能到 ~0.98，
+                    # 直接混合会让原字幕像素残留 ~2%。放大 1.02 倍再截断，
+                    # 让 mask 核心饱和到 1（完全用补全帧），羽化过渡保持不变。
+                    alpha = np.clip(alpha * 1.02, 0.0, 1.0)
+                    frame[y0:y1, :, :] = np.clip(
+                        alpha * comp.astype(np.float32)
+                        + (1.0 - alpha) * frame[y0:y1, :, :].astype(np.float32),
+                        0, 255,
+                    ).astype(np.uint8)
                 # 将最终帧添加到列表
                 inpainted_frames.append(frame)
                 # print(f'processing frame, {len(frames_hr) - j} left')
