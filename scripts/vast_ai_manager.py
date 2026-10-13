@@ -19,7 +19,7 @@ BASE_URL = "https://console.vast.ai/api/v0"
 BASE_URL_V1 = "https://console.vast.ai/api/v1"
 DOCKER_REPO = "liudunxu/video-subtitle-remover"
 DOCKER_TAG = "vast-gpu"
-LABEL_PREFIX = "video-subtitle-remover-api"
+LABEL_PREFIX = "video-subtitle-remover-api-"
 DEFAULT_LABEL = "video-subtitle-remover-api-mvp"
 DEFAULT_PORT = 6006
 DEFAULT_DISK = 70
@@ -521,6 +521,24 @@ def cmd_logs(key: str, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_health(key: str, args: argparse.Namespace) -> int:
+    """OmniVoice 风格健康探测：GET <url>/health，要求 200 且 {"ok": true}。"""
+    url = args.url.rstrip("/")
+    try:
+        resp = requests.get(f"{url}/health", timeout=10)
+    except Exception as e:
+        _die(f"health check error: {e}")
+    print(f"/health status={resp.status_code} body={resp.text[:300]}")
+    ok = False
+    try:
+        ok = resp.status_code == 200 and bool(resp.json().get("ok"))
+    except Exception:
+        ok = False
+    if not ok:
+        _die("health check failed (expect HTTP 200 with {\"ok\": true})")
+    return 0
+
+
 def main(argv: List[str] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Manage Vast.ai instances for video-subtitle-remover API."
@@ -533,8 +551,13 @@ def main(argv: List[str] = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("status", help="List matching instances")
+    sub.add_parser("list", help="Alias of status (OmniVoice-style verb)")
 
     p_stop = sub.add_parser("stop", help="Delete all matching instances")
+    sub.add_parser("destroy-all", help="Alias of stop (OmniVoice-style verb)")
+
+    p_health = sub.add_parser("health", help="Check <url>/health (no API key needed)")
+    p_health.add_argument("url", help="Public base URL of the instance")
 
     p_start = sub.add_parser("start", help="Start a new instance")
     p_start.add_argument("--image", default="", help="Docker image (defaults to latest digest)")
@@ -561,13 +584,17 @@ def main(argv: List[str] = None) -> int:
     p_logs.add_argument("instance_id", help="Instance ID")
 
     args = parser.parse_args(argv)
-    key = args.api_key or _api_key()
+    # health 不需要 Vast API key；其余命令必须解析出 key
+    key = None if args.command == "health" else (args.api_key or _api_key())
 
     commands = {
         "status": cmd_status,
+        "list": cmd_status,
         "stop": cmd_stop,
+        "destroy-all": cmd_stop,
         "start": cmd_start,
         "logs": cmd_logs,
+        "health": cmd_health,
     }
     return commands[args.command](key, args)
 

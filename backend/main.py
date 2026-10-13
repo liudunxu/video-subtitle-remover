@@ -12,7 +12,7 @@ from functools import cached_property
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from backend.config import *
+from backend.config import config, InpaintMode, SubtitleDetectMode
 from backend.tools.hardware_accelerator import HardwareAccelerator
 from backend.tools.common_tools import is_video_or_image, is_image_file, get_readable_path, read_image
 from backend.inpaint.sttn_auto_inpaint import STTNAutoInpaint
@@ -30,6 +30,20 @@ import multiprocessing
 import time
 from tqdm import tqdm
 import numpy as np
+
+_INPAINT_MODE_NAMES = {
+    InpaintMode.STTN_AUTO: 'STTN智能擦除',
+    InpaintMode.STTN_DET: 'STTN字幕检测',
+    InpaintMode.LAMA: 'LAMA',
+    InpaintMode.PROPAINTER: 'ProPainter',
+    InpaintMode.OPENCV: 'OpenCV',
+}
+
+_SUBTITLE_DETECT_MODE_NAMES = {
+    SubtitleDetectMode.PP_OCRv5_MOBILE: '快速',
+    SubtitleDetectMode.PP_OCRv5_SERVER: '精准',
+}
+
 
 class SubtitleRemover:
     def __init__(self, vd_path, gui_mode=False, sub_area=None):
@@ -164,7 +178,7 @@ class SubtitleRemover:
         sub_detector = getattr(self, 'sub_detector', None) or SubtitleDetect(self.video_path, self.sub_areas)
         sub_list = sub_detector.find_subtitle_frame_no(sub_remover=self)
         if len(sub_list) == 0:
-            raise Exception(tr['Main']['NoSubtitleDetected'].format(self.video_path))
+            raise Exception(f'未检测到任何字幕, 请检查文件{self.video_path}是否正确')
         continuous_frame_no_list = sub_detector.find_continuous_ranges_with_same_mask(sub_list)
         scene_div_points = sub_detector.get_scene_div_frame_no(self.video_path)
         continuous_frame_no_list = sub_detector.split_range_by_scene(continuous_frame_no_list,
@@ -173,7 +187,7 @@ class SubtitleRemover:
         gc.collect()        
         device = self.hardware_accelerator.device if self.hardware_accelerator.has_cuda() else torch.device("cpu")
         propainter_inpaint = PropainterInpaint(device, self.model_config.PROPAINTER_MODEL_DIR, config.propainterMaxLoadNum.value)
-        self.append_output(tr['Main']['ProcessingStartRemovingSubtitles'])
+        self.append_output('[处理中] 开始移除字幕...')
         index = 0
         # 使用帧预读取，I/O 与推理重叠
         reader = FramePrefetcher(self.video_cap)
@@ -252,7 +266,7 @@ class SubtitleRemover:
         """
         使用sttn对选中区域进行重绘，不进行字幕检测
         """
-        self.append_output(tr['Main']['ProcessingStartRemovingSubtitles'])
+        self.append_output('[处理中] 开始移除字幕...')
         mask_area_coordinates = []
         for sub_area in self.sub_areas:
             ymin, ymax, xmin, xmax = sub_area
@@ -265,7 +279,7 @@ class SubtitleRemover:
         sub_detector = getattr(self, 'sub_detector', None) or SubtitleDetect(self.video_path, self.sub_areas)
         sub_list = sub_detector.find_subtitle_frame_no(sub_remover=self)
         if len(sub_list) == 0:
-            raise Exception(tr['Main']['NoSubtitleDetected'].format(self.video_path))
+            raise Exception(f'未检测到任何字幕, 请检查文件{self.video_path}是否正确')
         continuous_frame_no_list = sub_detector.find_continuous_ranges_with_same_mask(sub_list)
         tbar.write(f"Subtitle detected: {continuous_frame_no_list}")
         continuous_frame_no_list = expand_frame_ranges(continuous_frame_no_list, config.subtitleTimelineBackwardFrameCount.value, config.subtitleTimelineForwardFrameCount.value)
@@ -279,7 +293,7 @@ class SubtitleRemover:
             # 确保区间不超出视频总帧数，否则会导致 FramePrefetcher 哨兵被内循环消费后外层死锁
             start_end_map[start] = min(end, self.frame_count)
         current_frame_index = 0
-        self.append_output(tr['Main']['ProcessingStartRemovingSubtitles'])
+        self.append_output('[处理中] 开始移除字幕...')
         # 使用帧预读取，I/O 与推理重叠
         reader = FramePrefetcher(self.video_cap)
         while True:
@@ -340,15 +354,16 @@ class SubtitleRemover:
         # 记录开始时间
         start_time = time.time()
         if len(self.sub_areas) == 0:
-            self.append_output(tr['Main']['FullScreenProcessingNote'])
+            self.append_output('未设置字幕区域，将对全屏进行处理，最终效果可能不理想')
             self.sub_areas.append((0, self.frame_height, 0, self.frame_width))
-        self.append_output(tr['Main']['SubtitleArea'].format(self.sub_areas))
-        self.append_output(tr['Main']['ABSection'].format(str(self.ab_sections).replace("range", "") if self.ab_sections is not None and len(self.ab_sections) > 0 else tr['Main']['ABSectionAll']))
+        self.append_output(f'字幕区域: {self.sub_areas}')
+        ab_section_text = str(self.ab_sections).replace("range", "") if self.ab_sections is not None and len(self.ab_sections) > 0 else '全部'
+        self.append_output(f'处理区块: {ab_section_text}')
         # 如果使用GPU加速，则打印GPU加速提示
         if self.hardware_accelerator.has_accelerator():
             accelerator_name = self.hardware_accelerator.accelerator_name
             if accelerator_name == 'DirectML' and config.inpaintMode.value not in [InpaintMode.STTN_AUTO, InpaintMode.STTN_DET]:
-                self.append_output(tr['Main']['DirectMLWarning'])
+                self.append_output('警告: DirectML 加速仅适用于 STTN 模型，其他模型将使用 CPU 运行。')
         os.makedirs(os.path.dirname(self.video_out_path), exist_ok=True)
         # 重置进度条
         self.progress_total = 0
@@ -357,7 +372,7 @@ class SubtitleRemover:
         if self.is_picture:
             original_frame = read_image(self.video_path)
             if original_frame is None:
-                self.append_output(tr['Main']['ReadImageFailed'].format(self.video_path))
+                self.append_output(f'读取图片失败: {self.video_path}')
                 return
             sub_detector = getattr(self, 'sub_detector', None) or SubtitleDetect(self.video_path, self.sub_areas)
             sub_list = sub_detector.detect_subtitle(original_frame)
@@ -396,8 +411,8 @@ class SubtitleRemover:
             print(f"[phase] run: merge_audio_to_video start (elapsed={time.time() - start_time:.1f}s)", flush=True)
             self.merge_audio_to_video()
             print(f"[phase] run: merge_audio_to_video done (elapsed={time.time() - start_time:.1f}s)", flush=True)
-        self.append_output(tr['Main']['FinishedProcessing'].format(self.video_out_path))
-        self.append_output(tr['Main']['ProcessingTime'].format(round(time.time() - start_time)))
+        self.append_output(f'[完成] 字幕移除成功, 文件已保存到 {self.video_out_path}')
+        self.append_output(f'处理时间: {round(time.time() - start_time)}秒')
         self.isFinished = True
         self.progress_total = 100
         if os.path.exists(self.video_temp_file.name):
@@ -407,7 +422,7 @@ class SubtitleRemover:
                 pass #ignore
 
     def log_model(self):
-        model_friendly_name = list(tr['InpaintMode'].values())[list(InpaintMode).index(config.inpaintMode.value)]
+        model_friendly_name = _INPAINT_MODE_NAMES[config.inpaintMode.value]
         model_device = 'CPU'
         if config.inpaintMode.value != InpaintMode.OPENCV and self.hardware_accelerator.has_accelerator():
             accelerator_name = self.hardware_accelerator.accelerator_name
@@ -415,11 +430,11 @@ class SubtitleRemover:
                 model_device = 'DirectML'
             if self.hardware_accelerator.has_cuda() or self.hardware_accelerator.has_mps():
                 model_device = accelerator_name
-        self.append_output(tr['Main']['SubtitleRemoverModel'].format(f"{model_friendly_name} ({model_device})"))
+        self.append_output(f'去除字幕模型: {model_friendly_name} ({model_device})')
         providers = ", ".join(self.hardware_accelerator.onnx_providers)
         providers_str = f" ({providers})" if providers else ""
-        detect_mode_name = list(tr['SubtitleDetectMode'].values())[list(SubtitleDetectMode).index(config.subtitleDetectMode.value)]
-        self.append_output(tr['Main']['SubtitleDetectionModel'].format(f"{detect_mode_name}{providers_str}"))
+        detect_mode_name = _SUBTITLE_DETECT_MODE_NAMES[config.subtitleDetectMode.value]
+        self.append_output(f'字幕检测模型: {detect_mode_name}{providers_str}')
 
     def merge_audio_to_video(self):
         """把源视频的音轨合并到去字幕后生成的无声视频上。
@@ -498,13 +513,9 @@ if __name__ == '__main__':
     multiprocessing.set_start_method("spawn")
     from backend.tools.args_handler import parse_args
     args = parse_args()
-    # force english
-    config.set(config.interface, 'en')
-    TRANSLATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'interface', f"{config.interface.value}.ini")
-    tr.read(TRANSLATION_FILE, encoding='utf-8')
     sr = SubtitleRemover(args.input)
     if not is_video_or_image(args.input):
-        sr.append_output(f'Error: {video_path} is not supported not corrupted.')
+        sr.append_output(f'Error: {args.input} is not supported or corrupted.')
         exit(-1)
     sr.sub_areas = args.subtitle_area_coords
     sr.video_out_path = args.output

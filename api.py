@@ -1,5 +1,4 @@
 import argparse
-import cgi
 import json
 import mimetypes
 import multiprocessing
@@ -43,6 +42,27 @@ PROCESS_LOCK = threading.Lock()
 _ACTIVE_JOBS: dict = {}
 _ACTIVE_JOBS_LOCK = threading.Lock()
 JOB_TTL_SECONDS = 1800
+# 与 OmniVoice 对齐的 API 契约版本号，随 /health、/api/capabilities 与
+# 提交类响应返回，调用方可据此做兼容判断。
+API_SCHEMA_VERSION = "vsr-removal-v1"
+_SERVER_STARTED_AT = time.time()
+# 历史别名路由 →  canonical 路由。命中别名时响应带 Deprecation/Link 头
+# （对齐 OmniVoice），使用量计入 /api/capabilities。
+_DEPRECATED_ROUTE_ALIASES = {
+    "/api/remove": "/api/remove-subtitle",
+    "/remove": "/api/remove-subtitle",
+    "/api/detect": "/api/detect-subtitle-area",
+    "/detect-subtitle-area": "/api/detect-subtitle-area",
+}
+_DEPRECATED_ROUTE_USAGE: dict = {}
+# 调用方提供的 job_id 允许的安全字符集：仅字母数字/下划线/连字符，
+# 不含路径分隔符和点号，job 目录命名与 /download 校验共用，防路径穿越。
+_JOB_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# 磁盘上 job 目录的保留时长：内存进度注册表有 TTL，磁盘目录原来没有，
+# 长期运行会把磁盘涨满。超时且不在活跃注册表内的目录由 janitor 删除。
+JOB_DIR_TTL_SECONDS = int(os.environ.get("VSR_API_JOB_TTL_SECONDS", str(6 * 3600)))
+_JANITOR_INTERVAL_SECONDS = 600
+_last_janitor_at = 0.0
 # Per-job throttle for stdout PROGRESS lines: {job_id: (phase, 10%-bucket)}.
 # We only print on phase change, every 10% within a phase, or on terminal
 # states — keeps the api-server log readable during long removals.
@@ -70,6 +90,34 @@ def _prune_active_jobs():
         stale = [k for k, v in _ACTIVE_JOBS.items() if now - v.get("updated_at", 0) > JOB_TTL_SECONDS]
         for k in stale:
             _ACTIVE_JOBS.pop(k, None)
+    _sweep_stale_job_dirs()
+
+
+def _sweep_stale_job_dirs():
+    """删除磁盘上超过 JOB_DIR_TTL_SECONDS 且不在活跃注册表内的 job 目录。
+    最多每 _JANITOR_INTERVAL_SECONDS 扫一遍，调用点是 progress 轮询与 POST。"""
+    global _last_janitor_at
+    now = time.time()
+    if now - _last_janitor_at < _JANITOR_INTERVAL_SECONDS:
+        return
+    _last_janitor_at = now
+    jobs_root = WORK_DIR / "jobs"
+    try:
+        entries = list(jobs_root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if not entry.is_dir():
+                continue
+            with _ACTIVE_JOBS_LOCK:
+                if entry.name in _ACTIVE_JOBS:
+                    continue
+            if now - entry.stat().st_mtime > JOB_DIR_TTL_SECONDS:
+                shutil.rmtree(entry, ignore_errors=True)
+                print(f"INFO: swept stale job dir {entry.name}")
+        except OSError:
+            continue
 
 
 def _get_job_progress(job_id):
@@ -235,6 +283,12 @@ def _normalize_options(payload):
         "bbox_min_inside_ratio",
         "ocr_sample_step",
         "empty_detection_full_inpaint",
+        "blur_kernel",
+        "blur_passes",
+        "blur_pad",
+        "blur_feather",
+        "blur_temporal_window",
+        "blur_cover_allow_passthrough",
         "post_verify_blur",
         "post_verify_blur_force",
         "post_verify_blur_sample_every",
@@ -259,7 +313,10 @@ def _normalize_options(payload):
     mode = str(merged.get("mode") or merged.get("inpaint_mode") or "sttn").strip().lower().replace("-", "_")
     explicit_post_lama_refine = "post_lama_refine" in merged
     explicit_auto_residual_cleanup = "auto_residual_cleanup" in merged
-    post_lama_refine = _to_bool(merged.get("post_lama_refine", False))
+    # 默认开启 text-trace 修边：它是 diff-gated 的（只处理 STTN 实际改动过
+    # 的像素，不会误伤未改动内容），且对无文字特征帧有快速 pre-check，
+    # 是性价比最高的抗残留手段。显式传 post_lama_refine=false 可关闭。
+    post_lama_refine = _to_bool(merged.get("post_lama_refine", True))
     # Historical aliases for the STTN+LaMa refine mode. `sttn_lama` /
     # `sttn_lama_refine` were folded into `sttn_then_lama` — kept the
     # latter as the canonical name; the others no longer match.
@@ -324,6 +381,15 @@ def _normalize_options(payload):
         # 检测不到字幕时的兜底：True = 整区每帧 STTN_AUTO 重绘（旧行为），
         # False = 直接报错，让调用方知道检测为空而不是默默整帧重绘。
         "empty_detection_full_inpaint": _to_bool(merged.get("empty_detection_full_inpaint", True)),
+        # blur_cover 模式的高斯模糊参数（此前不在白名单内，API 传不进来）。
+        "blur_kernel": _bounded_int(merged.get("blur_kernel"), "blur_kernel", 51, 3, 199),
+        "blur_passes": _bounded_int(merged.get("blur_passes"), "blur_passes", 2, 1, 6),
+        "blur_pad": _bounded_int(merged.get("blur_pad"), "blur_pad", 24, 0, 64),
+        "blur_feather": _bounded_int(merged.get("blur_feather"), "blur_feather", 20, 0, 64),
+        "blur_temporal_window": _bounded_int(merged.get("blur_temporal_window"), "blur_temporal_window", 3, 0, 15),
+        # blur_cover 检测失败/检测为空时：False = 返回 422（默认，让调用方
+        # 感知字幕还在），True = 旧行为，原样拷贝原视频返回 200。
+        "blur_cover_allow_passthrough": _to_bool(merged.get("blur_cover_allow_passthrough", False)),
         # Auto residual cleanup tail pass — see _run_residual_cleanup.
         # Default is off. The multiline OCR preset may enable it internally
         # for only the frames where 3+ subtitle lines were detected.
@@ -469,43 +535,119 @@ def _read_multipart(handler, job_dir):
     if "multipart/form-data" not in content_type.lower():
         raise RequestError(HTTPStatus.BAD_REQUEST, "Content-Type must be multipart/form-data")
 
-    form = cgi.FieldStorage(
-        fp=handler.rfile,
-        headers=handler.headers,
-        environ={
-            "REQUEST_METHOD": "POST",
-            "CONTENT_TYPE": content_type,
-            "CONTENT_LENGTH": str(body_size),
-        },
-        keep_blank_values=True,
-    )
-    payload = {}
-    uploaded_path = None
-    for key in form.keys():
-        field = form[key]
-        fields = field if isinstance(field, list) else [field]
-        for item in fields:
-            filename = getattr(item, "filename", None)
-            if filename:
-                if key not in {"video", "file", "video_file"}:
-                    raise RequestError(HTTPStatus.BAD_REQUEST, f"Unsupported file field: {key}")
-                target_path = job_dir / _safe_filename(filename, "input.mp4")
-                with target_path.open("wb") as output:
-                    shutil.copyfileobj(item.file, output, length=1024 * 1024)
-                if target_path.stat().st_size == 0:
-                    raise RequestError(HTTPStatus.BAD_REQUEST, "Uploaded video is empty")
-                uploaded_path = target_path
-                payload["filename"] = target_path.name
-                continue
+    # cgi.FieldStorage 在 Python 3.13 已移除，改用 python-multipart 流式
+    # 解析：文件字段边收边写盘，普通字段驻留内存，整个视频不进内存。
+    try:
+        from multipart.multipart import MultipartParser, parse_options_header
+    except ImportError as exc:
+        raise RequestError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "python-multipart is required for multipart uploads",
+        ) from exc
+    _, ct_params = parse_options_header(content_type)
+    boundary = ct_params.get(b"boundary")
+    if not boundary:
+        raise RequestError(HTTPStatus.BAD_REQUEST, "multipart boundary is missing")
 
-            value = item.value
-            if key in {"payload", "json", "metadata"}:
-                parsed = _maybe_json_field(value)
-                if not isinstance(parsed, dict):
-                    raise RequestError(HTTPStatus.BAD_REQUEST, f"{key} must be a JSON object")
-                payload.update(parsed)
-            else:
-                payload[key] = _maybe_json_field(value)
+    payload = {}
+    part = {
+        "header_name": b"",
+        "header_value": b"",
+        "headers": {},
+        "field_name": "",
+        "file": None,
+        "file_path": None,
+        "value_chunks": [],
+    }
+    uploaded_path = None
+
+    def on_part_begin():
+        part["header_name"] = b""
+        part["header_value"] = b""
+        part["headers"] = {}
+        part["field_name"] = ""
+        part["file"] = None
+        part["file_path"] = None
+        part["value_chunks"] = []
+
+    def on_header_field(data, start, end):
+        part["header_name"] += data[start:end]
+
+    def on_header_value(data, start, end):
+        part["header_value"] += data[start:end]
+
+    def on_header_end():
+        part["headers"][part["header_name"].lower()] = part["header_value"]
+        part["header_name"] = b""
+        part["header_value"] = b""
+
+    def on_headers_finished():
+        _, cd_params = parse_options_header(
+            part["headers"].get(b"content-disposition", b"")
+        )
+        field_name = (cd_params.get(b"name") or b"").decode("utf-8", "replace")
+        filename = cd_params.get(b"filename")
+        part["field_name"] = field_name
+        if filename is None:
+            return
+        if field_name not in {"video", "file", "video_file"}:
+            raise RequestError(HTTPStatus.BAD_REQUEST, f"Unsupported file field: {field_name}")
+        target_path = job_dir / _safe_filename(filename.decode("utf-8", "replace"), "input.mp4")
+        part["file"] = target_path.open("wb")
+        part["file_path"] = target_path
+
+    def on_part_data(data, start, end):
+        if part["file"] is not None:
+            part["file"].write(data[start:end])
+        else:
+            part["value_chunks"].append(data[start:end])
+
+    def on_part_end():
+        nonlocal uploaded_path
+        if part["file"] is not None:
+            part["file"].close()
+            target_path = part["file_path"]
+            if target_path.stat().st_size == 0:
+                raise RequestError(HTTPStatus.BAD_REQUEST, "Uploaded video is empty")
+            uploaded_path = target_path
+            payload["filename"] = target_path.name
+            return
+        value = b"".join(part["value_chunks"]).decode("utf-8", "replace")
+        key = part["field_name"]
+        if key in {"payload", "json", "metadata"}:
+            parsed = _maybe_json_field(value)
+            if not isinstance(parsed, dict):
+                raise RequestError(HTTPStatus.BAD_REQUEST, f"{key} must be a JSON object")
+            payload.update(parsed)
+        else:
+            payload[key] = _maybe_json_field(value)
+
+    callbacks = {
+        "on_part_begin": on_part_begin,
+        "on_header_field": on_header_field,
+        "on_header_value": on_header_value,
+        "on_header_end": on_header_end,
+        "on_headers_finished": on_headers_finished,
+        "on_part_data": on_part_data,
+        "on_part_end": on_part_end,
+    }
+    parser = MultipartParser(boundary, callbacks)
+    try:
+        remaining = body_size
+        while remaining > 0:
+            chunk = handler.rfile.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            parser.write(chunk)
+        parser.finalize()
+    except RequestError:
+        raise
+    except Exception as exc:
+        raise RequestError(HTTPStatus.BAD_REQUEST, f"Invalid multipart body: {exc}") from exc
+    finally:
+        if part["file"] is not None and not part["file"].closed:
+            part["file"].close()
 
     if uploaded_path is not None:
         payload["_uploaded_video_path"] = str(uploaded_path)
@@ -637,7 +779,7 @@ def _stage_video(video_url, job_dir, filename_hint):
 
 
 def _apply_config_options(config, options):
-    # 适配当前项目 qfluentwidgets 配置系统（属性名为驼峰命名）
+    # 适配 backend.config 的纯 Python 配置系统（属性名为驼峰命名）
     mode_map = {
         "sttn": config.InpaintMode.STTN_DET,
         "lama": config.InpaintMode.LAMA,
@@ -868,6 +1010,9 @@ def _run_blur_cover(video_path, area, options, ocr_preset=None):
       - blur_feather: feather width in pixels (default 20)
       - blur_temporal_window: smooth box positions over this many frames
         (default 3). Set 0 to disable temporal smoothing.
+      - blur_cover_allow_passthrough: on detection failure / no subtitle
+        detected, return the original video with 200 instead of HTTP 422
+        (default false — the caller should know the subtitles are still there).
     """
     _patch_numpy_compat()
     import cv2
@@ -918,26 +1063,31 @@ def _run_blur_cover(video_path, area, options, ocr_preset=None):
         SubtitleDetect, video_path, area, ocr_bbox_y_pad, **detector_kwargs
     )
 
-    # 查找字幕位置（检测可能因CUDNN失败，降级处理）
+    # 查找字幕位置（检测可能因 CUDNN 失败；失败或为空时默认 422 让调用方
+    # 感知字幕未被处理，blur_cover_allow_passthrough=true 才回退原视频）
+    allow_passthrough = bool(options.get("blur_cover_allow_passthrough", False))
+
+    def _passthrough_or_raise(message):
+        remover.video_cap.release()
+        remover.video_writer.release()
+        if not allow_passthrough:
+            raise RequestError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                f"{message}（如需原样返回原视频，设置 blur_cover_allow_passthrough=true）",
+            )
+        print(f"WARNING: {message}; blur_cover_allow_passthrough=true, returning original video")
+        # 直接复制原视频（复制件自带音轨；不要再调
+        # merge_audio_to_video——它会把 0 帧的空临时视频合并覆盖掉好文件）
+        import shutil
+        shutil.copy2(video_path, remover.video_out_name)
+        return Path(remover.video_out_name)
+
     try:
         sub_list = remover.sub_detector.find_subtitle_frame_no(sub_remover=remover)
     except Exception as detect_err:
-        print(f"WARNING: _run_blur_cover detection failed: {detect_err}, skipping blur")
-        # 检测失败时直接复制原视频（复制件自带音轨；不要再调
-        # merge_audio_to_video——它会把 0 帧的空临时视频合并覆盖掉好文件）
-        remover.video_cap.release()
-        remover.video_writer.release()
-        import shutil
-        shutil.copy2(video_path, remover.video_out_name)
-        return Path(remover.video_out_name)
+        return _passthrough_or_raise(f"blur_cover 字幕检测失败: {detect_err}")
     if not sub_list:
-        print("WARNING: _run_blur_cover no subtitles detected, skipping blur")
-        # 仍然输出原视频
-        remover.video_cap.release()
-        remover.video_writer.release()
-        import shutil
-        shutil.copy2(video_path, remover.video_out_name)
-        return Path(remover.video_out_name)
+        return _passthrough_or_raise("blur_cover OCR 未在字幕区域内检测到字幕，视频未做任何模糊处理")
 
     # Step 1.5: Temporal smoothing of detected box positions to reduce
     # frame-to-frame flicker when the detector jitters. Boxes from
@@ -1169,6 +1319,7 @@ def _run_text_trace_refine(video_path, mask_source_path, area, options, progress
 
     def _inpaint_one_frame(frame, mask_frame, area, options):
         """Per-frame refine: text-trace mask + cv2.inpaint + optional feather.
+        Returns (frame, changed) — changed=False 表示该帧未做任何修改。
         Pure function so it's safe to run from worker threads."""
         # Fast pre-check: if the area has no white or yellow text-like
         # pixels at all, skip the expensive text-trace mask computation
@@ -1185,7 +1336,7 @@ def _run_text_trace_refine(video_path, mask_source_path, area, options, progress
         xmin = max(0, xmin)
         xmax = min(frame.shape[1], xmax)
         if ymin >= ymax or xmin >= xmax:
-            return frame
+            return frame, False
         crop = frame[ymin:ymax, xmin:xmax]
         # Skip pre-check for very small areas — the per-pixel overhead
         # doesn't pay off.
@@ -1204,7 +1355,7 @@ def _run_text_trace_refine(video_path, mask_source_path, area, options, progress
                 else:
                     has_yellow = False
                 if not (has_white or has_yellow):
-                    return frame
+                    return frame, False
             except Exception:
                 # Pre-check is best-effort; fall through to the full mask.
                 pass
@@ -1234,8 +1385,8 @@ def _run_text_trace_refine(video_path, mask_source_path, area, options, progress
                 ).astype("uint8")
             out = frame.copy()
             out[y1:y2, x1:x2] = refined_crop
-            return out
-        return frame
+            return out, True
+        return frame, False
 
     cpu_count = os.cpu_count() or 1
     # Reserve at least 1 core for the main loop + writer; cap to a reasonable
@@ -1253,6 +1404,7 @@ def _run_text_trace_refine(video_path, mask_source_path, area, options, progress
     pending = []  # list of (frame_no, future) in submit order
     frame_no = 0
     last_reported = -1
+    refined_frames = 0
     frame_filter = {
         int(v) for v in (options.get("post_lama_refine_frame_filter") or [])
         if str(v).strip().lstrip("-").isdigit()
@@ -1263,9 +1415,11 @@ def _run_text_trace_refine(video_path, mask_source_path, area, options, progress
     def _drain_buffer():
         """Wait for in-order futures and write them out. Returns the
         last reported percent after this drain pass."""
-        nonlocal last_reported
+        nonlocal last_reported, refined_frames
         for fno, fut in pending:
-            refined = fut.result()
+            refined, changed = fut.result()
+            if changed:
+                refined_frames += 1
             writer.write(refined)
             if frame_count > 0:
                 current_pct = int(100 * (fno) / frame_count)
@@ -1310,6 +1464,16 @@ def _run_text_trace_refine(video_path, mask_source_path, area, options, progress
         except OSError:
             pass
         raise RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "Text-trace refinement: no frames decoded from input")
+
+    if refined_frames == 0:
+        # 整段视频没有任何帧被修边改动——直接沿用上一步的输出，
+        # 不再产出一代无谓的重编码（保画质也省一次 mux）。
+        try:
+            os.remove(temp_video.name)
+        except OSError:
+            pass
+        print("INFO: text_trace_refine: 0 frames changed; keeping upstream output unchanged")
+        return Path(video_path)
 
     # Mux source audio onto the refined video. The temp file is already
     # libx264 (FFmpegVideoWriter crf 12), so the video stream is copied
@@ -1632,6 +1796,14 @@ def _run_post_verify_blur(video_path, area, options, progress_callback=None, sta
     print(
         f"INFO: post_verify_blur: blurred {blurred_count} frame(s) at PaddleOCR-detected bbox regions"
     )
+    if blurred_count == 0:
+        # 候选帧最终都没产生 blur——沿用上一步的输出，不多产一代重编码。
+        try:
+            os.remove(temp_video.name)
+        except OSError:
+            pass
+        print("INFO: post_verify_blur: 0 frames blurred; keeping upstream output unchanged")
+        return Path(video_path)
 
     # Phase 4: mux audio. 旧实现引用不存在的 backend.config.USE_H264，
     # 每次都在构造 merge_cmd 时 AttributeError，被 except 吞掉后把无音轨的
@@ -2018,6 +2190,15 @@ def _run_residual_cleanup(input_video_path, output_video_path, area, options, pr
     finally:
         src_cap.release()
         writer.release()
+    if frames_with_residual == 0:
+        # 整段视频没有残字帧——沿用上一步的输出，不再产出一代无谓的
+        # 重编码（保画质也省一次 mux）。
+        try:
+            os.remove(temp_video.name)
+        except OSError:
+            pass
+        print("INFO: residual_cleanup: 0 frames had residual; keeping upstream output unchanged")
+        return Path(input_video_path)
     # 把输入视频的音轨合并回处理后的视频（视频流 -c:v copy，不再转码）。
     # 失败时抛错，由调用方决定保留上游输出，绝不静默产出无声视频。
     try:
@@ -2037,6 +2218,84 @@ def _run_residual_cleanup(input_video_path, output_video_path, area, options, pr
     return output_path
 
 
+def _probe_video_stream_geometry(path):
+    """用 ffprobe 取首个视频流的 width/height/r_frame_rate；失败返回 None。"""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height,r_frame_rate",
+                "-of", "json", str(path),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        stream = (json.loads(result.stdout).get("streams") or [{}])[0]
+        if stream.get("width") and stream.get("height") and stream.get("r_frame_rate"):
+            return stream
+    except Exception:
+        pass
+    return None
+
+
+def _pad_video_duration_concat(video_path, pad_seconds, dest_path, ffmpeg_path, timeout=600):
+    """冻结末帧生成一小段新编码片段，concat `-c copy` 接到视频末尾。
+
+    主体视频流零重编码（无额外画质代际）；只有末尾新接的静止片段是
+    新编码的。片段无音轨，末尾 pad 区间内音频为空（静音）。
+    """
+    path = Path(video_path)
+    geometry = _probe_video_stream_geometry(path)
+    if geometry is None:
+        raise RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "Pad: cannot probe video stream geometry")
+    last_frame_path = path.with_name(path.stem + "_padframe.png")
+    freeze_path = path.with_name(path.stem + "_padfreeze.mp4")
+    concat_list_path = path.with_name(path.stem + "_padconcat.txt")
+    try:
+        with open(os.devnull) as devnull:
+            subprocess.check_output(
+                [
+                    ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
+                    "-sseof", "-0.2", "-i", str(path),
+                    "-frames:v", "1", "-update", "1", str(last_frame_path),
+                ],
+                stdin=devnull, timeout=timeout,
+            )
+            if not last_frame_path.is_file():
+                raise RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "Pad: failed to extract last frame")
+            subprocess.check_output(
+                [
+                    ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
+                    "-loop", "1", "-framerate", str(geometry["r_frame_rate"]),
+                    "-t", f"{pad_seconds:.3f}", "-i", str(last_frame_path),
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                    "-pix_fmt", "yuv420p", "-an", str(freeze_path),
+                ],
+                stdin=devnull, timeout=timeout,
+            )
+            if not freeze_path.is_file():
+                raise RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "Pad: failed to render freeze clip")
+            concat_list_path.write_text(
+                f"file '{path}'\nfile '{freeze_path}'\n", encoding="utf-8"
+            )
+            subprocess.check_output(
+                [
+                    ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "concat", "-safe", "0", "-i", str(concat_list_path),
+                    "-c", "copy", "-movflags", "+faststart", str(dest_path),
+                ],
+                stdin=devnull, timeout=timeout,
+            )
+    finally:
+        for tmp in (last_frame_path, freeze_path, concat_list_path):
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    if not dest_path.is_file():
+        raise RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "Pad: concat did not create output")
+
+
 def _pad_video_duration(video_path, target_duration, timeout=600):
     """Extend `video_path` to at least `target_duration` by freezing the last frame.
 
@@ -2044,8 +2303,6 @@ def _pad_video_duration(video_path, target_duration, timeout=600):
     but the source container advertises a slightly longer duration than
     OpenCV/ffmpeg can decode. Returns the (possibly replaced) path.
     """
-    import subprocess
-
     path = Path(video_path)
     if not path.is_file():
         return path
@@ -2066,17 +2323,35 @@ def _pad_video_duration(video_path, target_duration, timeout=600):
             padded_path.unlink()
         except OSError:
             pass
-    cmd = [
-        ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(path),
-        "-vf", f"tpad=stop_mode=clone:stop_duration={pad_seconds:.3f}",
-        "-c:a", "copy",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-movflags", "+faststart",
-        str(padded_path),
-    ]
-    with open(os.devnull) as devnull:
-        subprocess.check_output(cmd, stdin=devnull, timeout=timeout)
+    # 优先「冻结末帧片段 + concat -c copy」：主体视频流不重编码，不添一代
+    # 画质损失。concat 失败（如编码参数不兼容）回退 tpad 全片重编码。
+    try:
+        _pad_video_duration_concat(path, pad_seconds, padded_path, ffmpeg_path, timeout)
+        padded_duration = (_probe_video_info(padded_path).get("duration") or 0)
+        if padded_duration < current_duration + pad_seconds * 0.9:
+            raise RequestError(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                f"Pad: concat output duration {padded_duration:.3f}s shorter than expected",
+            )
+        print(f"INFO: _pad_video_duration: padded {pad_seconds:.3f}s via freeze-frame concat (main body stream-copied)")
+    except Exception as concat_exc:
+        print(f"WARN: _pad_video_duration: concat pad failed ({concat_exc}); falling back to tpad re-encode")
+        if padded_path.is_file():
+            try:
+                padded_path.unlink()
+            except OSError:
+                pass
+        cmd = [
+            ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(path),
+            "-vf", f"tpad=stop_mode=clone:stop_duration={pad_seconds:.3f}",
+            "-c:a", "copy",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-movflags", "+faststart",
+            str(padded_path),
+        ]
+        with open(os.devnull) as devnull:
+            subprocess.check_output(cmd, stdin=devnull, timeout=timeout)
     if not padded_path.is_file():
         raise RequestError(
             HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -2099,6 +2374,9 @@ def _mux_audio_onto_video(video_only_path, audio_source_path, dest_path, timeout
     无法直接装 pcm/opus 等流，直接 copy 会静默失败或产出无声视频）。
     源视频没有音轨时只拷贝视频流。任何 ffmpeg 失败都抛异常，由调用方决定
     是否回退，绝不静默产出无声视频。
+
+    不用 `-shortest`：音轨按源音频全长保留，产物 duration 才能与源视频
+    一致（源音频略长于视频流时末尾保留原始音频，而不是截断）。
     """
     from backend.tools.ffmpeg_cli import FFmpegCLI, probe_audio_codec
 
@@ -2122,7 +2400,6 @@ def _mux_audio_onto_video(video_only_path, audio_source_path, dest_path, timeout
             "-map", "1:a:0",
             "-c:v", "copy",
             *audio_args,
-            "-shortest",
             "-loglevel", "error",
             str(dest_path),
         ]
@@ -2368,17 +2645,26 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
     main_scale_end = 100.0
     remover = None
     poller_stop = None
+    blur_output_path = None
     fallback_triggered = False
     phase_label = "sttn" if options["mode"] == "sttn" else options["mode"]
     use_multiline_auto_strategy = _uses_multiline_auto_strategy(options)
     for attempt in range(2):
-        remover = SubtitleRemover(str(video_path), sub_area=area)
+        # blur_cover 在 _run_blur_cover 内部自建 SubtitleRemover 与检测器，
+        # 外层再建一个只会白占一个 idle ffmpeg writer 子进程（成功路径无人
+        # 释放，每请求泄漏一个），进度 poller 也会挂在不工作的实例上——
+        # 外层跳过创建，输出路径直接用 _run_blur_cover 的返回值。
+        remover = None
+        if options["mode"] != "blur_cover":
+            remover = SubtitleRemover(str(video_path), sub_area=area)
         detector_kwargs = {
             "bbox_min_inside_ratio": options.get("bbox_min_inside_ratio", 1.0),
             "ocr_sample_step": options.get("ocr_sample_step", 0),
         }
         if options.get("sttn_skip_detection", False):
             print(f"INFO: _run_subtitle_remover sttn_skip_detection=True, OCR override not needed")
+        elif remover is None:
+            print(f"INFO: _run_subtitle_remover mode=blur_cover, detector built inside _run_blur_cover")
         else:
             if need_ocr_override:
                 print(f"INFO: _run_subtitle_remover overriding OCR detector: ocr_preset={ocr_preset_name}, det_db_thresh={ocr_preset.get('det_db_thresh')}, det_db_box_thresh={ocr_preset.get('det_db_box_thresh')}, det_limit_side_len={ocr_preset.get('det_limit_side_len')}, ocr_bbox_y_pad={ocr_bbox_y_pad}, bbox_min_inside_ratio={detector_kwargs['bbox_min_inside_ratio']}, ocr_sample_step={detector_kwargs['ocr_sample_step']}")
@@ -2471,13 +2757,16 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
         _report(phase_label, 0.0, "starting")
         _sr_t0 = time.time()
         print(f"[phase] _run_subtitle_remover: main inpaint start (mode={options['mode']})", flush=True)
-        poller_stop = _start_progress_poller(remover, phase_label, main_scale_end, _report, poll_interval=0.5)
+        poller_stop = (
+            _start_progress_poller(remover, phase_label, main_scale_end, _report, poll_interval=0.5)
+            if remover is not None else None
+        )
         try:
             if options["mode"] == "lama_area":
                 _run_lama_area_remover(remover, area)
             elif options["mode"] == "blur_cover":
                 ocr_preset = _OCR_PRESETS.get(ocr_preset_name, _OCR_PRESETS["default"])
-                _run_blur_cover(video_path, area, options, ocr_preset=ocr_preset)
+                blur_output_path = _run_blur_cover(video_path, area, options, ocr_preset=ocr_preset)
             else:
                 remover.run()
             print(f"[phase] _run_subtitle_remover: main inpaint done ({time.time() - _sr_t0:.1f}s)", flush=True)
@@ -2501,7 +2790,9 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
     if poller_stop is not None:
         poller_stop.set()
     _report(phase_label, main_scale_end, "main_done")
-    output_path = Path(remover.video_out_name).resolve()
+    output_path = Path(
+        blur_output_path if options["mode"] == "blur_cover" else remover.video_out_name
+    ).resolve()
     if not output_path.is_file():
         raise RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "Subtitle remover did not create an output file")
     if has_refine:
@@ -2566,11 +2857,14 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
                 start_percent=residual_start, end_percent=residual_end,
             )
             # Replace the upstream output with the residual-cleaned one.
-            try:
-                output_path.unlink()
-            except OSError:
-                pass
-            residual_output.replace(output_path)
+            # residual_cleanup 零改动时会原样返回上游路径——同一路径不能
+            # unlink 后再 replace（会把文件删掉）。
+            if residual_output != output_path:
+                try:
+                    output_path.unlink()
+                except OSError:
+                    pass
+                residual_output.replace(output_path)
             _report("residual", residual_end, "residual_done")
         except Exception as residual_exc:
             # Residual cleanup is best-effort: if it fails (e.g. cv2 import
@@ -3212,24 +3506,92 @@ def _download_url(handler, job_id, filename):
     return f"{proto}://{host}/download/{quote(job_id)}/{quote(filename)}"
 
 
+def _service_version():
+    try:
+        from backend.config import VERSION
+        return VERSION
+    except Exception:
+        return "unknown"
+
+
 class RemoverAPIHandler(BaseHTTPRequestHandler):
     server_version = "VideoSubtitleRemoverAPI/1.1"
 
     def do_GET(self):
+        self._request_id = self.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
         parsed = urlparse(self.path)
-        if parsed.path == "/health":
-            self._send_json(HTTPStatus.OK, {"status": "ok"})
+        if parsed.path in ("/health", "/api/health"):
+            # 与 OmniVoice 对齐的健康检查格式：{"ok": true, "service", ...}。
+            # 刻意保持轻量：不取锁、不 import 重依赖，GPU 忙时也要能秒回。
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "service": "video_subtitle_remover_api",
+                    "status": "ok",
+                    "ready": True,
+                    "api_schema_version": API_SCHEMA_VERSION,
+                    "version": _service_version(),
+                },
+            )
+            return
+        if parsed.path == "/api/capabilities":
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "service": "video_subtitle_remover_api",
+                    "api_schema_version": API_SCHEMA_VERSION,
+                    "modes": ["sttn", "lama", "propainter", "lama_area", "blur_cover"],
+                    "ocr_presets": sorted(_OCR_PRESETS.keys()),
+                    "deprecated_route_aliases": _DEPRECATED_ROUTE_ALIASES,
+                    "deprecated_route_usage": dict(_DEPRECATED_ROUTE_USAGE),
+                    "features": {
+                        "multiline_auto_strategy": True,
+                        "empty_detection_fallback": True,
+                        "post_lama_refine_default": True,
+                        "job_dir_ttl_seconds": JOB_DIR_TTL_SECONDS,
+                        "custom_job_id_pattern": "[A-Za-z0-9_-]{1,64}",
+                    },
+                },
+            )
+            return
+        if parsed.path == "/api/status":
+            _prune_active_jobs()
+            with _ACTIVE_JOBS_LOCK:
+                active_jobs = len(_ACTIVE_JOBS)
+            try:
+                disk_free_gb = round(shutil.disk_usage(str(WORK_DIR)).free / (1024 ** 3), 2)
+            except OSError:
+                disk_free_gb = None
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "service": "video_subtitle_remover_api",
+                    "version": _service_version(),
+                    "api_schema_version": API_SCHEMA_VERSION,
+                    "uptime_seconds": round(time.time() - _SERVER_STARTED_AT, 1),
+                    "work_dir": str(WORK_DIR),
+                    "disk_free_gb": disk_free_gb,
+                    "active_jobs": active_jobs,
+                },
+            )
             return
         if parsed.path == "/":
             self._send_json(
                 HTTPStatus.OK,
                 {
+                    "ok": True,
                     "name": "video-subtitle-remover-api",
+                    "api_schema_version": API_SCHEMA_VERSION,
                     "endpoints": {
                         "submit": "POST /api/remove-subtitle",
                         "detect": "POST /api/detect-subtitle-area",
                         "download": "GET /download/{job_id}/{filename}",
                         "progress": "GET /api/progress/{job_id}",
+                        "capabilities": "GET /api/capabilities",
+                        "status": "GET /api/status",
                         "health": "GET /health",
                     },
                 },
@@ -3254,6 +3616,7 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self):
+        self._request_id = self.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
         parsed = urlparse(self.path)
         if parsed.path in ("/api/detect-subtitle-area", "/api/detect", "/detect-subtitle-area"):
             self._handle_detect_subtitle_area()
@@ -3263,6 +3626,7 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
             return
 
         started_at = time.time()
+        _sweep_stale_job_dirs()
         # job_id is provided by the caller (e.g. the dub web app) so it can
         # poll /api/progress/{job_id} for in-flight progress updates. We
         # fall back to a fresh uuid when the caller doesn't supply one.
@@ -3281,6 +3645,12 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                         break
             except Exception:
                 provided_job_id = ""
+        if provided_job_id and not _JOB_ID_RE.fullmatch(provided_job_id):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid job_id: must match [A-Za-z0-9_-]{1,64}"},
+            )
+            return
 
         content_type = (self.headers.get("Content-Type") or "").lower()
         is_multipart = content_type.startswith("multipart/form-data")
@@ -3308,6 +3678,17 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                 pass
             self._send_json(exc.status, {"error": exc.message})
             return
+        except ConnectionError as exc:
+            # 客户端上传途中断开——客户端/网络问题，非服务端故障
+            # （对齐 OmniVoice 的 499，区别于服务端 502）。
+            try:
+                if job_dir is not None and job_dir.exists():
+                    shutil.rmtree(job_dir, ignore_errors=True)
+            except Exception:
+                pass
+            print(f"WARNING job={job_id} client disconnected during upload: {type(exc).__name__}: {exc}")
+            self._send_json(499, {"error": "client disconnected during upload"})
+            return
         except Exception as exc:
             try:
                 if job_dir is not None and job_dir.exists():
@@ -3318,6 +3699,12 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
             return
         if not job_id and isinstance(payload, dict):
             provided_job_id = str(payload.get("progress_job_id") or "").strip()
+            if provided_job_id and not _JOB_ID_RE.fullmatch(provided_job_id):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "invalid progress_job_id: must match [A-Za-z0-9_-]{1,64}"},
+                )
+                return
             job_id = provided_job_id or uuid.uuid4().hex
             job_dir = WORK_DIR / "jobs" / job_id
             try:
@@ -3400,6 +3787,8 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                     "url": download_url,
                     "download_url": download_url,
                     "job_id": job_id,
+                    "request_id": self._request_id,
+                    "api_schema_version": API_SCHEMA_VERSION,
                     "filename": output_path.name,
                     "area": list(area) if area is not None else None,
                     "refine_area": list(refine_area) if refine_area is not None else None,
@@ -3444,7 +3833,7 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                 {
                     "error": str(exc),
                     "error_type": type(exc).__name__,
-                    "traceback": tb_text,
+                    # traceback 只打在服务端日志里，不回传给调用方（信息泄露）
                     "job_id": job_id,
                 },
             )
@@ -3483,6 +3872,8 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
             result.update(
                 {
                     "job_id": job_id,
+                    "request_id": self._request_id,
+                    "api_schema_version": API_SCHEMA_VERSION,
                     "filename": source_path.name,
                     "elapsed_seconds": round(time.time() - started_at, 3),
                 }
@@ -3495,6 +3886,15 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             self._send_json(exc.status, {"error": exc.message})
+        except ConnectionError as exc:
+            # 客户端上传途中断开（对齐 OmniVoice 的 499，非服务端故障）
+            try:
+                if job_dir.exists():
+                    shutil.rmtree(job_dir, ignore_errors=True)
+            except Exception:
+                pass
+            print(f"WARNING job={job_id} client disconnected during upload: {type(exc).__name__}: {exc}")
+            self._send_json(499, {"error": "client disconnected during upload"})
         except Exception as exc:
             # Print the full traceback to BOTH stderr (default) and stdout
             # (where PROGRESS lines live) so the operator can see the
@@ -3515,7 +3915,7 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                 {
                     "error": str(exc),
                     "error_type": type(exc).__name__,
-                    "traceback": tb_text,
+                    # traceback 只打在服务端日志里，不回传给调用方（信息泄露）
                     "job_id": job_id,
                 },
             )
@@ -3528,7 +3928,7 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
 
         job_id = parts[2]
         filename = _safe_filename(parts[3])
-        if not re.fullmatch(r"[A-Fa-f0-9]{32}", job_id):
+        if not _JOB_ID_RE.fullmatch(job_id):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid job_id"})
             return
 
@@ -3541,6 +3941,9 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
         content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
+        request_id = getattr(self, "_request_id", None)
+        if request_id:
+            self.send_header("X-Request-ID", request_id)
         self.send_header("Content-Length", str(file_path.stat().st_size))
         self.send_header("Content-Disposition", f'attachment; filename="{file_path.name}"')
         self.end_headers()
@@ -3548,9 +3951,25 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
             shutil.copyfileobj(input_file, self.wfile)
 
     def _send_json(self, status, payload):
+        # OmniVoice 风格信封：2xx 自动补 "ok": true，4xx/5xx 补 "ok": false
+        if isinstance(payload, dict) and "ok" not in payload:
+            payload = {"ok": int(status) < 400, **payload}
         body = _json_bytes(payload)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        request_id = getattr(self, "_request_id", None)
+        if request_id:
+            self.send_header("X-Request-ID", request_id)
+        # 历史别名路由：标 Deprecation + Link 指向 canonical（对齐 OmniVoice）
+        try:
+            req_path = urlparse(self.path).path
+        except Exception:
+            req_path = ""
+        canonical = _DEPRECATED_ROUTE_ALIASES.get(req_path)
+        if canonical:
+            _DEPRECATED_ROUTE_USAGE[req_path] = _DEPRECATED_ROUTE_USAGE.get(req_path, 0) + 1
+            self.send_header("Deprecation", "true")
+            self.send_header("Link", f'<{canonical}>; rel="successor-version"')
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -3578,6 +3997,7 @@ def main(argv=None):
         pass
 
     WORK_DIR.mkdir(parents=True, exist_ok=True)
+    _sweep_stale_job_dirs()
     server = ThreadingHTTPServer((args.host, args.port), RemoverAPIHandler)
     print(f"Serving on http://{args.host}:{args.port}")
     print(f"Work dir: {WORK_DIR}")

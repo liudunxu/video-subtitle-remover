@@ -8,7 +8,7 @@ spelling.
 
 Use this convention for this project's GPU API deployment:
 
-- Stable Vast.ai label prefix: `video-subtitle-remover-api`
+- Stable Vast.ai label prefix: `video-subtitle-remover-api-`
 - Default instance label: `video-subtitle-remover-api-mvp`
 - Service port inside container: `6006`
 - Docker Hub image tag: `liudunxu/video-subtitle-remover:vast-gpu`
@@ -28,14 +28,14 @@ Use this convention for this project's GPU API deployment:
 When the user says "关闭vast.ai实例" or equivalent:
 
 - Query current Vast.ai instances with `VAST_API_KEY`.
-- Delete every running/loading/stopped Vast.ai instance whose `label` starts with `video-subtitle-remover-api`.
+- Delete every running/loading/stopped Vast.ai instance whose `label` starts with `video-subtitle-remover-api-`.
 - Do not delete instances with other labels.
 - Report the deleted instance ids and confirm no matching instances remain.
 
 When the user says "开启vast.ai实例" or equivalent:
 
 - Query current Vast.ai instances first.
-- If a matching `video-subtitle-remover-api*` instance is already running, reuse it and report its public URL.
+- If a matching `video-subtitle-remover-api-*` instance is already running, reuse it and report its public URL.
 - Otherwise search verified rentable on-demand offers for one RTX 3090 with at least 24GB VRAM, at least one direct port, and enough disk space.
 - Prefer Asia-region offers that can pull from Docker Hub reliably; if no suitable Asia offer is available, fall back to Americas-region offers with good reliability and network.
 - Avoid machines that recently failed Docker Hub pulls.

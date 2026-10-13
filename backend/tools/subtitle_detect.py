@@ -8,7 +8,7 @@ from tqdm import tqdm
 from .model_config import ModelConfig
 from .common_tools import get_readable_path
 from .ocr import get_coordinates
-from backend.config import config, tr
+from backend.config import config
 from backend.scenedetect import scene_detect
 from backend.scenedetect.detectors import ContentDetector
 from backend.tools.inpaint_tools import is_frame_number_in_ab_sections
@@ -88,6 +88,10 @@ class SubtitleDetect:
         self._kwargs = kwargs
         # 构造 TextDetection 被拒收阈值时退化为 predict 层按 box_thresh 过滤低分框
         self._score_filter_min = None
+        # find_subtitle_frame_no 结果缓存：同一 detector 实例的视频/区域/阈值
+        # 不变，API 默认链路（detector peek + 主 inpaint 流程）会连续调用两次，
+        # 缓存可省掉一整遍采样 OCR。
+        self._frame_no_box_cache = None
         self._init_sample_step()
 
     def _init_sample_step(self):
@@ -215,6 +219,8 @@ class SubtitleDetect:
         return temp_list
 
     def find_subtitle_frame_no(self, sub_remover=None):
+        if self._frame_no_box_cache is not None:
+            return self._frame_no_box_cache
         video_cap = cv2.VideoCapture(get_readable_path(self.video_path))
         frame_count = video_cap.get(cv2.CAP_PROP_FRAME_COUNT)
         tbar = tqdm(total=int(frame_count), unit='frame', position=0, file=sys.__stdout__, desc='Subtitle Finding')
@@ -222,7 +228,7 @@ class SubtitleDetect:
         # 阶段1：采样检测，仅对每隔 sample_step 帧执行 OCR
         sampled_results = {}  # frame_no -> temp_list
         if sub_remover:
-            sub_remover.append_output(tr['Main']['ProcessingStartFindingSubtitles'])
+            sub_remover.append_output('[处理中] 开始查找字幕...')
         while video_cap.isOpened():
             ret, frame = video_cap.read()
             # 如果读取视频帧失败（视频读到最后一帧）
@@ -257,11 +263,12 @@ class SubtitleDetect:
             subtitle_frame_no_box_dict[detected_nos[-1]] = sampled_results[detected_nos[-1]]
         subtitle_frame_no_box_dict = self.unify_regions(subtitle_frame_no_box_dict)
         if sub_remover:
-            sub_remover.append_output(tr['Main']['FinishedFindingSubtitles'])
+            sub_remover.append_output('[结束] 查找字幕完成...')
         new_subtitle_frame_no_box_dict = dict()
         for key in subtitle_frame_no_box_dict.keys():
             if len(subtitle_frame_no_box_dict[key]) > 0:
                 new_subtitle_frame_no_box_dict[key] = subtitle_frame_no_box_dict[key]
+        self._frame_no_box_cache = new_subtitle_frame_no_box_dict
         return new_subtitle_frame_no_box_dict
 
     @staticmethod

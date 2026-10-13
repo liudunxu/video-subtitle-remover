@@ -3,74 +3,12 @@
 Run with:
     python3 -m unittest tests.test_inpaint_tools -v
 """
-import sys
 import unittest
-from types import ModuleType
-from unittest.mock import MagicMock
 
 import numpy as np
 
-
-def _install_qfluentwidgets_stub():
-    """Install a minimal qfluentwidgets stub so backend.config can be imported.
-
-    The real qfluentwidgets library is a PyQt5/PySide6 GUI dep. In headless
-    test envs, we inject a stub that exposes only the names backend.config
-    touches: qconfig (with load/set), ConfigItem, OptionsConfigItem,
-    RangeConfigItem, QConfig, OptionsValidator, BoolValidator, EnumSerializer,
-    RangeValidator, ConfigValidator.
-    """
-    if 'qfluentwidgets' in sys.modules:
-        return
-
-    qfw = ModuleType('qfluentwidgets')
-
-    class _ConfigItem:
-        def __init__(self, group, name, default, validator=None, restart=False):
-            self.group = group
-            self.name = name
-            self.default = default
-            self.validator = validator
-            self.value = default
-
-        def __repr__(self):
-            return f"<ConfigItem {self.group}/{self.name} value={self.value!r}>"
-
-    class _QConfig:
-        @classmethod
-        def set(cls, item, value):
-            item.value = value
-
-    class _QConfigSingleton:
-        def __init__(self):
-            self._store = {}
-
-        def load(self, path, config):
-            # No-op: stub doesn't persist anything.
-            pass
-
-        def set(self, item, value):
-            item.value = value
-
-    qfw.qconfig = _QConfigSingleton()
-    qfw.ConfigItem = _ConfigItem
-    qfw.OptionsConfigItem = _ConfigItem
-    qfw.RangeConfigItem = _ConfigItem
-    qfw.QConfig = _QConfig
-    qfw.OptionsValidator = MagicMock
-    qfw.BoolValidator = MagicMock
-    qfw.EnumSerializer = MagicMock
-    qfw.RangeValidator = MagicMock
-    qfw.ConfigValidator = MagicMock
-
-    sys.modules['qfluentwidgets'] = qfw
-
-
-# Install stub BEFORE importing backend.config.
-_install_qfluentwidgets_stub()
-
-from backend.config import config  # noqa: E402
-from backend.tools.inpaint_tools import create_mask  # noqa: E402
+from backend.config import config
+from backend.tools.inpaint_tools import create_mask
 
 
 class CreateMaskTest(unittest.TestCase):

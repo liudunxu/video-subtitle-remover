@@ -26,8 +26,7 @@ dependencies = [
     "opencv-python==4.11.0.86",
     "scikit-image==0.25.2",
     "tqdm==4.67.1",
-    "pyside6-fluent-widgets==1.7.7",
-    "numpy==2.2.5",
+    "numpy<2",
     "av==17.0.0",
     "einops==0.8.1",
     "paddleocr==3.4.0",
@@ -35,8 +34,7 @@ dependencies = [
     "Pillow",
     "scipy",
     "requests",
-    "darkdetect",
-    "je-showinfilemanager==1.1.6a4",
+    "python-multipart==0.0.20",
 ]
 
 [project.optional-dependencies]
@@ -87,9 +85,6 @@ Repository = "https://github.com/YaoFANGUK/video-subtitle-remover"
 Issues = "https://github.com/YaoFANGUK/video-subtitle-remover/issues"
 Documentation = "https://github.com/YaoFANGUK/video-subtitle-remover#readme"
 
-[project.gui-scripts]
-vsr = "gui:main"
-
 [project.scripts]
 vsr-cli = "backend.main:main"
 vsr-api = "api:main"
@@ -102,7 +97,6 @@ build-backend = "hatchling.build"
 packages = ["backend", "."]
 
 [tool.hatch.build.targets.wheel.force-include]
-"gui.py" = "gui.py"
 "api.py" = "api.py"
 
 [tool.uv]

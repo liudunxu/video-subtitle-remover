@@ -2,20 +2,23 @@ FROM python:3.12
 
 RUN --mount=type=cache,target=/root/.cache,sharing=private \
     apt update && \
-    apt install -y libgl1-mesa-glx \
-        # pyside6
-        libegl1 libxkbcommon0 libdbus-1-3 && \
+    apt install -y libgl1-mesa-glx && \
     true
 
 ADD . /vsr
 ARG CUDA_VERSION=12.6
 ARG HARDWARD_ACCELERATOR="cuda"
 
-# CUDA 12.x (cu126 / cu128). torch 2.8.0 has no cu118 wheel, so CUDA 11.8
-# is no longer supported. cu126 is the shared target with OmniVoice.
+# CUDA 12.x (cu126 / cu128)。torch 2.8.0 无 cu118 wheel，CUDA 11.8 不再
+# 支持——显式报错，而不是静默构建出一个未安装任何依赖的镜像。
 RUN --mount=type=cache,target=/root/.cache,sharing=private \
-    if [ "${HARDWARD_ACCELERATOR}" = "cuda" ] && [ "${CUDA_VERSION}" != "11.8" ]; then \
-        pip install paddlepaddle==3.0 && \
+    if [ "${CUDA_VERSION}" = "11.8" ]; then \
+        echo "CUDA_VERSION=11.8 is not supported (torch 2.8.0 has no cu118 wheel); use 12.6 or 12.8" >&2; \
+        exit 1; \
+    fi
+RUN --mount=type=cache,target=/root/.cache,sharing=private \
+    if [ "${HARDWARD_ACCELERATOR}" = "cuda" ]; then \
+        pip install "numpy<2" paddlepaddle-gpu==3.0.0 --extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu126/ && \
         pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu$(echo ${CUDA_VERSION} | tr -d '.') && \
         pip install -r /vsr/requirements.txt; \
     fi
@@ -23,7 +26,7 @@ RUN --mount=type=cache,target=/root/.cache,sharing=private \
 # 如果是 DirectML 版本，执行 DirectML 特定设置
 RUN --mount=type=cache,target=/root/.cache,sharing=private \
     if [ "${HARDWARD_ACCELERATOR}" = "directml" ]; then \
-        pip install paddlepaddle==3.0 && \
+        pip install "numpy<2" paddlepaddle==3.0 && \
         pip install torch_directml==0.2.5.dev240914 && \
         pip install -r /vsr/requirements.txt; \
     fi
@@ -31,7 +34,7 @@ RUN --mount=type=cache,target=/root/.cache,sharing=private \
 # 如果是 CPU 版本，执行 CPU 特定设置
 RUN --mount=type=cache,target=/root/.cache,sharing=private \
     if [ "${HARDWARD_ACCELERATOR}" = "cpu" ]; then \
-        pip install paddlepaddle==3.0 && \
+        pip install "numpy<2" paddlepaddle==3.0 && \
         pip install -r /vsr/requirements.txt && \
         sed -i 's/HARDWARD_ACCELERATION_OPTION *= *.*/HARDWARD_ACCELERATION_OPTION = False/g' /vsr/backend/config.py; \
     fi

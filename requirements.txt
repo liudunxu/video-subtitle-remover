@@ -2,8 +2,9 @@ filesplit==3.0.2
 opencv-python==4.11.0.86
 scikit-image==0.25.2
 tqdm==4.67.1
-pyside6-fluent-widgets==1.7.7
-numpy==2.2.5
+# numpy < 2：paddle 3.0 的 wheel 基于 numpy 1.x 构建（Docker 镜像构建
+# 末尾有版本断言兜底）；docker 镜像均为 Python ≤3.12，1.26.x 可用。
+numpy<2
 av==17.0.0
 einops==0.8.1
 paddleocr==3.4.0
@@ -15,8 +16,7 @@ matplotlib<3.8
 Pillow
 scipy
 requests
-darkdetect
-je-showinfilemanager==1.1.6a4
+python-multipart==0.0.20
 # torch and torchvision are installed separately (see Dockerfile for platform-specific versions)
 
 # Training only

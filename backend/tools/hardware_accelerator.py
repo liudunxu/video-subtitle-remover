@@ -3,7 +3,6 @@ import importlib.util
 
 import torch
 
-from backend.config import tr
 
 class HardwareAccelerator:
 
@@ -60,12 +59,12 @@ class HardwareAccelerator:
                     "CoreMLExecutionProvider",      # Apple macOS
                     "CUDAExecutionProvider",        # Nvidia GPU
                 ]:
-                    print(tr['Main']['OnnxExectionProviderNotSupportedSkipped'].format(provider))
+                    print(f'ONNX 执行提供程序: {provider} 不支持，已跳过。')
                     continue
-                print(tr['Main']['OnnxExecutionProviderDetected'].format(provider))
+                print(f'检测到 ONNX 执行提供程序: {provider}')
                 self.__onnx_providers.append(provider)
         except ModuleNotFoundError as e:
-            print(tr['Main']['OnnxRuntimeNotInstall'])
+            print('ONNX 运行环境未安装，已跳过。')
 
     def has_accelerator(self):
         if not self.__enabled:

@@ -3,71 +3,67 @@
 <div align="center">
   <img src="design/icon_1024.PNG" alt="VSR Logo" width="128" height="128">
 </div>
-<div align="center">
-<a href="https://trendshift.io/repositories/9120" target="_blank"><img src="https://trendshift.io/api/badge/repositories/9120" alt="YaoFANGUK%2Fvideo-subtitle-remover | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</div>
 
 ## Project Introduction
 
 ![License](https://img.shields.io/badge/License-Apache%202-red.svg)
 ![python version](https://img.shields.io/badge/Python-3.11+-blue.svg)
 ![support os](https://img.shields.io/badge/OS-Windows/macOS/Linux-green.svg)
-[![Docker](https://img.shields.io/badge/Docker-Image-blue?logo=docker)](https://hub.docker.com/r/eritpchy/video-subtitle-remover)
 
-Video-subtitle-remover (VSR) is an AI-based software that removes hardcoded subtitles from videos.
-It mainly implements the following functionalities:
-- **Lossless resolution**: Removes hardcoded subtitles from videos and generates files without subtitles
-- Fills in the removed subtitle text area using a powerful AI algorithm model (non-adjacent pixel filling and mosaic removal)
-- Supports custom subtitle positions by only removing subtitles in the defined location (input position)
-- Supports automatic removal of all text throughout the entire video (without inputting a position)
-- Supports multi-selection of images for batch removal of watermark text
+Video-subtitle-remover (VSR) is an AI-based tool that removes hardcoded subtitles from videos.
+
+This repository is focused on **HTTP API / GPU service deployment**: the desktop GUI has been removed (along with the PySide6/qfluentwidgets dependency in the config system), keeping two ways to use it — an **API service** and a **command-line CLI**. For the desktop GUI, use the upstream project [YaoFANGUK/video-subtitle-remover](https://github.com/YaoFANGUK/video-subtitle-remover).
+
+Main features:
+
+- **Lossless resolution** removal of hardcoded subtitles from videos
+- Fills the subtitle area with AI inpainting models (STTN / LaMa / ProPainter / OpenCV) — not adjacent-pixel smearing or mosaics
+- Automatic subtitle detection with PaddleOCR; custom subtitle areas can also be passed in
+- HTTP API: subtitle removal, automatic subtitle-area detection, progress polling, result download
+- CLI: `python backend/main.py -i input.mp4 -o output.mp4`
 
 ![demo.png](https://github.com/YaoFANGUK/video-subtitle-remover/raw/main/design/demo.png)
 
-**Instructions:**
+## Quick Start
 
-- If you have questions, please join the discussion group: QQ Group 210150985 (full), 806152575 (full), 816881808 (full), 295894827
-- Download the compressed package, extract and run it directly. If it cannot run, follow the tutorial below to try installing from source
+### 1. Install dependencies (uv, recommended)
 
-**Download:** <a href="https://github.com/YaoFANGUK/video-subtitle-remover/releases">Release</a>
-
-**Pre-built Package Comparison**:
-
-| Pre-built Package Name            | Python | Paddle | Torch | Environment                    | Supported Compute Capability Range |
-|-----------------------------------|--------|--------|-------|--------------------------------|------------------------------------|
-| `vsr-windows-cpu.7z`              | 3.12   | 3.0.0  | 2.7.0 | Universal                      | Universal                          |
-| `vsr-windows-directml.7z`         | 3.12   | 3.0.0  | 2.4.1 | Windows non-Nvidia GPU         | Universal                          |
-| `vsr-windows-nvidia-cuda-11.8.7z` | 3.12   | 3.0.0  | 2.7.0 | CUDA 11.8                      | 3.5 – 8.9                         |
-| `vsr-windows-nvidia-cuda-12.6.7z` | 3.12   | 3.0.0  | 2.7.0 | CUDA 12.6                      | 5.0 – 8.9                         |
-| `vsr-windows-nvidia-cuda-12.8.7z` | 3.12   | 3.0.0  | 2.7.0 | CUDA 12.8                      | 5.0 – 9.0+                        |
-
-> NVIDIA provides a list of compute capabilities for each GPU model. Refer to [CUDA GPUs](https://developer.nvidia.com/cuda-gpus) to check which CUDA version is compatible with your GPU.
-
-**Docker Versions:**
 ```shell
-  # Nvidia 10, 20, 30 Series Graphics Cards
-  docker run -it --name vsr --gpus all eritpchy/video-subtitle-remover:1.4.0-cuda11.8 python backend/main.py -i test/test.mp4 -o test/test_no_sub.mp4
+git clone https://github.com/YaoFANGUK/video-subtitle-remover.git
+cd video-subtitle-remover
 
-  # Nvidia 40 Series Graphics Cards
-  docker run -it --name vsr --gpus all eritpchy/video-subtitle-remover:1.4.0-cuda12.6 python backend/main.py -i test/test.mp4 -o test/test_no_sub.mp4
+# NVIDIA GPU (CUDA 12.6)
+uv sync --extra cuda12
 
-  # Nvidia 50 Series Graphics Cards
-  docker run -it --name vsr --gpus all eritpchy/video-subtitle-remover:1.4.0-cuda12.8 python backend/main.py -i test/test.mp4 -o test/test_no_sub.mp4
+# CPU only
+uv sync --extra cpu
 
-  # AMD / Intel Dedicated or Integrated Graphics
-  docker run -it --name vsr --gpus all eritpchy/video-subtitle-remover:1.4.0-directml python backend/main.py -i test/test.mp4 -o test/test_no_sub.mp4
+# macOS (Apple Silicon)
+uv sync --extra macos
 
-  # CPU
-  docker run -it --name vsr --gpus all eritpchy/video-subtitle-remover:1.4.0-cpu python backend/main.py -i test/test.mp4 -o test/test_no_sub.mp4
-
-  # Export video
-  docker cp vsr:/vsr/test/test_no_sub.mp4 ./
+# AMD/Intel GPU (Windows DirectML)
+uv sync --extra directml
 ```
 
-**Command Line:**
-```
-Video Subtitle Remover Command Line Tool
+With plain pip: `pip install -r requirements.txt`, then install paddlepaddle / torch for your platform (versions pinned in the extras in pyproject.toml).
 
+### 2. Start the API service
+
+```shell
+uv run python api.py            # defaults to 127.0.0.1:6006
+HOST=0.0.0.0 PORT=6006 uv run python api.py
+```
+
+### 3. Command-line CLI
+
+```shell
+python backend/main.py -i test/test.mp4 -o test/test_no_sub.mp4
+
+# Custom subtitle area (repeatable) and inpaint mode
+python backend/main.py -i test/test.mp4 -o out.mp4 -c 900 1000 100 1800 --inpaint-mode sttn-det
+```
+
+```
 options:
   -h, --help            show this help message and exit
   --input INPUT, -i INPUT
@@ -79,190 +75,154 @@ options:
   --inpaint-mode {sttn-auto,sttn-det,lama,propainter,opencv}
                         Inpaint mode, default is sttn-auto
 ```
-## Demonstration
 
-- GUI:
+## HTTP API
 
-<p style="text-align:center;"><img src="https://github.com/YaoFANGUK/video-subtitle-remover/raw/main/design/demo2.gif" alt="demo2.gif"/></p>
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check (alias `/api/health`), returns `{"ok": true, "service", "api_schema_version", ...}` |
+| `/api/capabilities` | GET | Capability list: modes / ocr_presets / feature flags / deprecated-alias usage |
+| `/api/status` | GET | Service status: version / uptime / work dir / free disk / active jobs |
+| `/api/remove-subtitle` | POST | Submit a subtitle removal job (aliases `/api/remove`, `/remove` — alias responses carry a `Deprecation` header) |
+| `/api/detect-subtitle-area` | POST | Auto-detect the subtitle area (aliases `/api/detect`, `/detect-subtitle-area`) |
+| `/api/progress/{job_id}` | GET | Poll job progress (phase / percent / stage) |
+| `/download/{job_id}/{filename}` | GET | Download the processed result |
 
-<p style="text-align:center;"><a href="https://b23.tv/guEbl9C"><img src="https://github.com/YaoFANGUK/video-subtitle-remover/raw/main/design/demo.gif" alt="demo.gif"/></a></p>
+Response conventions (aligned with OmniVoice): every JSON response carries the `{"ok": true|false, ...}` envelope and `api_schema_version`; an `X-Request-ID` request header is echoed back as a response header (generated when absent); errors are uniformly `{"ok": false, "error": "..."}` (4xx/422/499/5xx, no traceback in the body); a client disconnect mid-upload returns 499.
 
-## Source Code Usage Instructions
+### Removal: POST /api/remove-subtitle
 
+Two ways to supply the video (pick one):
 
-#### 1. Install Python
-
-Please ensure that you have installed Python 3.12+.
-
-- Windows users can go to the [Python official website](https://www.python.org/downloads/windows/) to download and install Python.
-- MacOS users can install using Homebrew:
-  ```shell
-  brew install python@3.12
-  ```
-- Linux users can install via the package manager, such as on Ubuntu/Debian:
-  ```shell
-  sudo apt update && sudo apt install python3.12 python3.12-venv python3.12-dev
-  ```
-
-#### 2. Install Dependencies
-
-It is recommended to use a virtual environment to manage project dependencies to avoid conflicts with the system environment.
-
-(1) Create and activate the virtual environment:
-```shell
-python -m venv videoEnv
-```
-
-- Windows:
-```shell
-videoEnv\\Scripts\\activate
-```
-- MacOS/Linux:
-```shell
-source videoEnv/bin/activate
-```
-
-#### 3. Create and Activate Project Directory
-
-Change to the directory where your source code is located:
-```shell
-cd <source_code_directory>
-```
-> For example, if your source code is in the `tools` folder on the D drive and the folder name is `video-subtitle-remover`, use:
-> ```shell
-> cd D:/tools/video-subtitle-remover-main
-> ```
-
-#### 4. Install the Appropriate Runtime Environment
-
-This project supports four running modes: CUDA (NVIDIA GPU acceleration), CPU (no GPU), DirectML (AMD, Intel and other GPU/APU acceleration), and macOS (Apple Silicon).
-
-##### (1) CUDA (For NVIDIA GPU users)
-
-> Make sure your NVIDIA GPU driver supports the selected CUDA version.
-
-- Recommended CUDA 11.8, corresponding to cuDNN 8.6.0.
-
-- Install CUDA:
-  - Windows: [Download CUDA 11.8](https://developer.download.nvidia.com/compute/cuda/11.8.0/local_installers/cuda_11.8.0_522.06_windows.exe)
-  - Linux:
-    ```shell
-    wget https://developer.download.nvidia.com/compute/cuda/11.8.0/local_installers/cuda_11.8.0_520.61.05_linux.run
-    sudo sh cuda_11.8.0_520.61.05_linux.run
-    ```
-  - CUDA is not supported on MacOS.
-
-- Install cuDNN (CUDA 11.8 corresponds to cuDNN 8.6.0):
-  - [Windows cuDNN 8.6.0 Download](https://developer.download.nvidia.cn/compute/redist/cudnn/v8.6.0/local_installers/11.8/cudnn-windows-x86_64-8.6.0.163_cuda11-archive.zip)
-  - [Linux cuDNN 8.6.0 Download](https://developer.download.nvidia.cn/compute/redist/cudnn/v8.6.0/local_installers/11.8/cudnn-linux-x86_64-8.6.0.163_cuda11-archive.tar.xz)
-  - Follow the installation guide in the NVIDIA official documentation.
-
-- Install PaddlePaddle GPU version (CUDA 11.8):
-  ```shell
-  pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
-  ```
-- Install Torch GPU version (CUDA 11.8):
-  ```shell
-  pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu118
-  ```
-
-- Install other dependencies:
-  ```shell
-  pip install -r requirements.txt
-  ```
-
-- For Linux systems, you also need to install:
-
-  ```shell
-  # for cuda 12.x
-  pip install onnxruntime-gpu==1.22.0
-  # for cuda 11.x
-  pip install onnxruntime-gpu==1.20.1 --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-11/pypi/simple/
-  ```
-  > For more details, see: [Install ONNX Runtime](https://onnxruntime.ai/docs/install/#install-onnx-runtime-gpu-cuda-12x)
-
-##### (2) DirectML (For AMD, Intel, and other GPU/APU users)
-
-- Suitable for Windows devices with AMD/NVIDIA/Intel GPUs.
-- Install ONNX Runtime DirectML version:
-  ```shell
-  pip install paddlepaddle==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
-  pip install -r requirements.txt
-  pip install torch_directml==0.2.5.dev240914
-  ```
-##### (3) CPU Only (For systems without GPU or those not wanting to use GPU acceleration)
-
-- Suitable for systems without GPU or those that do not wish to use GPU.
-  ```shell
-  pip install paddlepaddle==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
-  pip install torch==2.7.0 torchvision==0.22.0
-  pip install -r requirements.txt
-  ```
-##### (4) Running on macOS (Apple Silicon)
-- Suitable for macOS (Apple Silicon) devices
-- For macOS (Intel), please use the CPU mode. Forcing GPU usage will only be slower.
-- On macOS (Apple Silicon), the accuracy of the PP-OCRv4-Server model for subtitle detection seems suboptimal. We recommend using an alternative model.
-  ```shell
-  pip install paddlepaddle==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
-  pip install torch==2.7.0 torchvision==0.22.0
-  pip install -r requirements.txt
-  ```
-  > Tested with Python 3.13
-#### 4. Run the program
-
-- Run the graphical interface
+- `video_url` in a JSON body: HTTP(S) URL, `file://` path, or local path
+- `multipart/form-data`: upload via the `video` file field, parameters in the `payload` JSON field (recommended for 100MB+ videos; do not use base64 JSON)
 
 ```shell
-python gui.py
+# JSON + remote video URL
+curl -X POST http://127.0.0.1:6006/api/remove-subtitle \
+  -H 'Content-Type: application/json' \
+  -H 'X-Job-Id: my-job-0001' \
+  -d '{
+    "video_url": "https://example.com/input.mp4",
+    "sub_area": [900, 1050, 100, 1820],
+    "options": {"mode": "sttn", "ocr_preset": "default"}
+  }'
+
+# multipart local upload
+curl -X POST http://127.0.0.1:6006/api/remove-subtitle \
+  -F 'video=@test/test.mp4' \
+  -F 'payload={"sub_area": [900, 1050, 100, 1820], "options": {"mode": "sttn"}}'
 ```
 
-- Run the command line version (CLI)
+`sub_area` is `[ymin, ymax, xmin, xmax]` in pixels (optional; the whole frame is processed when omitted). Response:
+
+```json
+{
+  "ok": true,
+  "url": "http://127.0.0.1:6006/download/<job_id>/test_no_sub.mp4",
+  "download_url": "...",
+  "job_id": "...",
+  "request_id": "...",
+  "api_schema_version": "vsr-removal-v1",
+  "filename": "test_no_sub.mp4",
+  "fallback_triggered": false,
+  "elapsed_seconds": 123.4
+}
+```
+
+Progress polling: `GET /api/progress/{job_id}` (set the job id via the `X-Job-Id` header or the `progress_job_id` field; otherwise the server generates one; custom ids must match `[A-Za-z0-9_-]{1,64}`).
+
+Output guarantees: the result duration matches the source video (missing tail frames are padded with a frozen last frame — the main body is NOT re-encoded); the audio track is kept at full source length (AAC stream-copied, other codecs transcoded to AAC 320k, never truncated with `-shortest`); H.264 + faststart; tail repair passes that modify zero frames return the upstream output unchanged instead of adding another lossy generation.
+
+### Main options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `mode` | `sttn` | `sttn` (detection-driven, best for live-action) / `lama` (animation) / `propainter` (heavy motion, VRAM-hungry) / `lama_area` (whole-area LaMa) / `blur_cover` (Gaussian blur cover) |
+| `subtitle_area_deviation_pixel` | 44 | Mask expansion in X (px) |
+| `subtitle_area_deviation_pixel_y` | 44 | Mask expansion in Y (px); increase for multi-line subtitles |
+| `sttn_skip_detection` | false | Skip OCR detection and repaint the whole area with STTN_AUTO (fastest; may touch subtitle-free frames) |
+| `sttn_neighbor_stride` / `sttn_reference_length` / `sttn_max_load_num` | 5 / 20 / 120 | STTN reference-frame stride / count / max frames per batch (larger = better quality, slower, more VRAM) |
+| `ocr_preset` | `default` | Detection sensitivity: `default` / `fast` / `turbo` / `fuzzy` / `ultra` / `multiline` / `aggressive`. `multiline` auto-enables STTN refinement + residual cleanup on frames with 3+ subtitle lines |
+| `bbox_min_inside_ratio` | 1.0 | Minimum intersection-over-box ratio for keeping an OCR box inside the subtitle area; 1.0 = box must be fully inside (old behavior), lower values (e.g. 0.6) keep boxes straddling the area edge |
+| `ocr_sample_step` | 0 | OCR sampling interval; 0 = fps-adaptive, 1 = every frame (slowest, fewest misses), max 30 |
+| `empty_detection_full_inpaint` | true | When OCR finds no subtitles: true = whole-area STTN_AUTO repaint; false = HTTP 422. The response field `fallback_triggered` reports whether the fallback fired |
+| `post_lama_refine` | true | Extra text-trace refinement pass after STTN that removes STTN ghost residue (diff-gated — only touches pixels STTN actually changed; pass `false` to disable; tunable via `post_refine_*`) |
+| `auto_residual_cleanup` | false | Tail pass that scans for residual text pixels and inpaints them (tunable via `residual_*`) |
+| `post_verify_blur` | false | Tail pass that re-runs OCR on the output and Gaussian-blurs remaining text boxes (tunable via `post_verify_blur_*`) |
+| `blur_kernel` / `blur_passes` / `blur_pad` / `blur_feather` / `blur_temporal_window` | 51 / 2 / 24 / 20 / 3 | `blur_cover` mode only: Gaussian kernel / stacked passes / box padding px / feather px / temporal smoothing window (0 disables) |
+| `blur_cover_allow_passthrough` | false | When `blur_cover` detection fails or finds no subtitles: false = HTTP 422 (the caller should know the subtitles are still there); true = return the original video (old behavior) |
+
+Preset values `det_db_thresh` / `det_db_box_thresh` / `det_limit_side_len` are mapped to the parameter names the installed PaddleOCR actually accepts (2.x uses the same names; 3.x/PaddleX uses `thresh` / `box_thresh` / `limit_side_len`); the applied values are logged at construction.
+
+STTN-related environment variables (the docker image sets defaults):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VSR_STTN_BAND_MARGIN` | 40 | STTN_DET crop height adapts to the mask: tallest subtitle band + 2×margin (px); empty masks fall back to the old proportional split |
+| `VSR_STTN_INPUT_WIDTH` / `VSR_STTN_INPUT_HEIGHT` | 432 / 240 | STTN_DET model input size; constrained by the attention patch grid to multiples of 432/240, capped at 864×480; invalid values fall back to 432×240 |
+
+Other service-level variables: `HOST` / `PORT`, `VSR_API_WORK_DIR` (job work dir), `VSR_API_MAX_UPLOAD_MB` / `VSR_API_MAX_DOWNLOAD_MB` (default 2048), `VSR_API_DOWNLOAD_TIMEOUT` (default 300s), `VSR_API_JOB_TTL_SECONDS` (how long finished job dirs are kept on disk, default 21600s / 6h — older dirs are swept automatically), `VSR_REQUIRE_GPU` (docker entrypoint enforces GPU checks at startup).
+
+### Area detection: POST /api/detect-subtitle-area
+
+Same input styles as the removal endpoint; returns the detected subtitle area (can be fed straight back to the removal endpoint):
 
 ```shell
-python ./backend/main.py
+curl -X POST http://127.0.0.1:6006/api/detect-subtitle-area \
+  -H 'Content-Type: application/json' \
+  -d '{"video_url": "https://example.com/input.mp4", "detect_options": {"sample_count": 72}}'
 ```
 
-## Common Issues
-1. How to deal with slow removal speed
+The response contains `area` / `sub_area` (padded), `raw_area` / `raw_sub_area` (unpadded), `confidence`, `boxes`, `video_size`, `fps`, etc. Common detect options: `sample_count` (default 72), `ocr_preset`, `bbox_min_inside_ratio`, `crop_to_band`, `early_stop_hit_frames`.
 
-You can greatly increase the removal speed by modifying the parameters in backend/config.py:
-```python
-MODE = InpaintMode.STTN  # Set to STTN algorithm
-STTN_SKIP_DETECTION = True # Skip subtitle detection, skipping may cause missed subtitles or damage to frames without subtitles
+## Deployment
+
+### Docker (GPU API image)
+
+`docker/Dockerfile.gpu` builds the GPU API image for Vast.ai (CUDA 12.6 + paddlepaddle-gpu + mandatory GPU self-check at startup), published to Docker Hub by the `build-vast-gpu` GitHub Actions workflow:
+
+```shell
+docker build -f docker/Dockerfile.gpu -t <namespace>/video-subtitle-remover:vast-gpu .
+docker run --gpus all -p 6006:6006 <namespace>/video-subtitle-remover:vast-gpu
+curl http://127.0.0.1:6006/health
 ```
 
-2. What to do if the video removal results are not satisfactory
+### One-command Vast.ai instances
 
-Modify the values in backend/config.py and try different removal algorithms. Here is an introduction to the algorithms:
-
-> - InpaintMode.STTN algorithm: Good for live-action videos and fast in speed, capable of skipping subtitle detection
-> - InpaintMode.LAMA algorithm: Best for images and effective for animated videos, moderate speed, unable to skip subtitle detection
-> - InpaintMode.PROPAINTER algorithm: Consumes a significant amount of VRAM, slower in speed, works better for videos with very intense movement
-
-- Using the STTN algorithm
-
-```python
-MODE = InpaintMode.STTN  # Set to STTN algorithm
-# Number of neighboring frames, increasing this will increase memory usage and improve the result
-STTN_NEIGHBOR_STRIDE = 10
-# Length of reference frames, increasing this will increase memory usage and improve the result
-STTN_REFERENCE_LENGTH = 10
-# Set the maximum number of frames processed simultaneously by the STTN algorithm, a larger value leads to slower processing but better results
-# Ensure that STTN_MAX_LOAD_NUM is greater than STTN_NEIGHBOR_STRIDE and STTN_REFERENCE_LENGTH
-STTN_MAX_LOAD_NUM = 30
-```
-- Using the LAMA algorithm
-```python
-MODE = InpaintMode.LAMA  # Set to LAMA algorithm
-LAMA_SUPER_FAST = False  # Ensure quality
+```bash
+export VAST_API_KEY=<your-key>
+python scripts/vast_ai_manager.py status   # list instances
+python scripts/vast_ai_manager.py start    # pick an offer, create, wait for /health
+python scripts/vast_ai_manager.py stop     # delete all matching instances
+python scripts/vast_ai_manager.py logs <instance_id>
 ```
 
-> If you are not satisfied with the subtitle removal results, you can check the training methods in the design folder, use the code in backend/tools/train to train, and then replace the old model with the trained model.
+See the full operations runbook (Chinese): [docs/vast_ai_gpu_service_runbook_zh.md](docs/vast_ai_gpu_service_runbook_zh.md).
 
-3. 7z file extraction error
+## Development & Testing
 
-Solution: Upgrade the 7-zip extraction program to the latest version.
+```shell
+python -m pytest tests/ -v     # unit tests (no GPU / Paddle models needed)
+python api.py --help           # API service arguments
+```
 
+Key behavioral conventions for the algorithm/API layer are documented in `AGENTS.md` section 8; to train your own models see `backend/tools/train/`.
+
+## FAQ
+
+1. Processing is slow
+
+- `mode=sttn` + `sttn_skip_detection=true`: skips detection and repaints the whole area (may touch subtitle-free frames or miss some subtitles).
+- Lower `sttn_max_load_num` / `sttn_reference_length` to reduce VRAM usage (slightly worse quality).
+
+2. Removal quality is poor
+
+- STTN: best for live-action videos, fast, can skip detection.
+- LaMa: best for images, good for animation, moderate speed, cannot skip detection.
+- ProPainter: VRAM-hungry and slow, best for videos with very heavy motion.
+- Residual text left: enable the `post_lama_refine`, `auto_residual_cleanup`, or `post_verify_blur` tail passes; try `ocr_preset=multiline` for 3+ line subtitles.
+- If you are not satisfied with the models, check the training guide in the design folder and train a replacement with `backend/tools/train/`.
 
 ## Sponsor
 

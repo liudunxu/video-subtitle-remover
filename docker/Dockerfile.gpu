@@ -36,15 +36,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     ffmpeg \
-    git \
-    libdbus-1-3 \
-    libegl1 \
     libgl1 \
     libglib2.0-0 \
     libgomp1 \
     libsm6 \
     libxext6 \
-    libxkbcommon0 \
     libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -62,8 +58,10 @@ RUN chmod +x /usr/local/bin/vsr-api-gpu-entrypoint \
 
 # PaddleOCR 3.4.0 uses PaddleX internally, so PaddleX is pinned near that stack
 # instead of floating to the latest release. PyTorch/torchvision come from the
-# base image and are checked below.
+# base image and are checked below. numpy<2 is pinned up front so Paddle does
+# not drag numpy 2.x into the image (its wheels are built against numpy 1.x).
 RUN python -m pip install \
+    "numpy<2" \
     paddlepaddle-gpu==${PADDLE_VERSION} \
     --extra-index-url ${PADDLE_CUDA_INDEX}
 
@@ -71,8 +69,6 @@ RUN python -m pip install \
     onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION} \
     paddlex==${PADDLEX_VERSION} \
     -r requirements.txt
-
-RUN python -m pip install --force-reinstall "numpy==1.26.4"
 
 # Paddle 3.0's wheel metadata pins older CUDA Python packages than the PyTorch
 # 2.8 CUDA 12.6 image. Restore PyTorch's exact runtime library pins after Paddle
@@ -89,9 +85,12 @@ RUN mkdir -p /workspace/.cache/matplotlib /workspace/video_subtitle_remover_api
 RUN python - <<'PY'
 from importlib import metadata
 
+import numpy
 import onnxruntime as ort
 import torch
 
+if not numpy.__version__.startswith("1.26"):
+    raise SystemExit(f"unexpected numpy version: {numpy.__version__}")
 if not torch.__version__.startswith("2.8.0"):
     raise SystemExit(f"unexpected torch version: {torch.__version__}")
 if not torch.version.cuda:
@@ -110,7 +109,7 @@ PY
 
 EXPOSE 6006
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('PORT', '6006'), timeout=3).read()"
 
 ENTRYPOINT ["/usr/local/bin/vsr-api-gpu-entrypoint"]

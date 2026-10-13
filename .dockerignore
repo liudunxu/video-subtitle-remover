@@ -1,0 +1,22 @@
+# Version control & local caches — never needed inside images
+.git
+**/__pycache__
+**/.DS_Store
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.claude
+config/
+
+# Dev-only content (not referenced by docker/Dockerfile or docker/Dockerfile.gpu)
+design/
+docs/
+scripts/
+test/
+tests/
+
+# Platform-specific ffmpeg binaries — Linux images only use backend/ffmpeg/linux_x64
+# (backend/tools/ffmpeg_cli.py selects by platform; macOS/Windows binaries are
+# dead weight in every linux/amd64 image, ~180MB)
+backend/ffmpeg/macos/
+backend/ffmpeg/win_x64/
