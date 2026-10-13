@@ -1215,9 +1215,13 @@ def _text_trace_mask(mask_frame, target_frame, area, options):
     if source_crop.size == 0 or target_crop.size == 0:
         return np.zeros((height, width), dtype=np.uint8)
 
-    hsv = cv2.cvtColor(source_crop, cv2.COLOR_BGR2HSV)
+    # 文字种子在 **target（STTN 输出）** 上算：只有 STTN 擦完仍残留的
+    # 亮/黄/暗痕迹才应被重填。历史上种子在 source（原始帧）上算——原始帧
+    # 的字形永远是亮的，而 STTN 又改动了全部字形像素，diff 门控形同虚设，
+    # 结果整个字形区域每帧都被无纹理的 telea 重填（毛玻璃观感的主因）。
+    hsv = cv2.cvtColor(target_crop, cv2.COLOR_BGR2HSV)
     hue, saturation, value = cv2.split(hsv)
-    gray = cv2.cvtColor(source_crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(target_crop, cv2.COLOR_BGR2GRAY)
     bright_threshold = int(options.get("post_refine_bright_threshold") or 145)
     dark_threshold = int(options.get("post_refine_dark_threshold") or 80)
     edge_threshold = int(options.get("post_refine_edge_threshold") or 40)
