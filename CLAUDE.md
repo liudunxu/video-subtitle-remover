@@ -76,7 +76,7 @@ Use this convention for this project's GPU API deployment:
 - Default disk: `70`
 - Minimum GPU VRAM: `12000` MB (12 GB); RTX 3060/3060 Ti/4060 Ti/4070/3090 class GPUs are acceptable.
 - CPU preference: modern x86-64 CPUs with AVX2 and FMA support. Avoid very old Intel Xeon E5 v2/v3 without AVX2, and avoid `Common KVM processor` / unknown generic CPUs. AMD EPYC 7xx2/7xx3/7K62/7402/7452/7502/7532/7551P or newer, and Intel Xeon E5-2673 v4 / E5-2686 v4 / E5-2690 v4 / E5-2695 v4 / E5-2696 v4 / Xeon W / Xeon Gold/Silver / Core i5/i7/i9 6th-gen or newer are preferred.
-- Region preference (aligned with OmniVoice): **Southeast Asia first** (SG/TH/VN/MY/ID/PH/KH/MM/LA/BN/TL), then **East Asia** (KR/TW/JP/HK/MO), then other Asia (CN/IN/TR/AE/SA/IL/QA/KW/BH/OM). Fall back to Americas (US/CA) only when no suitable Asia offer is available. (A previous Oman pick downloaded at ~6KB/s — West Asia is rank 2, not rank 0.)
+- Region preference (aligned with OmniVoice): **Southeast Asia first** (SG/TH/VN/MY/ID/PH/KH/MM/LA/BN/TL), then **East Asia** (KR/TW/JP/HK/MO), then other Asia (IN/TR/AE/SA/IL/QA/KW/BH/OM). Fall back to Americas (US/CA) only when no suitable Asia offer is available. **CN offers are blacklisted and never selected** (aligned with OmniVoice's never-CN rule). (A previous Oman pick downloaded at ~6KB/s — West Asia is rank 2, not rank 0.)
 - Required env:
   - `-p 6006:6006=1`
   - `HOST=0.0.0.0`

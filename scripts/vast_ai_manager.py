@@ -61,8 +61,12 @@ _PREFERRED_CPU_SUBSTRINGS = [
 # Asia, then Americas. A previous Oman (West Asia) pick downloaded at ~6KB/s.
 _SOUTHEAST_ASIA_COUNTRY_CODES = {"SG", "TH", "VN", "MY", "ID", "PH", "KH", "MM", "LA", "BN", "TL"}
 _EAST_ASIA_COUNTRY_CODES = {"KR", "TW", "JP", "HK", "MO"}
-_OTHER_ASIA_COUNTRY_CODES = {"CN", "IN", "TR", "AE", "SA", "IL", "QA", "KW", "BH", "OM"}
+_OTHER_ASIA_COUNTRY_CODES = {"IN", "TR", "AE", "SA", "IL", "QA", "KW", "BH", "OM"}
 _AMERICAS_COUNTRY_CODES = {"US", "CA", "MX", "BR", "AR", "CL", "CO", "PE"}
+
+# 国家黑名单：这些地区的 offer 一律不选（对齐 OmniVoice 的 never-CN 规则；
+# 拉镜像慢/不稳定曾是中国区机器的常态）。
+_OFFER_COUNTRY_BLACKLIST = {"CN"}
 
 REQUIRED_ENV = {
     f"-p {DEFAULT_PORT}:{DEFAULT_PORT}": "1",
@@ -157,7 +161,12 @@ def search_offers(
     )
     resp.raise_for_status()
     data = resp.json()
-    return data.get("offers", []) or []
+    offers = data.get("offers", []) or []
+    # 黑名单国家的 offer 直接排除，不参与排序与创建
+    return [
+        o for o in offers
+        if _offer_country(o) not in _OFFER_COUNTRY_BLACKLIST
+    ]
 
 
 def create_instance(
@@ -284,13 +293,18 @@ def _build_known_good_entry(instance_id: int, offer: Dict[str, Any], image: str)
     }
 
 
-def _offer_region(offer: Dict[str, Any]) -> str:
+def _offer_country(offer: Dict[str, Any]) -> str:
     country = (offer.get("country_code") or "").upper()
     if not country:
         # vast 的 geolocation 形如 "City, CC"，取逗号后的国家码精确匹配，
         # 避免子串误伤（如 "in" 命中 "Singapore"）。
         geo = (offer.get("geolocation") or "")
         country = geo.rsplit(",", 1)[-1].strip().upper() if geo else ""
+    return country
+
+
+def _offer_region(offer: Dict[str, Any]) -> str:
+    country = _offer_country(offer)
     if country in _SOUTHEAST_ASIA_COUNTRY_CODES:
         return "southeast_asia"
     if country in _EAST_ASIA_COUNTRY_CODES:
