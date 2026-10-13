@@ -51,9 +51,16 @@ class STTNDetInpaint:
         # 2. 设置相连帧数
         self.neighbor_stride = config.sttnNeighborStride.value
         self.ref_length = config.sttnReferenceLength.value
-        # mask 驱动的 crop 带高余量（env VSR_STTN_BAND_MARGIN 可调）
+        # mask 驱动的 crop 带高余量（请求级 sttn_band_margin 优先，其次
+        # env VSR_STTN_BAND_MARGIN）。余量越大，模型能"看到"的周边纹理
+        # 上下文越多，大片结构纹理（如针织）的合成越自然。
+        import backend.config as _config_module
+        _margin_override = getattr(_config_module, "STTN_BAND_MARGIN", None)
         try:
-            self.band_margin = max(0, min(200, int(os.environ.get("VSR_STTN_BAND_MARGIN", "40"))))
+            self.band_margin = max(0, min(400, int(
+                _margin_override if _margin_override is not None
+                else os.environ.get("VSR_STTN_BAND_MARGIN", "40")
+            )))
         except (TypeError, ValueError):
             self.band_margin = 40
 
