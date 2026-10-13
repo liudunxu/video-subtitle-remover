@@ -268,6 +268,8 @@ def _normalize_options(payload):
         "sttn_neighbor_stride",
         "sttn_reference_length",
         "sttn_max_load_num",
+        "sttn_input_width",
+        "sttn_input_height",
         "lama_super_fast",
         "propainter_max_load_num",
         "post_lama_refine",
@@ -357,6 +359,11 @@ def _normalize_options(payload):
         "sttn_neighbor_stride": _bounded_int(merged.get("sttn_neighbor_stride"), "sttn_neighbor_stride", 5, 1, 30),
         "sttn_reference_length": _bounded_int(merged.get("sttn_reference_length"), "sttn_reference_length", 20, 1, 60),
         "sttn_max_load_num": _bounded_int(merged.get("sttn_max_load_num"), "sttn_max_load_num", 120, 2, 240),
+        # STTN_DET 模型输入尺寸（0 = 用 env/内置默认 432x240）。更大输入
+        # （如 864x480）重绘更锐利、减少放大模糊，代价是推理更慢更耗显存；
+        # 非法值（非 432/240 整数倍或超 864x480）回退默认并打 warning。
+        "sttn_input_width": _bounded_int(merged.get("sttn_input_width"), "sttn_input_width", 0, 0, 864),
+        "sttn_input_height": _bounded_int(merged.get("sttn_input_height"), "sttn_input_height", 0, 0, 480),
         "lama_super_fast": _to_bool(merged.get("lama_super_fast", False)),
         "propainter_max_load_num": _bounded_int(merged.get("propainter_max_load_num"), "propainter_max_load_num", 70, 2, 180),
         "post_lama_refine": post_lama_refine,
@@ -815,6 +822,8 @@ def _apply_config_options(config, options):
     dynamic_overrides = {
         "STTN_SKIP_DETECTION": options["sttn_skip_detection"],
         "LAMA_SUPER_FAST": options["lama_super_fast"],
+        "STTN_INPUT_WIDTH": options.get("sttn_input_width") or None,
+        "STTN_INPUT_HEIGHT": options.get("sttn_input_height") or None,
     }
 
     # `config` 是 backend.config 模块；ConfigItem（inpaintMode 等）挂在单例

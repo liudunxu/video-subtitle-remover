@@ -143,6 +143,7 @@ curl -X POST http://127.0.0.1:6006/api/remove-subtitle \
 | `subtitle_area_deviation_pixel_y` | 44 | mask 的 Y 方向外扩像素（多行字幕调大） |
 | `sttn_skip_detection` | false | 跳过 OCR 检测，整区 STTN_AUTO 重绘（最快，可能误伤无字幕帧） |
 | `sttn_neighbor_stride` / `sttn_reference_length` / `sttn_max_load_num` | 5 / 20 / 120 | STTN 参考帧步长 / 数量 / 单次最大加载帧数（调大效果更好、更慢、更耗显存） |
+| `sttn_input_width` / `sttn_input_height` | 0（用 env/默认 432×240） | STTN_DET 模型输入尺寸；864×480 重绘更锐利（放大模糊更少）但更慢更耗显存；须为 432/240 的整数倍且 ≤864×480，非法值回退默认 |
 | `ocr_preset` | `default` | 检测灵敏度：`default` / `fast` / `turbo` / `fuzzy` / `ultra` / `multiline` / `aggressive`。`multiline` 检测到 3 行及以上字幕时自动对多行帧启用 STTN 修边 + 残字兜底 |
 | `bbox_min_inside_ratio` | 1.0 | OCR 检测框与字幕区域的交集面积占比下限；1.0 = 完全落在区域内才保留，调小（如 0.6）可保留压在区域边缘的检测框 |
 | `ocr_sample_step` | 0 | OCR 采样间隔；0 = 按帧率自适应，1 = 逐帧检测（最慢但最不易漏），最大 30 |
