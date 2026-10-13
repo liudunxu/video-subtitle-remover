@@ -32,15 +32,19 @@ class STTNDetInpaint:
         self.model.load_state_dict(torch.load(model_path, map_location='cpu')['netG'])
         # 3. # 将模型设置为评估模式
         self.model.eval()
-        # 模型输入用的宽和高（请求级 sttn_input_width/height 优先（经 config
-        # 动态属性注入），其次 env VSR_STTN_INPUT_WIDTH/HEIGHT；
-        # 受 STTN 注意力 patch 网格约束，仅允许 432/240 的整数倍且封顶 864x480）
+        # 模型输入用的宽和高（请求级 sttn_input_width/height 优先，其次
+        # env VSR_STTN_INPUT_WIDTH/HEIGHT；受 STTN 注意力 patch 网格约束，
+        # 仅允许 432/240 的整数倍且封顶 864x480）。
+        # 注意：api.py 的动态覆盖是 setattr 到 backend.config **模块**上的
+        # （与 STTN_SKIP_DETECTION/LAMA_SUPER_FAST 同模式），必须读模块属性，
+        # 读 config 单例会静默落空（曾导致 864 选项实际跑 432）。
+        import backend.config as _config_module
         _size_environ = dict(os.environ)
         for _env_name, _attr in (
             ("VSR_STTN_INPUT_WIDTH", "STTN_INPUT_WIDTH"),
             ("VSR_STTN_INPUT_HEIGHT", "STTN_INPUT_HEIGHT"),
         ):
-            _val = getattr(config, _attr, None)
+            _val = getattr(_config_module, _attr, None)
             if _val:
                 _size_environ[_env_name] = str(_val)
         self.model_input_width, self.model_input_height = resolve_sttn_det_input_size(_size_environ)
