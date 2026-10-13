@@ -144,6 +144,7 @@ Output guarantees: the result duration matches the source video (missing tail fr
 | `sttn_skip_detection` | false | Skip OCR detection and repaint the whole area with STTN_AUTO (fastest; may touch subtitle-free frames) |
 | `sttn_neighbor_stride` / `sttn_reference_length` / `sttn_max_load_num` | 5 / 20 / 120 | STTN reference-frame stride / count / max frames per batch (larger = better quality, slower, more VRAM) |
 | `sttn_input_width` / `sttn_input_height` | 0 (use env/default 432×240) | STTN_DET model input size; 864×480 inpaints sharper (less upscale blur) at higher cost; must be multiples of 432/240, capped at 864×480, invalid values fall back to default |
+| `sttn_band_margin` | 0 (use env/default 40) | STTN_DET crop band margin px: larger values (e.g. 120) give the model more surrounding-texture context and can slightly help on large structured fills, at the cost of a taller/slower crop; very large values (240+ on 1080×1920) can stall or fail |
 | `ocr_preset` | `default` | Detection sensitivity: `default` / `fast` / `turbo` / `fuzzy` / `ultra` / `multiline` / `aggressive`. `multiline` auto-enables STTN refinement + residual cleanup on frames with 3+ subtitle lines |
 | `bbox_min_inside_ratio` | 1.0 | Minimum intersection-over-box ratio for keeping an OCR box inside the subtitle area; 1.0 = box must be fully inside (old behavior), lower values (e.g. 0.6) keep boxes straddling the area edge |
 | `ocr_sample_step` | 0 | OCR sampling interval; 0 = fps-adaptive, 1 = every frame (slowest, fewest misses), max 30 |
