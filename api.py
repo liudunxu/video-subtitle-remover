@@ -3744,6 +3744,11 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
             if area is None and options.get("auto_detect_area", True):
                 try:
                     detect_options = _normalize_detect_options(payload)
+                    # 擦除用途把横向 padding 放宽到 >=96px：自动识别的区域只是
+                    # 检测/修边的作用范围，宁宽勿窄——detect 默认的 16px 曾把
+                    # 字幕左右边缘的残字裁在区域外（宽区域在 STTN_DET 下几乎
+                    # 零代价，mask 仍由检测框驱动；仅影响空检测整区兜底范围）。
+                    detect_options["padding_x"] = max(int(detect_options.get("padding_x") or 0), 96)
                     with PROCESS_LOCK:
                         area_detect = _run_subtitle_area_detection(source_path, None, detect_options)
                     if area_detect.get("sub_area"):
