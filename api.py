@@ -3001,6 +3001,7 @@ def _normalize_detect_options(payload):
         "band_extra_pct",
         "early_stop_hit_frames",
         "non_hpi_fast",
+        "multi_group_union",
     }}}
     ocr_preset_raw = _normalize_ocr_preset_name(merged.get("ocr_preset"))
     sample_count_value = merged.get("sample_count", merged.get("detect_sample_count"))
@@ -3043,6 +3044,9 @@ def _normalize_detect_options(payload):
         ),
         "_early_stop_hit_frames_explicit": early_stop_hit_frames_value not in (None, ""),
         "non_hpi_fast": _to_bool(merged.get("non_hpi_fast", True)),
+        # 多区域并集：不做带宽过滤、>= 最高分 60% 的强组取并集。
+        # 适合底部横排字幕与侧边竖排演职员表并存的多区域文本。
+        "multi_group_union": _to_bool(merged.get("multi_group_union", False)),
     }
 
 
@@ -3165,7 +3169,12 @@ def _choose_subtitle_area(boxes, width, height, options):
         box for box in boxes
         if min_center_y <= box["y"] + box["height"] / 2.0 <= max_center_y
     ]
-    if primary_candidates:
+    if options.get("multi_group_union"):
+        # 多区域并集模式：不做带宽过滤，全部框参与分组与评分；分数接近的
+        # 多个强组取并集（底部横排字幕 + 侧边竖排演职员表这类多区域文本
+        # 不再二选一）。位置先验仍参与打分，但证据强的区域不会被先验杀掉。
+        candidates = list(boxes)
+    elif primary_candidates:
         candidates = primary_candidates
     elif options.get("allow_outside_band"):
         candidates = [
@@ -3223,6 +3232,19 @@ def _choose_subtitle_area(boxes, width, height, options):
         )
 
     selected = max(groups, key=group_score)
+    if options.get("multi_group_union"):
+        # >= 最高分 60% 的强组全部并入：STTN_DET 的 mask 由检测框驱动，
+        # 更大的区域几乎零代价，却能覆盖侧边竖排等易被位置先验挤掉的真字幕。
+        top_score = group_score(selected)
+        strong = [g for g in groups if group_score(g) >= top_score * 0.6]
+        if len(strong) > 1:
+            union_boxes = [b for g in strong for b in g["boxes"]]
+            selected = {
+                "boxes": union_boxes,
+                "frames": {b["frame"] for b in union_boxes},
+                "center_sum": 0.0,
+                "count": len(union_boxes),
+            }
     raw_area = _area_from_boxes(selected["boxes"])
     if raw_area:
         buffer_y = int(options.get("raw_area_buffer_y", 10))
@@ -3798,6 +3820,15 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                     # 字幕左右边缘的残字裁在区域外（宽区域在 STTN_DET 下几乎
                     # 零代价，mask 仍由检测框驱动；仅影响空检测整区兜底范围）。
                     detect_options["padding_x"] = max(int(detect_options.get("padding_x") or 0), 96)
+                    # 准确率优先（擦除前的区域识别，慢几秒值得）：
+                    # 全帧扫描（非 HPI 快速路径默认只扫 50%-90% 高度带，
+                    # 竖排演职员表这类带外文本会被直接切掉）、多区域并集、
+                    # 采样加密到 48 帧。调用方显式传入的值优先。
+                    if not detect_options.get("_crop_to_band_explicit"):
+                        detect_options["crop_to_band"] = False
+                    detect_options["multi_group_union"] = True
+                    if not detect_options.get("_sample_count_explicit"):
+                        detect_options["sample_count"] = 48
                     with PROCESS_LOCK:
                         area_detect = _run_subtitle_area_detection(source_path, None, detect_options)
                     if area_detect.get("sub_area"):
