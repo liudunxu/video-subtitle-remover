@@ -114,7 +114,7 @@ curl -X POST http://127.0.0.1:6006/api/remove-subtitle \
   -F 'payload={"sub_area": [900, 1050, 100, 1820], "options": {"mode": "sttn"}}'
 ```
 
-`sub_area` 为 `[ymin, ymax, xmin, xmax]`（像素，可选；不传则全帧处理）。响应：
+`sub_area` 为 `[ymin, ymax, xmin, xmax]`（像素，可选）。不传时默认先自动识别字幕区域（`auto_detect_area`，见下表），识别失败或为空则退回全帧处理；响应里的 `area` 与 `auto_detected_area` 会标明实际使用的区域与来源。响应：
 
 ```json
 {
@@ -147,6 +147,7 @@ curl -X POST http://127.0.0.1:6006/api/remove-subtitle \
 | `bbox_min_inside_ratio` | 1.0 | OCR 检测框与字幕区域的交集面积占比下限；1.0 = 完全落在区域内才保留，调小（如 0.6）可保留压在区域边缘的检测框 |
 | `ocr_sample_step` | 0 | OCR 采样间隔；0 = 按帧率自适应，1 = 逐帧检测（最慢但最不易漏），最大 30 |
 | `empty_detection_full_inpaint` | true | OCR 检测不到字幕时：true = 整区每帧 STTN_AUTO 重绘；false = 返回 422。响应里的 `fallback_triggered` 标记是否触发了整区重绘兜底 |
+| `auto_detect_area` | true | 未传 `sub_area` 时先自动识别字幕区域再擦除（识别失败/为空退回全帧；传了 `sub_area` 或设为 `false` 则不触发） |
 | `post_lama_refine` | true | STTN 后接一遍 text-trace 修边，清除 STTN 残影（diff-gated，只处理 STTN 改动过的像素；显式传 `false` 关闭；`post_refine_*` 系列参数可调） |
 | `auto_residual_cleanup` | false | 尾部残字扫描 + cv2.inpaint 兜底（`residual_*` 系列参数可调） |
 | `post_verify_blur` | false | 尾部 OCR 复检，仍有残字的检测框做高斯模糊（`post_verify_blur_*` 系列参数可调） |

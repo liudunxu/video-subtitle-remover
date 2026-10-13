@@ -283,6 +283,7 @@ def _normalize_options(payload):
         "bbox_min_inside_ratio",
         "ocr_sample_step",
         "empty_detection_full_inpaint",
+        "auto_detect_area",
         "blur_kernel",
         "blur_passes",
         "blur_pad",
@@ -381,6 +382,10 @@ def _normalize_options(payload):
         # 检测不到字幕时的兜底：True = 整区每帧 STTN_AUTO 重绘（旧行为），
         # False = 直接报错，让调用方知道检测为空而不是默默整帧重绘。
         "empty_detection_full_inpaint": _to_bool(merged.get("empty_detection_full_inpaint", True)),
+        # 未传 sub_area 时先跑一遍字幕区域自动检测（复用 /api/detect-subtitle-area
+        # 的逻辑），把擦除范围收窄到真实字幕带：减少全帧误检/误擦，尾部 pass
+        # 也只在字幕带内工作。检测不到则退回全帧处理（旧行为）。
+        "auto_detect_area": _to_bool(merged.get("auto_detect_area", True)),
         # blur_cover 模式的高斯模糊参数（此前不在白名单内，API 传不进来）。
         "blur_kernel": _bounded_int(merged.get("blur_kernel"), "blur_kernel", 51, 3, 199),
         "blur_passes": _bounded_int(merged.get("blur_passes"), "blur_passes", 2, 1, 6),
@@ -3550,6 +3555,7 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                         "multiline_auto_strategy": True,
                         "empty_detection_fallback": True,
                         "post_lama_refine_default": True,
+                        "auto_detect_area_default": True,
                         "job_dir_ttl_seconds": JOB_DIR_TTL_SECONDS,
                         "custom_job_id_pattern": "[A-Za-z0-9_-]{1,64}",
                     },
@@ -3731,6 +3737,31 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
             if source_path is None:
                 source_path = _stage_video(video_url.strip(), job_dir, filename_hint)
 
+            # 未传 sub_area 时先自动识别字幕区域（默认开启）：
+            # 复用 /api/detect-subtitle-area 的检测逻辑把擦除范围收窄到真实
+            # 字幕带；识别失败或为空时退回全帧处理。
+            auto_detected_area = False
+            if area is None and options.get("auto_detect_area", True):
+                try:
+                    detect_options = _normalize_detect_options(payload)
+                    with PROCESS_LOCK:
+                        area_detect = _run_subtitle_area_detection(source_path, None, detect_options)
+                    if area_detect.get("sub_area"):
+                        area = tuple(int(v) for v in area_detect["sub_area"])
+                        auto_detected_area = True
+                        print(
+                            f"INFO: job={job_id} auto-detected subtitle area {area} "
+                            f"(confidence={area_detect.get('confidence')}, "
+                            f"frames_sampled={len(area_detect.get('frames_sampled') or [])})"
+                        )
+                    else:
+                        print(f"INFO: job={job_id} auto area detection found nothing; proceeding with full frame")
+                except Exception as detect_exc:
+                    print(
+                        f"WARN: job={job_id} auto area detection failed "
+                        f"({type(detect_exc).__name__}: {detect_exc}); proceeding with full frame"
+                    )
+
             def _job_progress(phase, percent, stage=""):
                 _set_job_progress(job_id, phase, percent, stage)
                 # Also surface progress in the api-server stdout so operators
@@ -3791,6 +3822,8 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                     "api_schema_version": API_SCHEMA_VERSION,
                     "filename": output_path.name,
                     "area": list(area) if area is not None else None,
+                    # 本次 sub_area 是否为自动识别（True）还是调用方传入/全帧（False）
+                    "auto_detected_area": auto_detected_area,
                     "refine_area": list(refine_area) if refine_area is not None else None,
                     "options": options,
                     # OCR 检测为空时是否触发了整区 STTN_AUTO 重绘兜底

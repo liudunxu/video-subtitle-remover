@@ -36,7 +36,7 @@ When the user says "开启vast.ai实例" or equivalent:
 
 - Query current Vast.ai instances first.
 - If a matching `video-subtitle-remover-api-*` instance is already running, reuse it and report its public URL.
-- Otherwise search verified rentable on-demand offers for one RTX 3090 with at least 24GB VRAM, at least one direct port, and enough disk space.
+- Otherwise search verified rentable on-demand offers for a **single-GPU** machine (`num_gpus=1` — never rent multi-GPU machines) with at least 12000 MB VRAM, at least one direct port, and enough disk space. GPU model preference order (aligned with OmniVoice's try-next-model-down pattern; fall back to the next model only when the current one has no offers): **RTX 3090 Ti → RTX 3090 → RTX 4090**.
 - Prefer Asia-region offers that can pull from Docker Hub reliably; if no suitable Asia offer is available, fall back to Americas-region offers with good reliability and network.
 - Avoid machines that recently failed Docker Hub pulls.
 - Create exactly one instance using label `video-subtitle-remover-api-mvp`.

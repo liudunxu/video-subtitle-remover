@@ -114,7 +114,7 @@ curl -X POST http://127.0.0.1:6006/api/remove-subtitle \
   -F 'payload={"sub_area": [900, 1050, 100, 1820], "options": {"mode": "sttn"}}'
 ```
 
-`sub_area` is `[ymin, ymax, xmin, xmax]` in pixels (optional; the whole frame is processed when omitted). Response:
+`sub_area` is `[ymin, ymax, xmin, xmax]` in pixels (optional). When omitted, the server first auto-detects the subtitle area (`auto_detect_area`, see below) and falls back to full-frame processing if detection fails or finds nothing; the response `area` and `auto_detected_area` fields report what was actually used. Response:
 
 ```json
 {
@@ -147,6 +147,7 @@ Output guarantees: the result duration matches the source video (missing tail fr
 | `bbox_min_inside_ratio` | 1.0 | Minimum intersection-over-box ratio for keeping an OCR box inside the subtitle area; 1.0 = box must be fully inside (old behavior), lower values (e.g. 0.6) keep boxes straddling the area edge |
 | `ocr_sample_step` | 0 | OCR sampling interval; 0 = fps-adaptive, 1 = every frame (slowest, fewest misses), max 30 |
 | `empty_detection_full_inpaint` | true | When OCR finds no subtitles: true = whole-area STTN_AUTO repaint; false = HTTP 422. The response field `fallback_triggered` reports whether the fallback fired |
+| `auto_detect_area` | true | When `sub_area` is omitted, auto-detect the subtitle area before removal (falls back to full-frame on failure/empty; ignored when `sub_area` is passed or this is `false`) |
 | `post_lama_refine` | true | Extra text-trace refinement pass after STTN that removes STTN ghost residue (diff-gated — only touches pixels STTN actually changed; pass `false` to disable; tunable via `post_refine_*`) |
 | `auto_residual_cleanup` | false | Tail pass that scans for residual text pixels and inpaints them (tunable via `residual_*`) |
 | `post_verify_blur` | false | Tail pass that re-runs OCR on the output and Gaussian-blurs remaining text boxes (tunable via `post_verify_blur_*`) |

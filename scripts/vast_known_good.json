@@ -10,6 +10,28 @@
       "image": "liudunxu/video-subtitle-remover@sha256:c2ad2d3c80c64d878f031ba9985c01c0ba7bf98cbf61e286898aab40f07c59bc",
       "started_at": "2026-07-06T15:21:02.240690+00:00",
       "notes": "GPU runtime check passed"
+    },
+    {
+      "instance_id": 55713198,
+      "machine_id": 3779,
+      "gpu_name": "RTX 3090",
+      "cpu_name": "AMD EPYC 7282 16-Core Processor",
+      "country_code": null,
+      "region": "asia",
+      "image": "liudunxu/video-subtitle-remover@sha256:e71ee0caca7fdbdc29a8377e8e5d0ada92a67f4c2ac76a72d796ab3e6a9f09b2",
+      "started_at": "2026-10-13T09:00:18.865945+00:00",
+      "notes": "GPU runtime check passed"
+    },
+    {
+      "instance_id": 55715039,
+      "machine_id": 12840,
+      "gpu_name": "RTX 3090 Ti",
+      "cpu_name": "AMD EPYC 7D12 32-Core Processor",
+      "country_code": null,
+      "region": "asia",
+      "image": "liudunxu/video-subtitle-remover@sha256:e71ee0caca7fdbdc29a8377e8e5d0ada92a67f4c2ac76a72d796ab3e6a9f09b2",
+      "started_at": "2026-10-13T09:16:17.231824+00:00",
+      "notes": "GPU runtime check passed"
     }
   ]
 }

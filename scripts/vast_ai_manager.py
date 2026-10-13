@@ -24,6 +24,9 @@ DEFAULT_LABEL = "video-subtitle-remover-api-mvp"
 DEFAULT_PORT = 6006
 DEFAULT_DISK = 70
 DEFAULT_GPU = "RTX 3090"
+# GPU 型号偏好顺序（对齐 OmniVoice 的逐级降级模式）：未显式 --gpu 时
+# 按此顺序搜索，当前型号没有可用单卡 offer 才降级到下一个。
+GPU_PREFERENCE = ["RTX 3090 Ti", "RTX 3090", "RTX 4090"]
 DEFAULT_MIN_VRAM_MB = 12000
 KNOWN_GOOD_FILE = os.path.join(os.path.dirname(__file__), "vast_known_good.json")
 
@@ -53,12 +56,12 @@ _PREFERRED_CPU_SUBSTRINGS = [
     "Core i9-",
 ]
 
-# Region priority for video-subtitle-remover-api deployments.
-# East Asia / Southeast Asia / West Asia are preferred for latency; Americas are fallback.
-_ASIA_COUNTRY_CODES = {
-    "CN", "HK", "TW", "SG", "JP", "KR", "VN", "TH", "MY", "ID", "PH", "IN",
-    "TR", "AE", "SA", "IL", "QA", "KW", "BH", "OM",
-}
+# Region priority for video-subtitle-remover-api deployments (aligned with
+# OmniVoice): Southeast Asia first, then East Asia (KR/TW/JP/HK), then other
+# Asia, then Americas. A previous Oman (West Asia) pick downloaded at ~6KB/s.
+_SOUTHEAST_ASIA_COUNTRY_CODES = {"SG", "TH", "VN", "MY", "ID", "PH", "KH", "MM", "LA", "BN", "TL"}
+_EAST_ASIA_COUNTRY_CODES = {"KR", "TW", "JP", "HK", "MO"}
+_OTHER_ASIA_COUNTRY_CODES = {"CN", "IN", "TR", "AE", "SA", "IL", "QA", "KW", "BH", "OM"}
 _AMERICAS_COUNTRY_CODES = {"US", "CA", "MX", "BR", "AR", "CL", "CO", "PE"}
 
 REQUIRED_ENV = {
@@ -139,7 +142,9 @@ def search_offers(
 ) -> List[Dict[str, Any]]:
     payload = {
         "gpu_name": {"in": [gpu_name]},
-        "num_gpus": {"gte": 1},
+        # 只选单卡机：本服务只用一张 GPU，多卡整机属于白花钱
+        # （此前是 {"gte": 1}，曾因此选中一台 4x3090）。
+        "num_gpus": {"eq": 1},
         "gpu_ram": {"gte": min_vram_mb},
         "verified": {"eq": True},
         "rentable": {"eq": True},
@@ -280,11 +285,19 @@ def _build_known_good_entry(instance_id: int, offer: Dict[str, Any], image: str)
 
 
 def _offer_region(offer: Dict[str, Any]) -> str:
-    geo = (offer.get("geolocation") or "").lower()
     country = (offer.get("country_code") or "").upper()
-    if any(c.lower() in geo for c in _ASIA_COUNTRY_CODES) or country in _ASIA_COUNTRY_CODES:
-        return "asia"
-    if any(c.lower() in geo for c in _AMERICAS_COUNTRY_CODES) or country in _AMERICAS_COUNTRY_CODES:
+    if not country:
+        # vast 的 geolocation 形如 "City, CC"，取逗号后的国家码精确匹配，
+        # 避免子串误伤（如 "in" 命中 "Singapore"）。
+        geo = (offer.get("geolocation") or "")
+        country = geo.rsplit(",", 1)[-1].strip().upper() if geo else ""
+    if country in _SOUTHEAST_ASIA_COUNTRY_CODES:
+        return "southeast_asia"
+    if country in _EAST_ASIA_COUNTRY_CODES:
+        return "east_asia"
+    if country in _OTHER_ASIA_COUNTRY_CODES:
+        return "other_asia"
+    if country in _AMERICAS_COUNTRY_CODES:
         return "americas"
     return "other"
 
@@ -300,14 +313,23 @@ def _cpu_score(offer: Dict[str, Any]) -> int:
 
 
 def _score_offer(offer: Dict[str, Any], known_good_machine_ids: Optional[Set[int]] = None) -> tuple:
-    # Prefer known-good machines, then Asia, then known-good CPUs, then reliability, then lower price.
+    # Prefer known-good machines, then SEA > East Asia > other Asia > Americas,
+    # then known-good CPUs, then reliability, then lower price; fewer CPU cores
+    # as the final tie-break (同等条件下少核机器，少占资源碎片).
     machine_id = offer.get("machine_id")
     is_known_good = bool(known_good_machine_ids and machine_id in known_good_machine_ids)
-    region_rank = {"asia": 0, "americas": 1, "other": 2}.get(_offer_region(offer), 2)
+    region_rank = {
+        "southeast_asia": 0,
+        "east_asia": 1,
+        "other_asia": 2,
+        "americas": 3,
+        "other": 4,
+    }.get(_offer_region(offer), 4)
     cpu_rank = _cpu_score(offer)
     reliability = offer.get("reliability", 0) or 0
     dph = offer.get("dph_total", float("inf")) or float("inf")
-    return (0 if is_known_good else 1, region_rank, cpu_rank, -reliability, dph)
+    cpu_cores = offer.get("cpu_cores_effective") or offer.get("cpu_cores") or 0
+    return (0 if is_known_good else 1, region_rank, cpu_rank, -reliability, dph, cpu_cores)
 
 
 def cmd_status(key: str, args: argparse.Namespace) -> int:
@@ -393,10 +415,17 @@ def cmd_start(key: str, args: argparse.Namespace) -> int:
             f"preferring machine_ids: {sorted(known_good_machine_ids)}"
         )
 
-    print(
-        f"Searching on-demand offers for {args.gpu} with >= {args.min_vram_mb} MB VRAM ..."
-    )
-    offers = search_offers(key, gpu_name=args.gpu, min_vram_mb=args.min_vram_mb)
+    # GPU 型号偏好（未显式 --gpu 时按 GPU_PREFERENCE 顺序逐级降级）
+    gpu_candidates = [args.gpu] if args.gpu else GPU_PREFERENCE
+    offers = []
+    for gpu_name in gpu_candidates:
+        print(
+            f"Searching on-demand single-GPU offers for {gpu_name} with >= {args.min_vram_mb} MB VRAM ..."
+        )
+        offers = search_offers(key, gpu_name=gpu_name, min_vram_mb=args.min_vram_mb)
+        if offers:
+            break
+        print(f"  No {gpu_name} offers; falling back to next GPU model.")
     if not offers:
         _die("No suitable offers found.")
 
@@ -563,7 +592,7 @@ def main(argv: List[str] = None) -> int:
     p_start.add_argument("--image", default="", help="Docker image (defaults to latest digest)")
     p_start.add_argument("--label", default=DEFAULT_LABEL, help="Instance label")
     p_start.add_argument("--disk", type=int, default=DEFAULT_DISK, help="Disk size in GB")
-    p_start.add_argument("--gpu", default=DEFAULT_GPU, help="GPU name filter")
+    p_start.add_argument("--gpu", default="", help="GPU name filter (default: preference order 3090 Ti -> 3090 -> 4090)")
     p_start.add_argument("--min-vram-mb", type=int, default=DEFAULT_MIN_VRAM_MB, help="Minimum VRAM in MB")
     p_start.add_argument("--timeout", type=int, default=600, help="Seconds to wait for running")
     p_start.add_argument("--health-timeout", type=int, default=300, help="Seconds to wait for /health")
