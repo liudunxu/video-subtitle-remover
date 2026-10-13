@@ -176,7 +176,7 @@ curl -X POST http://127.0.0.1:6006/api/detect-subtitle-area \
   -d '{"video_url": "https://example.com/input.mp4", "detect_options": {"sample_count": 72}}'
 ```
 
-响应包含 `area` / `sub_area`（padded）、`raw_area` / `raw_sub_area`（未 padding）、`confidence`、`boxes`、`video_size`、`fps` 等。常用检测参数：`sample_count`（采样帧数，默认 72）、`ocr_preset`、`bbox_min_inside_ratio`、`crop_to_band`、`early_stop_hit_frames`。
+响应包含 `area` / `sub_area`（padded）、`raw_area` / `raw_sub_area`（未 padding）、`confidence`、`boxes`、`video_size`、`fps` 等。常用检测参数：`sample_count`（采样帧数，默认 72）、`ocr_preset`、`bbox_min_inside_ratio`、`crop_to_band`、`early_stop_hit_frames`、`multi_group_union`（true = 不做带宽过滤、≥最高分 60% 的强组取并集，适合底部横排字幕与侧边竖排文字并存的多区域文本）。
 
 ## 部署
 

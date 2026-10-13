@@ -176,7 +176,7 @@ curl -X POST http://127.0.0.1:6006/api/detect-subtitle-area \
   -d '{"video_url": "https://example.com/input.mp4", "detect_options": {"sample_count": 72}}'
 ```
 
-The response contains `area` / `sub_area` (padded), `raw_area` / `raw_sub_area` (unpadded), `confidence`, `boxes`, `video_size`, `fps`, etc. Common detect options: `sample_count` (default 72), `ocr_preset`, `bbox_min_inside_ratio`, `crop_to_band`, `early_stop_hit_frames`.
+The response contains `area` / `sub_area` (padded), `raw_area` / `raw_sub_area` (unpadded), `confidence`, `boxes`, `video_size`, `fps`, etc. Common detect options: `sample_count` (default 72), `ocr_preset`, `bbox_min_inside_ratio`, `crop_to_band`, `early_stop_hit_frames`, `multi_group_union` (true = no band filtering, groups scoring ≥ 60% of the top group get unioned — for videos with multiple text regions such as bottom subtitles plus side credits).
 
 ## Deployment
 
