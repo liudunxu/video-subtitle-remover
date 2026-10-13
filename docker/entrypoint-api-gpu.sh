@@ -77,4 +77,16 @@ print("GPU runtime check passed")
 PY
 fi
 
-exec python /app/api.py --host "${HOST}" --port "${PORT}"
+# OmniVoice 同款运行模式：启动时把最新代码（默认 main）浅同步到
+# /workspace/video-subtitle-remover 并从这里运行——代码更新只需
+# git push + 实例重启，无需重建镜像。同步失败（如 GitHub 不可达）
+# 回退到镜像内烘焙的 /app 代码，保证服务仍能启动。
+source /usr/local/lib/vsr-runtime-code.sh
+
+APP_PATH="$(resolve_runtime_app_path || true)"
+if [ -z "${APP_PATH}" ] || [ ! -f "${APP_PATH}/api.py" ]; then
+  echo "[entrypoint] runtime code sync failed; falling back to baked /app" >&2
+  APP_PATH="/app"
+fi
+
+exec python "${APP_PATH}/api.py" --host "${HOST}" --port "${PORT}"

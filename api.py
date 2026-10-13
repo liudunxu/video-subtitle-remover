@@ -3519,6 +3519,40 @@ def _service_version():
         return "unknown"
 
 
+_RUNTIME_VERSION: dict = {}
+
+
+def _runtime_version():
+    """OmniVoice 风格：报告运行中代码的来源与 commit。
+
+    镜像烘焙代码（source=image，commit 取构建参数 IMAGE_COMMIT_ID）与启动时
+    entrypoint git 同步的代码（source=git，commit 取 checkout 的 HEAD）区分
+    报告，调用方可据此确认实例实际在跑哪份代码。进程内只算一次。
+    """
+    if _RUNTIME_VERSION:
+        return _RUNTIME_VERSION
+    image_commit = os.environ.get("IMAGE_COMMIT_ID", "").strip()
+    image_commit = image_commit if re.fullmatch(r"[0-9a-f]{40,64}", image_commit) else None
+    version = {
+        "runtime_commit_id": None,
+        "image_commit_id": image_commit,
+        "runtime_source": "image" if image_commit else "unknown",
+    }
+    root = Path(__file__).resolve().parent
+    if (root / ".git").exists():
+        try:
+            commit = subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
+                text=True, stderr=subprocess.DEVNULL, timeout=5,
+            ).strip()
+            if re.fullmatch(r"[0-9a-f]{40,64}", commit):
+                version.update(runtime_commit_id=commit, runtime_source="git")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    _RUNTIME_VERSION.update(version)
+    return _RUNTIME_VERSION
+
+
 class RemoverAPIHandler(BaseHTTPRequestHandler):
     server_version = "VideoSubtitleRemoverAPI/1.1"
 
@@ -3537,6 +3571,7 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                     "ready": True,
                     "api_schema_version": API_SCHEMA_VERSION,
                     "version": _service_version(),
+                    **_runtime_version(),
                 },
             )
             return
@@ -3577,6 +3612,7 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                     "service": "video_subtitle_remover_api",
                     "version": _service_version(),
                     "api_schema_version": API_SCHEMA_VERSION,
+                    **_runtime_version(),
                     "uptime_seconds": round(time.time() - _SERVER_STARTED_AT, 1),
                     "work_dir": str(WORK_DIR),
                     "disk_free_gb": disk_free_gb,

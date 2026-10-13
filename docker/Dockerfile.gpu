@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     ffmpeg \
+    git \
     libgl1 \
     libglib2.0-0 \
     libgomp1 \
@@ -52,8 +53,10 @@ WORKDIR /app
 COPY requirements.txt pyproject.toml README.md api.py /app/
 COPY backend/ /app/backend/
 COPY docker/entrypoint-api-gpu.sh /usr/local/bin/vsr-api-gpu-entrypoint
+COPY docker/runtime_code.sh /usr/local/lib/vsr-runtime-code.sh
 
 RUN chmod +x /usr/local/bin/vsr-api-gpu-entrypoint \
+    && chmod +x /usr/local/lib/vsr-runtime-code.sh \
     && chmod +x /app/backend/ffmpeg/linux_x64/ffmpeg
 
 # PaddleOCR 3.4.0 uses PaddleX internally, so PaddleX is pinned near that stack
@@ -108,6 +111,11 @@ print(f"  paddlex={metadata.version('paddlex')}")
 PY
 
 EXPOSE 6006
+
+# 记录镜像烘焙时的代码版本（运行时代码版本见 /health 的 runtime_commit_id，
+# 启动时 entrypoint 会 git 同步最新 main 到 /workspace 运行）。
+ARG IMAGE_COMMIT_ID=""
+ENV IMAGE_COMMIT_ID=${IMAGE_COMMIT_ID}
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('PORT', '6006'), timeout=3).read()"
