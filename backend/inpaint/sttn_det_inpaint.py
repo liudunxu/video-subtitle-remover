@@ -70,6 +70,11 @@ class STTNDetInpaint:
         # 不再用固定比例（竖屏 1080x1920 旧逻辑 crop 高达 1066px，硬压到
         # 432x240 再放大贴回形变/降质严重）；空 mask 时回退旧比例逻辑。
         split_h = get_band_driven_split_h(mask, H_ori, W_ori, self.band_margin)
+        # crop 高度不得低于模型输入高度：否则低分辨率视频（如 480p、字幕带
+        # 仅几十像素高）的 crop 会被**纵向放大**到 240（如 150→240 放大 1.6
+        # 倍），模型在模糊放大图上重绘，输出整片发软——这正是低清素材上
+        # STTN 效果远差于 1080p 的原因（1080p 按比例 split 天然 ≥240）。
+        split_h = min(max(split_h, self.model_input_height), H_ori)
         inpaint_area = get_inpaint_area_by_mask(W_ori, H_ori, split_h, mask)
         # 初始化帧存储变量
         # 高分辨率帧存储列表（浅拷贝 + 逐帧 copy，避免 deepcopy 开销）
