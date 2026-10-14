@@ -109,9 +109,9 @@ options:
 | `detect_options` | object，可选 | 自动识别 area 的采样、`padding_x` / `padding_y` 等参数；与 `options` 同级 |
 | `progress_job_id` | string，可选 | 仅 JSON 请求可用此字段指定任务 ID；两种输入方式统一推荐使用 `X-Job-Id` 请求头 |
 
-#### 实测推荐参数（2026-10-14 起为 API 默认值）
+#### 实测推荐参数（2026-10-14，1080p 竖屏质量/性能折中）
 
-以减轻毛玻璃、涂抹和误伤背景为目标，以下组合在本次样片中表现较好。所有字段均可省略而使用新默认值；显式传参便于固定客户端行为。将以下内容保存为 `payload.json`，可直接用于后面的 multipart 示例：
+以减轻毛玻璃、涂抹和误伤背景为目标，1080p 竖屏优先试 **864×240 模型输入、margin 80、mask X/Y=12/16、关闭后处理**。同一 6 秒样片上，比 432×240 的针织纵向纹理略好，耗时约增加 12%，但仍有重建痕迹，并非所有视频的通用最优。将以下内容保存为 `payload.json`，可直接用于后面的调用示例：
 
 ```json
 {
@@ -122,6 +122,8 @@ options:
     "subtitle_area_deviation_pixel": 12,
     "subtitle_area_deviation_pixel_y": 16,
     "sttn_band_margin": 80,
+    "sttn_input_width": 864,
+    "sttn_input_height": 240,
     "post_lama_refine": false,
     "auto_residual_cleanup": false,
     "post_verify_blur": false,
@@ -130,10 +132,13 @@ options:
 }
 ```
 
+**推荐请求不等于全局默认**：除模型输入尺寸外，上述字段均为当前 API 默认值。尺寸不传（或传 0）仍使用环境变量，未配置时为 **432×240**；本轮不将单个竖屏样片的结论推广为全局默认。速度优先或其他素材可先用 432×240，与此推荐对照。
+
+- 先增加模型输入宽度，不盲目增加 margin：864×480 在本次样片耗时约增加 78%，视觉收益有限；margin 160 也没有明确优势。高分辨率并不意味着 area、mask 和上下文余量都应同比扩大。
 - 遮罩外扩由旧默认的 X/Y 各 44 px 收紧至 12/16 px，减少需要重新生成的背景面积；若有字边残留，再小幅增加相应方向的值。
 - `post_lama_refine=false` 关闭 STTN 后的修边，避免把背景纹理进一步抹平；`auto_residual_cleanup` / `post_verify_blur` 也保持关闭。仅在确认有残字时单独尝试开启。
 - `empty_detection_full_inpaint=false` 表示 STTN 的擦除 OCR 结果为空时返回 **HTTP 422**，不自动整区重绘。自动 area 识别失败仍会进入全帧 OCR；这两个阶段不要混淆。
-- ≤480p 素材可将 `mode` 改成 `lama`，其他字段保持不变（STTN 专属字段此时不生效）。本次静帧纹理更自然，但耗时约翻倍，仍需检查播放时是否闪烁。
+- ≤480p 素材可将 `mode` 改成 `lama`，其他字段保持不变（STTN 专属字段此时不生效）。此前低清样片静帧纹理更自然，但耗时约翻倍；本次 1080p 竖屏反而出现矩形接缝和纹理断裂，不推荐直接切换，且仍需检查播放时是否闪烁。
 - `ocr_preset=multiline` 在没有显式关闭时，仍可对三行及以上字幕自动启用修边/残字清理；希望保持清晰度优先时保留上面的显式 `false`。
 
 需要恢复旧版默认行为的客户端，可显式设置 `subtitle_area_deviation_pixel=44`、`subtitle_area_deviation_pixel_y=44`、`sttn_band_margin=0`、`post_lama_refine=true`、`empty_detection_full_inpaint=true`；其中 margin 为 0 表示沿用环境变量，未设置环境变量时为 40 px。
@@ -141,11 +146,13 @@ options:
 #### 调用示例
 
 ```shell
-# JSON + 远程视频 URL：使用新默认参数和自动 area
+# JSON + 远程视频 URL：复用上面的竖屏推荐参数（需要 jq）
+jq --arg video_url 'https://example.com/input.mp4' \
+  '. + {video_url: $video_url}' payload.json > request.json
 curl --fail-with-body -sS http://127.0.0.1:6006/api/remove-subtitle \
   -H 'Content-Type: application/json' \
   -H 'X-Job-Id: my-job-0001' \
-  -d '{"video_url": "https://example.com/input.mp4"}' \
+  --data-binary @request.json \
   -o result.json
 
 # multipart 本地上传：payload.json 使用上面的推荐组合
@@ -155,7 +162,7 @@ curl --fail-with-body -sS http://127.0.0.1:6006/api/remove-subtitle \
   -F 'payload=<payload.json' \
   -o result.json
 
-# 已知字幕位置：手动 area（此坐标示例适用于 1920×1080 视频）
+# 横屏使用服务默认参数 + 手动 area（此坐标示例适用于 1920×1080 视频）
 curl --fail-with-body -sS http://127.0.0.1:6006/api/remove-subtitle \
   -H 'Content-Type: application/json' \
   -H 'X-Job-Id: my-job-0003' \
@@ -184,6 +191,8 @@ curl --fail-with-body -sS http://127.0.0.1:6006/api/remove-subtitle \
     "subtitle_area_deviation_pixel": 12,
     "subtitle_area_deviation_pixel_y": 16,
     "sttn_band_margin": 80,
+    "sttn_input_width": 864,
+    "sttn_input_height": 240,
     "post_lama_refine": false,
     "empty_detection_full_inpaint": false
   },
@@ -215,7 +224,7 @@ curl --fail --location "$(jq -er '.download_url' result.json)" -o output.mp4
 | `subtitle_area_deviation_pixel_y` | 16 | mask 的 Y 方向外扩像素；残留上下字边时可小幅调大 |
 | `sttn_skip_detection` | false | 跳过 OCR 检测，整区 STTN_AUTO 重绘（最快，可能误伤无字幕帧） |
 | `sttn_neighbor_stride` / `sttn_reference_length` / `sttn_max_load_num` | 5 / 20 / 120 | STTN 参考帧步长 / 数量 / 单次最大加载帧数（调大效果更好、更慢、更耗显存） |
-| `sttn_input_width` / `sttn_input_height` | 0（用 env/默认 432×240） | STTN_DET 模型输入尺寸；864×480 可减少缩放损失，但更慢更耗显存且不保证观感改善，本次对比未测试；须为 432/240 的整数倍且 ≤864×480，非法值回退默认 |
+| `sttn_input_width` / `sttn_input_height` | 0（用 env/默认 432×240） | STTN_DET 模型输入尺寸；本次 1080p 竖屏推荐显式传 864×240（纹理略好、耗时约 +12%）；864×480 收益有限、耗时约 +78%。须为 432/240 的整数倍且 ≤864×480，非法值回退默认 |
 | `sttn_band_margin` | 80 | STTN_DET 裁剪带上下文余量 px；增大可提供更多周边纹理，但不保证更清晰；传 0 才沿用 `VSR_STTN_BAND_MARGIN`（未设置时 40） |
 | `ocr_preset` | `default` | 检测灵敏度：`default` / `fast` / `turbo` / `fuzzy` / `ultra` / `multiline` / `aggressive`。`multiline` 检测到 3 行及以上字幕时自动对多行帧启用 STTN 修边 + 残字兜底 |
 | `bbox_min_inside_ratio` | 1.0 | OCR 检测框与字幕区域的交集面积占比下限；1.0 = 完全落在区域内才保留，调小（如 0.6）可保留压在区域边缘的检测框 |
@@ -263,7 +272,7 @@ curl -X POST http://127.0.0.1:6006/api/detect-subtitle-area \
 |------|----------|----------|
 | 检测区域外扩 | `detect_options.padding_x` / `padding_y` | 防止字幕检测框被 area 边缘截掉；不直接提高重建清晰度 |
 | 擦除遮罩外扩 | `options.subtitle_area_deviation_pixel` / `_y` | 决定检测框周围多少原始像素需要重新生成；过大容易涂抹背景 |
-| 模型周边上下文 | `options.sttn_band_margin` | 控制送入 STTN 的裁剪带余量；本次推荐 80 px |
+| 模型周边上下文 | `options.sttn_band_margin` | 控制送入 STTN 的裁剪带余量；本次推荐 80 px，更多上下文挤入固定输入也可能加剧缩放损失 |
 
 独立检测接口的 X/Y padding 默认均为 16 px；擦除接口自动识别 area 时，会将 X padding 至少设为 96 px。Y 方向还已有 `raw_area_buffer_y`（默认 60 px）及最终上下各 50 px 的缓冲，并会裁到画面边界，因此通常无需再盲目扩大 Y。
 
@@ -279,18 +288,30 @@ curl -X POST http://127.0.0.1:6006/api/detect-subtitle-area \
 
 #### Vast.ai 实测结果与适用范围
 
-2026-10-13 在现有 RTX 3090 Ti 上，以旧版 `de4b8f2` 服务运行 10 组串行对比：1080×1920/30fps 和 852×480/25fps 两段各 6 秒样片。下表“推荐组合”即上方参数，也是 2026-10-14 起的新 API 默认值；时间为单次 API 返回的处理耗时，不是稳定吞吐基准。
+**第一轮：基础默认值。** 2026-10-13 在 RTX 3090 Ti 上，以旧版 `de4b8f2` 服务运行 10 组串行对比：1080×1920/30fps 和 852×480/25fps 两段各 6 秒样片。下表“基础组合”为 12/16、margin 80、关修边，STTN 输入均为 **432×240**，对应 2026-10-14 起的新 API 默认值；时间为单次 API 返回的处理耗时，不是稳定吞吐基准。
 
 | 参数组 | 1080p 竖屏 | 480p 横屏 | 观察 |
 |--------|------------|-----------|------|
 | 旧默认（44/44、margin 40、开修边） | 94.0s | 36.9s | 低清样片出现明显色块和大面积涂抹 |
-| 推荐组合（12/16、margin 80、关修边） | 74.2s | 31.4s | 低清改善明显；1080p 针织纹理仍有模糊 |
-| 推荐组合 + area padding 160/64 | 86.0s | 34.0s | 两段输出分别与未扩大 area 的推荐组合 SHA-256 完全相同 |
-| 推荐组合 + margin 120 | 84.2s | 35.3s | 没有显示出足以替换 margin 80 的优势 |
+| 基础组合（12/16、margin 80、关修边） | 74.2s | 31.4s | 低清改善明显；1080p 针织纹理仍有模糊 |
+| 基础组合 + area padding 160/64 | 86.0s | 34.0s | 两段输出分别与未扩大 area 的基础组合 SHA-256 完全相同 |
+| 基础组合 + margin 120 | 84.2s | 35.3s | 没有显示出足以替换 margin 80 的优势 |
 | 旧默认仅关闭修边 | 未测 | 31.4s | 色块减轻，但大面积发糊仍在 |
-| 推荐组合改用 LaMa | 未测 | 61.6s | 静帧纹理更自然，需检查时序闪烁 |
+| 基础组合改用 LaMa | 未测 | 61.6s | 静帧纹理更自然，需检查时序闪烁 |
 
-10 组均未触发整区兜底，分辨率、帧数和音轨存在性检查通过，与输入容器时长偏差不超过 38ms。结论仅适用于本次样片：未验证长视频、864×480 模型输入及 LaMa 时序闪烁，收紧遮罩可能增加字边残留；这些参数不能保证彻底消除复杂纹理上的毛玻璃感。
+10 组均未触发整区兜底，分辨率、帧数和音轨存在性检查通过，与输入容器时长偏差不超过 38ms。此轮未测试更大模型输入，后续竖屏对比见下表。
+
+**第二轮：竖屏输入尺寸与 margin。** 2026-10-14 在 RTX 3090、`e0a2f36` 服务上，使用同一个 1080×1920/30fps、6 秒/180 帧样片；保持 mask 12/16、关闭后处理，自动 area 均为 `[1188,1653,241,835]`。GPU 与第一轮不同，不直接跨表比较速度。
+
+| 配置 | 耗时 | 观察 |
+|------|------|------|
+| 432×240、margin 80（当前默认） | 63.2s | 字幕区仍有明显模糊带 |
+| **864×240、margin 80（竖屏推荐）** | **70.6s** | 针织纵向纹理略改善，仍有网格状重建痕迹；约 +12% 耗时 |
+| 864×480、margin 80 | 112.8s | 视觉收益有限，约 +78% 耗时，不作为首选 |
+| 864×480、margin 160 | 102.7s | 没有明确胜过 margin 80；单次耗时有波动，不代表 margin 160 更快 |
+| LaMa | 65.1s | 明显矩形接缝、纹理断裂，不推荐用于该竖屏样片 |
+
+新增 4 组均成功、未触发兜底，保留 1080×1920、180 帧及音轨，容器时长偏差小于 50ms；服务日志确认实际使用了 864×240/864×480 模型输入。视觉判断基于 0.5、2.5、4.5 秒抽帧，没有无字幕真值，也未做正式时序闪烁量化或长视频验证。横竖屏样片内容不同，不能将差异仅归因于画面方向。收紧遮罩可能增加字边残留；这些参数不能保证彻底消除复杂纹理上的毛玻璃感。
 
 ## 部署
 

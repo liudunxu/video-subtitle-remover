@@ -143,7 +143,7 @@ Output guarantees: the result duration matches the source video (missing tail fr
 | `subtitle_area_deviation_pixel_y` | 16 | Mask expansion in Y (px); increase slightly if glyph edges remain |
 | `sttn_skip_detection` | false | Skip OCR detection and repaint the whole area with STTN_AUTO (fastest; may touch subtitle-free frames) |
 | `sttn_neighbor_stride` / `sttn_reference_length` / `sttn_max_load_num` | 5 / 20 / 120 | STTN reference-frame stride / count / max frames per batch (larger = better quality, slower, more VRAM) |
-| `sttn_input_width` / `sttn_input_height` | 0 (use env/default 432×240) | STTN_DET model input size; 864×480 inpaints sharper (less upscale blur) at higher cost; must be multiples of 432/240, capped at 864×480, invalid values fall back to default |
+| `sttn_input_width` / `sttn_input_height` | 0 (use env/default 432×240) | STTN_DET model input size; try explicit 864×240 for 1080p portrait (slightly better texture, ~12% more time on the tested clip); 864×480 gave limited benefit at ~78% more time. Must be multiples of 432/240, capped at 864×480; invalid values fall back to default |
 | `sttn_band_margin` | 80 | STTN_DET crop context margin (px); larger is not necessarily sharper. Pass 0 to use `VSR_STTN_BAND_MARGIN` (40 if unset) |
 | `ocr_preset` | `default` | Detection sensitivity: `default` / `fast` / `turbo` / `fuzzy` / `ultra` / `multiline` / `aggressive`. `multiline` auto-enables STTN refinement + residual cleanup on frames with 3+ subtitle lines |
 | `bbox_min_inside_ratio` | 1.0 | Minimum intersection-over-box ratio for keeping an OCR box inside the subtitle area; 1.0 = box must be fully inside (old behavior), lower values (e.g. 0.6) keep boxes straddling the area edge |
@@ -156,7 +156,30 @@ Output guarantees: the result duration matches the source video (missing tail fr
 | `blur_kernel` / `blur_passes` / `blur_pad` / `blur_feather` / `blur_temporal_window` | 51 / 2 / 24 / 20 / 3 | `blur_cover` mode only: Gaussian kernel / stacked passes / box padding px / feather px / temporal smoothing window (0 disables) |
 | `blur_cover_allow_passthrough` | false | When `blur_cover` detection fails or finds no subtitles: false = HTTP 422 (the caller should know the subtitles are still there); true = return the original video (old behavior) |
 
-As of 2026-10-14, API defaults use smaller masks (12/16), margin 80, no refinement, and HTTP 422 on empty STTN OCR. Explicit options can restore the previous 44/44, margin 0 (environment fallback), refinement enabled, and whole-area fallback enabled. CLI/model defaults are unchanged. See the [Chinese README](README.md) for complete request examples and the 10-run GPU comparison; these settings do not guarantee artifact-free output on every video.
+As of 2026-10-14, API defaults use smaller masks (12/16), margin 80, no refinement, and HTTP 422 on empty STTN OCR. Explicit options can restore the previous 44/44, margin 0 (environment fallback), refinement enabled, and whole-area fallback enabled. CLI/model defaults are unchanged. See the [Chinese README](README.md) for complete request examples and both GPU comparisons; these settings do not guarantee artifact-free output on every video.
+
+**1080p portrait quality/performance recommendation:** save this as `payload.json` and upload with `-F 'video=@input.mp4' -F 'payload=<payload.json'`. This explicitly selects 864×240; omitting the size options still uses env/default **432×240**, not this recommendation.
+
+```json
+{
+  "options": {
+    "mode": "sttn",
+    "auto_detect_area": true,
+    "sttn_skip_detection": false,
+    "subtitle_area_deviation_pixel": 12,
+    "subtitle_area_deviation_pixel_y": 16,
+    "sttn_band_margin": 80,
+    "sttn_input_width": 864,
+    "sttn_input_height": 240,
+    "post_lama_refine": false,
+    "auto_residual_cleanup": false,
+    "post_verify_blur": false,
+    "empty_detection_full_inpaint": false
+  }
+}
+```
+
+On 2026-10-14, a single 6-second 1080×1920 clip on an RTX 3090 took 63.2s at 432×240/margin 80, 70.6s at 864×240/margin 80, 112.8s at 864×480/margin 80, and 102.7s at 864×480/margin 160. Wider input slightly improved knit texture, but artifacts remained; increasing margin had no clear benefit. LaMa took 65.1s and introduced visible rectangular seams, despite looking better on the earlier low-resolution clip. These are single-run timings and sampled-frame assessments, not long-video or temporal-flicker benchmarks. Do not scale area padding, mask expansion, and context margin together just because the source is higher resolution.
 
 Preset values `det_db_thresh` / `det_db_box_thresh` / `det_limit_side_len` are mapped to the parameter names the installed PaddleOCR actually accepts (2.x uses the same names; 3.x/PaddleX uses `thresh` / `box_thresh` / `limit_side_len`); the applied values are logged at construction.
 
