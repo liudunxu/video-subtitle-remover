@@ -317,10 +317,7 @@ def _normalize_options(payload):
     mode = str(merged.get("mode") or merged.get("inpaint_mode") or "sttn").strip().lower().replace("-", "_")
     explicit_post_lama_refine = "post_lama_refine" in merged
     explicit_auto_residual_cleanup = "auto_residual_cleanup" in merged
-    # 默认开启 text-trace 修边：它是 diff-gated 的（只处理 STTN 实际改动过
-    # 的像素，不会误伤未改动内容），且对无文字特征帧有快速 pre-check，
-    # 是性价比最高的抗残留手段。显式传 post_lama_refine=false 可关闭。
-    post_lama_refine = _to_bool(merged.get("post_lama_refine", True))
+    post_lama_refine = _to_bool(merged.get("post_lama_refine", False))
     # Historical aliases for the STTN+LaMa refine mode. `sttn_lama` /
     # `sttn_lama_refine` were folded into `sttn_then_lama` — kept the
     # latter as the canonical name; the others no longer match.
@@ -342,14 +339,14 @@ def _normalize_options(payload):
         "subtitle_area_deviation_pixel": _bounded_int(
             merged.get("subtitle_area_deviation_pixel", merged.get("mask_deviation")),
             "subtitle_area_deviation_pixel",
-            44,
+            12,
             0,
             180,
         ),
         "subtitle_area_deviation_pixel_y": _bounded_int(
             merged.get("subtitle_area_deviation_pixel_y"),
             "subtitle_area_deviation_pixel_y",
-            44,
+            16,
             0,
             300,
         ),
@@ -368,7 +365,7 @@ def _normalize_options(payload):
         # STTN_DET crop 带高余量（0 = 用 env/默认 40px）。调大（如 120-160）
         # 可给模型更多周边纹理上下文，对大面积结构纹理的填充更自然，
         # 代价是 crop 更高、推理更慢。
-        "sttn_band_margin": _bounded_int(merged.get("sttn_band_margin"), "sttn_band_margin", 0, 0, 400),
+        "sttn_band_margin": _bounded_int(merged.get("sttn_band_margin"), "sttn_band_margin", 80, 0, 400),
         "lama_super_fast": _to_bool(merged.get("lama_super_fast", False)),
         "propainter_max_load_num": _bounded_int(merged.get("propainter_max_load_num"), "propainter_max_load_num", 70, 2, 180),
         "post_lama_refine": post_lama_refine,
@@ -393,7 +390,7 @@ def _normalize_options(payload):
         "ocr_sample_step": _bounded_int(merged.get("ocr_sample_step"), "ocr_sample_step", 0, 0, 30),
         # 检测不到字幕时的兜底：True = 整区每帧 STTN_AUTO 重绘（旧行为），
         # False = 直接报错，让调用方知道检测为空而不是默默整帧重绘。
-        "empty_detection_full_inpaint": _to_bool(merged.get("empty_detection_full_inpaint", True)),
+        "empty_detection_full_inpaint": _to_bool(merged.get("empty_detection_full_inpaint", False)),
         # 未传 sub_area 时先跑一遍字幕区域自动检测（复用 /api/detect-subtitle-area
         # 的逻辑），把擦除范围收窄到真实字幕带：减少全帧误检/误擦，尾部 pass
         # 也只在字幕带内工作。检测不到则退回全帧处理（旧行为）。
@@ -2730,7 +2727,7 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
                 print(f"WARN: detector peek failed ({type(peek_exc).__name__}: {peek_exc}), proceeding without fallback")
                 peek_list = None
             if peek_list is not None and len(peek_list) == 0:
-                if not options.get("empty_detection_full_inpaint", True):
+                if not options.get("empty_detection_full_inpaint", False):
                     _restore_config_options(config, old_values)
                     raise RequestError(
                         HTTPStatus.UNPROCESSABLE_ENTITY,
@@ -3630,7 +3627,7 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                     "features": {
                         "multiline_auto_strategy": True,
                         "empty_detection_fallback": True,
-                        "post_lama_refine_default": True,
+                        "post_lama_refine_default": False,
                         "auto_detect_area_default": True,
                         "job_dir_ttl_seconds": JOB_DIR_TTL_SECONDS,
                         "custom_job_id_pattern": "[A-Za-z0-9_-]{1,64}",
