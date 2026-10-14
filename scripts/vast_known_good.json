@@ -54,6 +54,17 @@
       "image": "liudunxu/video-subtitle-remover@sha256:196a6f3103e017acf051ac3869f4f3414d0d8f82f47bd817ced86d1e3fce9545",
       "started_at": "2026-10-13T10:35:30.385047+00:00",
       "notes": "GPU runtime check passed"
+    },
+    {
+      "instance_id": 55847033,
+      "machine_id": 116189,
+      "gpu_name": "RTX 3090",
+      "cpu_name": "AMD EPYC 7B13 64-Core Processor",
+      "country_code": null,
+      "region": "southeast_asia",
+      "image": "liudunxu/video-subtitle-remover@sha256:196a6f3103e017acf051ac3869f4f3414d0d8f82f47bd817ced86d1e3fce9545",
+      "started_at": "2026-10-14T02:05:57.181648+00:00",
+      "notes": "GPU runtime check passed"
     }
   ]
 }
