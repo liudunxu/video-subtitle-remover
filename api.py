@@ -287,6 +287,7 @@ def _normalize_options(payload):
         "ocr_sample_step",
         "empty_detection_full_inpaint",
         "auto_detect_area",
+        "sub_area_margin",
         "blur_kernel",
         "blur_passes",
         "blur_pad",
@@ -395,6 +396,10 @@ def _normalize_options(payload):
         # 的逻辑），把擦除范围收窄到真实字幕带：减少全帧误检/误擦，尾部 pass
         # 也只在字幕带内工作。检测不到则退回全帧处理（旧行为）。
         "auto_detect_area": _to_bool(merged.get("auto_detect_area", True)),
+        # 调用方传入的 sub_area 向四周扩张的像素数（0 = 原样使用，不做任何
+        # 服务端猜测式的放宽）。只对显式传入的 area 生效；自动识别出来的
+        # 区域已经在 _choose_subtitle_area 里加过 buffer/padding。
+        "sub_area_margin": _bounded_int(merged.get("sub_area_margin"), "sub_area_margin", 0, 0, 400),
         # blur_cover 模式的高斯模糊参数（此前不在白名单内，API 传不进来）。
         "blur_kernel": _bounded_int(merged.get("blur_kernel"), "blur_kernel", 51, 3, 199),
         "blur_passes": _bounded_int(merged.get("blur_passes"), "blur_passes", 2, 1, 6),
@@ -489,6 +494,27 @@ def _normalize_area(payload):
     if raw_area is None:
         raw_area = payload.get("area")
     return _normalize_area_value(raw_area, "area")
+
+
+def _expand_sub_area(area, width, height, margin):
+    """把调用方传入的 sub_area 按 margin 向四周扩张，并 clamp 到帧内。
+
+    返回 backend 顺序 [ymin, ymax, xmin, xmax]。margin 之所以是显式选项而
+    不是服务端默认行为：STTN_DET 下这个矩形只是 OCR 的筛选窗口，悄悄放宽
+    会把紧邻的水印/台标也当成字幕擦掉。
+    """
+    ymin, ymax, xmin, xmax = area
+    pad = max(0, int(margin))
+    ymin = min(max(0, ymin - pad), int(height))
+    ymax = min(max(0, ymax + pad), int(height))
+    xmin = min(max(0, xmin - pad), int(width))
+    xmax = min(max(0, xmax + pad), int(width))
+    if ymax <= ymin or xmax <= xmin:
+        raise RequestError(
+            HTTPStatus.BAD_REQUEST,
+            f"area {list(area)} does not intersect the {width}x{height} video frame",
+        )
+    return [ymin, ymax, xmin, xmax]
 
 
 def _normalize_refine_area(payload):
@@ -3810,6 +3836,28 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
             refine_area = _normalize_refine_area(payload) if options.get("post_lama_refine") else None
             if source_path is None:
                 source_path = _stage_video(video_url.strip(), job_dir, filename_hint)
+
+            # 调用方显式传入的 sub_area：按需扩边 + clamp 到帧内。
+            # 不自动扩边（sub_area_margin 默认 0）——STTN_DET 下这个矩形是
+            # OCR 的接受窗口，服务端悄悄放宽会把区域外的水印/台标也擦掉。
+            # 需要放宽的调用方（尤其 sttn_skip_detection / 空检测兜底这类
+            # 矩形即 mask 的路径）显式传 sub_area_margin。
+            if area is not None:
+                geometry = _probe_video_stream_geometry(source_path)
+                if geometry:
+                    frame_w, frame_h = int(geometry["width"]), int(geometry["height"])
+                    expanded = _expand_sub_area(area, frame_w, frame_h, options["sub_area_margin"])
+                    if expanded != list(area):
+                        print(
+                            f"INFO: job={job_id} sub_area {list(area)} -> {expanded} "
+                            f"(margin={options['sub_area_margin']}, frame={frame_w}x{frame_h})"
+                        )
+                    area = tuple(expanded)
+                else:
+                    print(
+                        f"WARN: job={job_id} cannot probe frame size; "
+                        f"sub_area {list(area)} used as-is (no margin/clamp applied)"
+                    )
 
             # 未传 sub_area 时先自动识别字幕区域（默认开启）：
             # 复用 /api/detect-subtitle-area 的检测逻辑把擦除范围收窄到真实

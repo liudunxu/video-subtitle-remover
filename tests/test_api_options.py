@@ -63,5 +63,36 @@ class RemovalOptionsTest(unittest.TestCase):
         )
 
 
+class SubAreaMarginTest(unittest.TestCase):
+    def test_default_margin_is_zero(self):
+        self.assertEqual(api._normalize_options({})["sub_area_margin"], 0)
+
+    def test_top_level_key_is_whitelisted(self):
+        self.assertEqual(api._normalize_options({"sub_area_margin": 24})["sub_area_margin"], 24)
+
+    def test_margin_expands_all_sides(self):
+        self.assertEqual(
+            api._expand_sub_area((100, 200, 50, 300), 1920, 1080, 16),
+            [84, 216, 34, 316],
+        )
+
+    def test_expansion_is_clamped_to_frame(self):
+        self.assertEqual(
+            api._expand_sub_area((4, 1076, 2, 1918), 1920, 1080, 40),
+            [0, 1080, 0, 1920],
+        )
+
+    def test_zero_margin_still_clamps_out_of_bounds_area(self):
+        self.assertEqual(
+            api._expand_sub_area((100, 5000, 50, 300), 1920, 1080, 0),
+            [100, 1080, 50, 300],
+        )
+
+    def test_area_outside_frame_is_rejected(self):
+        with self.assertRaises(api.RequestError) as ctx:
+            api._expand_sub_area((2000, 3000, 50, 300), 1920, 1080, 0)
+        self.assertEqual(ctx.exception.status, HTTPStatus.BAD_REQUEST)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -231,6 +231,7 @@ curl --fail --location "$(jq -er '.download_url' result.json)" -o output.mp4
 | `ocr_sample_step` | 0 | OCR 采样间隔；0 = 按帧率自适应，1 = 逐帧检测（最慢但最不易漏），最大 30 |
 | `empty_detection_full_inpaint` | false | STTN OCR 检测不到字幕时：false = 返回 422；true = 整区每帧 STTN_AUTO 重绘。响应里的 `fallback_triggered` 标记是否触发了整区重绘兜底 |
 | `auto_detect_area` | true | 未传 `sub_area` 时先自动识别字幕区域再擦除（识别失败/为空退回全帧；传了 `sub_area` 或设为 `false` 则不触发） |
+| `sub_area_margin` | 0 | 仅对显式传入的 `sub_area` 生效：向四周扩张的像素数（clamp 到帧内，最大 400）。默认 0 = 原样使用，服务端不会自动放宽调用方的区域——STTN_DET 下 area 只是 OCR 接受窗口，悄悄放宽会把邻近的水印/台标也擦掉。`sttn_skip_detection=true` 或触发空检测兜底时这个矩形**就是** mask，贴着文字传会留下描边残字，此时建议传 16~40。越界坐标一律 clamp 到帧内；完全落在帧外的 area 返回 400 |
 | `post_lama_refine` | false | STTN 后接 text-trace 修边；默认方法为 `telea_text`，并非切换主算法到 LaMa。可清除残影，也可能抹平纹理；有残字时再显式开启 |
 | `auto_residual_cleanup` | false | 尾部残字扫描 + cv2.inpaint 兜底（`residual_*` 系列参数可调） |
 | `post_verify_blur` | false | 尾部 OCR 复检，仍有残字的检测框做高斯模糊（`post_verify_blur_*` 系列参数可调） |
