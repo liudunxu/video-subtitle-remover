@@ -8,6 +8,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -28,32 +29,34 @@ DEFAULT_GPU = "RTX 3090"
 # 按此顺序搜索，当前型号没有可用单卡 offer 才降级到下一个。
 GPU_PREFERENCE = ["RTX 3090 Ti", "RTX 3090", "RTX 4090"]
 DEFAULT_MIN_VRAM_MB = 12000
+# 单价上限（$/hr，对齐 OmniVoice 的 dph_total 硬过滤）。超过上限的 offer 不进候选池，
+# 因此"没有便宜机器"会报错而不是悄悄加价；确实无货时用 --max-price 0 关闭上限。
+DEFAULT_MAX_PRICE = 0.35
 KNOWN_GOOD_FILE = os.path.join(os.path.dirname(__file__), "vast_known_good.json")
 
 # Preferred CPU families for the current image stack (PyTorch 2.8 + PaddlePaddle 3.0).
 # These CPUs are known to support AVX2/FMA and avoid the Illegal instruction crashes
 # seen on very old Intel Xeon E5 v2/v3 and generic Common KVM processor labels.
+# Matched against _normalize_cpu_name() output (lowercase, ®/™ stripped), so entries
+# must be lowercase and must not contain trademark glyphs.
 _PREFERRED_CPU_SUBSTRINGS = [
-    "AMD Ryzen",
-    "AMD EPYC 7",
-    "AMD EPYC 72",
-    "AMD EPYC 73",
-    "AMD EPYC 74",
-    "AMD EPYC 75",
-    "AMD EPYC 76",
-    "AMD EPYC 77",
-    "Xeon E5-2673 v4",
-    "Xeon E5-2686 v4",
-    "Xeon E5-2690 v4",
-    "Xeon E5-2695 v4",
-    "Xeon E5-2696 v4",
-    "Xeon E5-2697 v4",
-    "Xeon W-",
-    "Xeon Gold",
-    "Xeon Silver",
-    "Core i5-",
-    "Core i7-",
-    "Core i9-",
+    "amd ryzen",
+    "amd epyc 7",
+    "amd epyc 8",
+    "amd epyc 9",
+    # Xeon E5 v4 == Broadwell-EP, the whole family has AVX2/FMA; listing single
+    # models here used to miss the majority of real offers (E5-2680 v4 etc).
+    " v4",
+    "xeon w-",
+    "xeon gold",
+    "xeon silver",
+    "xeon platinum",
+    # Xeon 6xxx (Granite Rapids / Sierra Forest)
+    "xeon 6",
+    "core i5-",
+    "core i7-",
+    "core i9-",
+    "core ultra",
 ]
 
 # Region priority for video-subtitle-remover-api deployments (aligned with
@@ -142,9 +145,10 @@ def search_offers(
     key: str,
     gpu_name: str = DEFAULT_GPU,
     min_vram_mb: int = DEFAULT_MIN_VRAM_MB,
-    limit: int = 50,
+    max_price: float = DEFAULT_MAX_PRICE,
+    limit: int = 200,
 ) -> List[Dict[str, Any]]:
-    payload = {
+    payload: Dict[str, Any] = {
         "gpu_name": {"in": [gpu_name]},
         # 只选单卡机：本服务只用一张 GPU，多卡整机属于白花钱
         # （此前是 {"gte": 1}，曾因此选中一台 4x3090）。
@@ -156,6 +160,10 @@ def search_offers(
         "type": "ondemand",
         "limit": limit,
     }
+    # 单价上限在服务端过滤：vast 返回的 offer 不按价格排序，limit 截断可能把
+    # 便宜机器挡在外面，所以先让服务端按价格筛，再在结果里排序。
+    if max_price and max_price > 0:
+        payload["dph_total"] = {"lte": max_price}
     resp = requests.post(
         f"{BASE_URL}/bundles/", headers=_headers(key), json=payload, timeout=60
     )
@@ -316,20 +324,34 @@ def _offer_region(offer: Dict[str, Any]) -> str:
     return "other"
 
 
+def _normalize_cpu_name(offer: Dict[str, Any]) -> str:
+    """Lowercase a Vast `cpu_name` and drop ®/™ so whitelist substrings match.
+
+    Vast reports e.g. "Xeon® E5-2680 v4 " and "Core™ i7-9700F "; without this
+    normalization none of the Intel entries in _PREFERRED_CPU_SUBSTRINGS ever
+    matched, so ~46% of live offers were scored as "unrecognized CPU".
+    """
+    cpu = str(offer.get("cpu_name") or "")
+    cpu = cpu.replace("®", " ").replace("™", " ")
+    return re.sub(r"\s+", " ", cpu).strip().lower()
+
+
 def _cpu_score(offer: Dict[str, Any]) -> int:
     """Prefer known-good modern CPUs; penalise generic/unknown/old CPUs."""
-    cpu = str(offer.get("cpu_name") or "").lower()
+    cpu = _normalize_cpu_name(offer)
     if not cpu or cpu == "common kvm processor":
         return 100
-    if any(sub.lower() in cpu for sub in _PREFERRED_CPU_SUBSTRINGS):
+    if any(sub in cpu for sub in _PREFERRED_CPU_SUBSTRINGS):
         return 0
     return 50
 
 
 def _score_offer(offer: Dict[str, Any], known_good_machine_ids: Optional[Set[int]] = None) -> tuple:
     # Prefer known-good machines, then SEA > East Asia > other Asia > Americas,
-    # then known-good CPUs, then reliability, then lower price; fewer CPU cores
+    # then known-good CPUs, then lower price, then reliability; fewer CPU cores
     # as the final tie-break (同等条件下少核机器，少占资源碎片).
+    # 价格必须排在 reliability 之前：reliability 是连续浮点数，几乎不会相等，
+    # 放在价格前面等于让价格永远不参与决策（曾因此选中贵 4% 的机器）。
     machine_id = offer.get("machine_id")
     is_known_good = bool(known_good_machine_ids and machine_id in known_good_machine_ids)
     region_rank = {
@@ -343,7 +365,7 @@ def _score_offer(offer: Dict[str, Any], known_good_machine_ids: Optional[Set[int
     reliability = offer.get("reliability", 0) or 0
     dph = offer.get("dph_total", float("inf")) or float("inf")
     cpu_cores = offer.get("cpu_cores_effective") or offer.get("cpu_cores") or 0
-    return (0 if is_known_good else 1, region_rank, cpu_rank, -reliability, dph, cpu_cores)
+    return (0 if is_known_good else 1, region_rank, cpu_rank, dph, -reliability, cpu_cores)
 
 
 def cmd_status(key: str, args: argparse.Namespace) -> int:
@@ -431,17 +453,27 @@ def cmd_start(key: str, args: argparse.Namespace) -> int:
 
     # GPU 型号偏好（未显式 --gpu 时按 GPU_PREFERENCE 顺序逐级降级）
     gpu_candidates = [args.gpu] if args.gpu else GPU_PREFERENCE
+    cap = f"<= ${args.max_price}/hr" if args.max_price > 0 else "no price cap"
     offers = []
     for gpu_name in gpu_candidates:
         print(
-            f"Searching on-demand single-GPU offers for {gpu_name} with >= {args.min_vram_mb} MB VRAM ..."
+            f"Searching on-demand single-GPU offers for {gpu_name} with "
+            f">= {args.min_vram_mb} MB VRAM, {cap} ..."
         )
-        offers = search_offers(key, gpu_name=gpu_name, min_vram_mb=args.min_vram_mb)
+        offers = search_offers(
+            key,
+            gpu_name=gpu_name,
+            min_vram_mb=args.min_vram_mb,
+            max_price=args.max_price,
+        )
         if offers:
             break
-        print(f"  No {gpu_name} offers; falling back to next GPU model.")
+        print(f"  No {gpu_name} offers within {cap}; falling back to next GPU model.")
     if not offers:
-        _die("No suitable offers found.")
+        _die(
+            f"No suitable offers found ({cap}). Raise --max-price, or pass "
+            "--max-price 0 to disable the cap."
+        )
 
     # Filter for direct port capability (direct_port_count >= 1)
     direct_offers = [
@@ -608,6 +640,12 @@ def main(argv: List[str] = None) -> int:
     p_start.add_argument("--disk", type=int, default=DEFAULT_DISK, help="Disk size in GB")
     p_start.add_argument("--gpu", default="", help="GPU name filter (default: preference order 3090 Ti -> 3090 -> 4090)")
     p_start.add_argument("--min-vram-mb", type=int, default=DEFAULT_MIN_VRAM_MB, help="Minimum VRAM in MB")
+    p_start.add_argument(
+        "--max-price",
+        type=float,
+        default=DEFAULT_MAX_PRICE,
+        help=f"Max $/hour per offer (default {DEFAULT_MAX_PRICE}; 0 disables the cap)",
+    )
     p_start.add_argument("--timeout", type=int, default=600, help="Seconds to wait for running")
     p_start.add_argument("--health-timeout", type=int, default=300, help="Seconds to wait for /health")
     p_start.add_argument("--interval", type=int, default=10, help="Polling interval seconds")
