@@ -104,6 +104,33 @@ class GlyphMaskTest(unittest.TestCase):
         self.assertTrue(np.all(mask[30:65, 30:90][white] == 255))
         self.assertFalse(mask[:, 130:].any())
 
+    def test_clipped_white_symbols_recovered_above_and_below_line(self):
+        frame = np.full((150, 170, 3), 70, np.uint8)
+        frame[55:85, 38:45] = 255
+        frame[35:42, 39:44] = 255  # Crosses old top search boundary (38).
+        frame[98:105, 39:44] = 255  # Crosses old bottom boundary (101).
+        mask = glyph_mask(frame, [[20, 130, 50, 90]])
+        self.assertTrue(np.all(mask[35:42, 39:44] == 255))
+        self.assertTrue(np.all(mask[98:105, 39:44] == 255))
+        self.assertFalse(mask[:, 75:85].any())  # Preserve background between glyphs.
+
+    def test_clipped_symbol_rejects_pale_fabric_and_unaligned_highlights(self):
+        for value, x in [(215, 39), (255, 100)]:
+            with self.subTest(value=value, x=x):
+                frame = np.full((150, 170, 3), 70, np.uint8)
+                frame[55:85, 38:45] = 255
+                frame[98:105, x:x+5] = value
+                mask = glyph_mask(frame, [[20, 130, 50, 90]])
+                self.assertFalse(mask[98:105, x:x+5].any())
+
+    def test_symbol_recovery_keeps_empty_and_frame_boundary_safe(self):
+        frame = np.full((100, 170, 3), 70, np.uint8)
+        frame[55:85, 38:45] = 255
+        frame[98:100, 39:44] = 255  # Continues through the physical frame edge.
+        self.assertFalse(glyph_mask(frame, []).any())
+        mask = glyph_mask(frame, [[20, 130, 50, 90]])
+        self.assertFalse(mask[98:100, 39:44].any())
+
     def test_thin_mask_core_never_blends_original_text_back(self):
         source = np.full((40, 60, 3), 255, np.uint8)
         mask = np.zeros((40, 60), np.uint8)

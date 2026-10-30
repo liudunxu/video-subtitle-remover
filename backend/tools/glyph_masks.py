@@ -150,7 +150,56 @@ def glyph_mask(frame, boxes, radius=5):
             guard = np.zeros_like(support)
             guard[iy0:iy1, ix0:ix1] = missing.astype(np.uint8)*255
             local |= cv2.dilate(guard, kernel)
-    return mask
+    return _recover_clipped_symbols(frame, boxes, mask, radius)
+
+
+def _recover_clipped_symbols(frame, boxes, base, radius):
+    """Recover white accents clipped by the first glyph search window.
+
+    Only small outlined components crossing its top/bottom edge qualify. Keep
+    a strong white core and alignment with existing glyphs to reject pale fabric.
+    """
+    extra = np.zeros_like(base)
+    for bx0, bx1, by0, by1 in boxes:
+        height = by1 - by0
+        if height < 10:
+            continue
+        old_pad = max(12, round(height * .22))
+        new_pad = max(old_pad + 12, round(height * .6))
+        x0, x1 = max(0, bx0 - 8), min(frame.shape[1], bx1 + 8)
+        y0, y1 = max(0, by0 - new_pad), min(frame.shape[0], by1 + new_pad)
+        crop = frame[y0:y1, x0:x1]
+        if not crop.size:
+            continue
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        saturation, value = hsv[:, :, 1], hsv[:, :, 2]
+        support = ((value >= 165) & (saturation <= 80)).astype(np.uint8)
+        contrast = value.astype(np.int16) - cv2.erode(value, np.ones((7, 7), np.uint8)).astype(np.int16)
+        outlined = (value >= 200) & (saturation <= 80) & (contrast >= 30)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(support, 8)
+        old_top, old_bottom = by0 - old_pad - y0, by1 + old_pad - y0 - 1
+        for k in range(1, n):
+            x, y, w, h, area = stats[k]
+            if area < 2 or h > .6 * height or w > height or area > .1 * height * (bx1 - bx0):
+                continue
+            if x == 0 or y == 0 or x + w >= crop.shape[1] or y + h >= crop.shape[0]:
+                continue
+            if not any(y <= edge < y + h for edge in (old_top, old_bottom)):
+                continue
+            pixels = labels == k
+            # White subtitle interiors dominate a symbol; pale fabric threads
+            # can have local contrast but lack a substantial bright white core.
+            strong_white = pixels & (value >= 230) & (saturation <= 55)
+            if np.count_nonzero(strong_white) < max(3, .3 * area):
+                continue
+            if np.count_nonzero(pixels & outlined) < 3:
+                continue
+            # A candidate must align with a known glyph column in this OCR line.
+            if not np.any(base[by0:by1, x0+x:x0+x+w]):
+                continue
+            extra[y0:y1, x0:x1][pixels] = 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius*2+1, radius*2+1))
+    return base | cv2.dilate(extra, kernel)
 
 
 def resize_model_mask(mask, size=(432, 240)):

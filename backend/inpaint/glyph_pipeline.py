@@ -254,7 +254,9 @@ def _render(video_path, masks, jobs, band_y, folder, silent, fps, size, progress
         for i in range(job['start'], job['stop']):
             by_frame[i].append(job)
     predictions = {}
-    writer = FFmpegVideoWriter(str(silent), fps, size, crf=12, preset='veryfast', strict=True)
+    # Encode only the final composited frames; OCR/inference use source pixels.
+    # Audio muxing copies this stream, so CRF 18 needs no second lossy encode.
+    writer = FFmpegVideoWriter(str(silent), fps, size, crf=18, preset='fast', strict=True)
     count = active_count = 0
     try:
         for i, source in enumerate(_read_frames(video_path)):
@@ -344,7 +346,7 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
         active = _render(video_path, masks, jobs, band[0], folder, silent, fps, (width, height), progress)
         progress('finalize', 98, 'audio_mux')
         mux_audio(silent, video_path, output)
-        audit = dict(profile='glyph_v3', mode=options['mode'], device=device, frames=len(boxes),
+        audit = dict(profile='glyph_v4', mode=options['mode'], device=device, frames=len(boxes),
                      fps=fps, size=[width, height], area=list(area), band=list(band),
                      ocr_frames=ocr_frames, shots=shots, jobs=records, active_mask_frames=active,
                      ocr_max_side=options.get('glyph_ocr_max_side', 640),
@@ -353,6 +355,7 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
                      masks_sha256=_mask_hash(masks), model_input_size=[432, 240],
                      chunk_size=80, overlap=20, feather_sigma=2, glyph_dilation=5,
                      frame_decode='sequential', mask_coverage_guard='outlined_pixels_in_ocr_line',
+                     clipped_symbol_recovery='aligned_strong_white_components',
                      model_mask_resize='area_nonzero_then_1px_dilation', feather_policy='opaque_core',
                      scene_metric='mean absolute BGR difference at 96x54 > 40',
                      precision='fp32', post_processing=False)

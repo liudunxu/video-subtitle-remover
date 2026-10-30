@@ -3734,7 +3734,7 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                     "features": {
                         "mask_strategies": ["rectangle", "glyph"],
                         "mask_strategy_default": "rectangle",
-                        "glyph_profile": "glyph_v3",
+                        "glyph_profile": "glyph_v4",
                         "glyph_ocr_max_side_default": 640,
                         "glyph_ocr_max_side_range": [640, 1280],
                         "glyph_adaptive_ocr_retry": True,
@@ -3973,6 +3973,14 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                         area_detect = _run_subtitle_area_detection(source_path, None, detect_options)
                     if area_detect.get("sub_area"):
                         area = tuple(int(v) for v in area_detect["sub_area"])
+                        # Sparse area samples can miss longer horizontal lines.
+                        # Glyph masks still follow detected strokes, so retain the
+                        # detected vertical band but accept text across its width.
+                        # Explicit sub_area and the legacy rectangle path stay as-is.
+                        if options["mask_strategy"] == "glyph":
+                            frame_w = int(area_detect["video_size"]["width"])
+                            if frame_w > 0:
+                                area = (area[0], area[1], 0, frame_w)
                         auto_detected_area = True
                         print(
                             f"INFO: job={job_id} auto-detected subtitle area {area} "

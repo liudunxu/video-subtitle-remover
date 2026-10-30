@@ -1,6 +1,8 @@
+import tempfile
 import unittest
+from pathlib import Path
 from http import HTTPStatus
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import api
 
@@ -92,6 +94,53 @@ class SubAreaMarginTest(unittest.TestCase):
         with self.assertRaises(api.RequestError) as ctx:
             api._expand_sub_area((2000, 3000, 50, 300), 1920, 1080, 0)
         self.assertEqual(ctx.exception.status, HTTPStatus.BAD_REQUEST)
+
+
+class RemovalAreaRoutingTest(unittest.TestCase):
+    def test_glyph_auto_area_is_full_width_but_explicit_and_legacy_stay_unchanged(self):
+        detected = [831, 1871, 108, 1066]
+        explicit = [1400, 1600, 100, 980]
+        cases = [
+            ('sttn', 'glyph', None, True, [831, 1871, 0, 1080]),
+            ('propainter', 'glyph', None, True, [831, 1871, 0, 1080]),
+            ('sttn', 'rectangle', None, True, detected),
+            ('sttn', 'glyph', explicit, True, explicit),
+            ('propainter', 'glyph', explicit, True, explicit),
+            ('sttn', 'glyph', None, False, None),
+        ]
+        for mode, strategy, supplied, auto, expected in cases:
+            with self.subTest(mode=mode, strategy=strategy, supplied=supplied, auto=auto):
+                with tempfile.TemporaryDirectory() as temp:
+                    source = Path(temp)/'source.mp4'
+                    source.touch()
+                    payload = {'_uploaded_video_path': str(source), 'options': {
+                        'mode': mode, 'mask_strategy': strategy, 'auto_detect_area': auto,
+                    }}
+                    if supplied is not None:
+                        payload['sub_area'] = supplied
+                    handler = object.__new__(api.RemoverAPIHandler)
+                    handler.headers = {}
+                    handler.path = '/api/remove-subtitle'
+                    handler._send_json = Mock()
+                    # Exercise the real request routing up to the model boundary.
+                    with patch.object(api, 'WORK_DIR', Path(temp)), patch.object(
+                        api, '_read_payload', return_value=payload
+                    ), patch.object(api, '_sweep_stale_job_dirs'), patch.object(
+                        api, '_set_job_progress'
+                    ), patch.object(api, '_probe_video_stream_geometry', return_value={
+                        'width': 1080, 'height': 1920,
+                    }), patch.object(api, '_run_subtitle_area_detection', return_value={
+                        'sub_area': detected, 'video_size': {'width': 1080, 'height': 1920},
+                    }) as detect, patch.object(api, '_run_subtitle_remover', side_effect=
+                        api.RequestError(HTTPStatus.UNPROCESSABLE_ENTITY, 'model boundary')
+                    ) as run:
+                        handler.do_POST()
+                    run.assert_called_once()
+                    area = run.call_args.args[1]
+                    self.assertEqual(list(area) if area is not None else None, expected)
+                    self.assertEqual(detect.call_count, int(supplied is None and auto))
+                    self.assertEqual(handler._send_json.call_args.args,
+                                     (HTTPStatus.UNPROCESSABLE_ENTITY, {'error': 'model boundary'}))
 
 
 if __name__ == "__main__":

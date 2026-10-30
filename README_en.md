@@ -94,17 +94,32 @@ Response conventions (aligned with OmniVoice): every JSON response carries the `
 
 Opt-in white outlined subtitle profile (2026-10-29): send
 `"options":{"mode":"propainter","mask_strategy":"glyph"}` (also supports `sttn`).
-Omitting `sub_area` keeps automatic area detection; an explicit area is an OCR
-acceptance window, not a rectangular repaint mask. The default strategy remains
+Omitting `sub_area` detects the vertical subtitle band and expands its horizontal
+acceptance to the full frame width, so sparse area samples do not reject longer
+lines. Explicit areas retain the caller's bounds (zero margin by default); a tight
+area can still reject a line under the default full-box containment rule. The
+area is an OCR acceptance window, not a rectangular repaint mask. The default strategy remains
 `rectangle`. Colored/moving captions and other fonts are not validated.
 
-`glyph_v3` (2026-10-30) uses real PaddleOCR detection, per-frame glyph/outline
+`glyph_v4` (2026-10-30) uses real PaddleOCR detection, per-frame glyph/outline
 masks with 5px dilation, disconnected-accent and clipped-stroke recovery, and
 scene-local temporal stabilization. If outlined bright pixels still escape a
 glyph mask, local growth around those pixels repairs coverage without filling
 the entire OCR line or its glyph gaps. This handles letters connected to bright
 skin/clothing while limiting extra repair area. Uniform highlights alone do not
 activate the guard.
+Clipped-symbol recovery searches farther above/below each OCR line, accepting
+only small outlined components crossing the old search boundary, aligned with
+existing glyph columns and containing a substantial strong white core. The white
+core gate rejects pale fabric threads in the tested negative case. Both engines
+and OCR retries share this extraction. Audit files identify `profile=glyph_v4`
+and `clipped_symbol_recovery=aligned_strong_white_components`. Validation covers
+three 50-frame My Poet clips near 31/90/119 seconds, not every font or full video.
+The dubbing UI's new removal-area default is full width (`x=0, width=1`), retaining
+`y=0.74, height=0.08`; saved/manual selections are preserved. Publish the frontend
+for that default and deploy the remover for stroke recovery. Existing jobs need
+an explicitly widened selection; callers still need `options.mask_strategy=glyph`.
+
 `glyph_ocr_max_side` sets the OCR maximum side (default 640, range 640–1280).
 Try 960 for missed short words on bright backgrounds. This changes OCR resolution
 only; full-video quality/cost at 960 is not yet validated.
@@ -125,6 +140,13 @@ every two frames with boundary checks (`ocr_sample_step=1` enables every frame;
 only 0/1/2 are supported). A brief caption between identical neighboring layouts
 can still be missed with sampling. `sttn_band_margin` and
 `sttn_reference_length` apply to both models; `sttn_neighbor_stride` is STTN-only.
+
+Both glyph engines perform OCR/inference from decoded source frames at the model
+sizes above. Final composited frames are encoded once as H.264, CRF 18 / preset
+fast (previously CRF 12 / veryfast), and video is stream-copied during audio muxing.
+This reduces output size without pre-compressing model inputs or adding a lossy
+intermediate encode. CRF affects output fidelity/size, not OCR, masks, or model
+settings; it does not guarantee a fixed file size.
 
 Incompatible legacy rectangle-dilation/chunk-size options, larger model inputs,
 whole-area fallback, and additional cleanup/refinement/blur return HTTP 400.
