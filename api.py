@@ -260,6 +260,8 @@ def _normalize_options(payload):
     merged = {**raw_options, **{key: payload[key] for key in payload.keys() if key in {
         "mode",
         "inpaint_mode",
+        "mask_strategy",
+        "glyph_ocr_max_side",
         "subtitle_area_deviation_pixel",
         "subtitle_area_deviation_pixel_y",
         "mask_deviation",
@@ -335,8 +337,10 @@ def _normalize_options(payload):
     mode = aliases.get(mode, mode)
     if mode not in {"sttn", "lama", "propainter", "lama_area", "blur_cover"}:
         raise RequestError(HTTPStatus.BAD_REQUEST, "mode must be sttn, lama, propainter, lama_area, or blur_cover")
-    return {
+    options = {
         "mode": mode,
+        "mask_strategy": str(merged.get("mask_strategy") or "rectangle").strip().lower(),
+        "glyph_ocr_max_side": _bounded_int(merged.get("glyph_ocr_max_side"), "glyph_ocr_max_side", 640, 640, 1280),
         "subtitle_area_deviation_pixel": _bounded_int(
             merged.get("subtitle_area_deviation_pixel", merged.get("mask_deviation")),
             "subtitle_area_deviation_pixel",
@@ -437,6 +441,26 @@ def _normalize_options(payload):
         "post_verify_blur_passes": _bounded_int(merged.get("post_verify_blur_passes"), "post_verify_blur_passes", 3, 1, 6),
         "post_verify_blur_median_kernel": _bounded_int(merged.get("post_verify_blur_median_kernel"), "post_verify_blur_median_kernel", 21, 0, 99),
     }
+    if options["mask_strategy"] not in {"rectangle", "glyph"}:
+        raise RequestError(HTTPStatus.BAD_REQUEST, "mask_strategy must be rectangle or glyph")
+    if options["mask_strategy"] == "glyph":
+        if mode not in {"sttn", "propainter"}:
+            raise RequestError(HTTPStatus.BAD_REQUEST, "glyph masks support sttn and propainter only")
+        incompatible = [key for key in (
+            "sttn_skip_detection", "empty_detection_full_inpaint", "post_lama_refine",
+            "auto_residual_cleanup", "post_verify_blur", "ocr_bbox_y_pad",
+        ) if options[key]]
+        if incompatible:
+            raise RequestError(HTTPStatus.BAD_REQUEST, "glyph profile is incompatible with: " + ", ".join(incompatible))
+        if options["ocr_sample_step"] not in (0, 1, 2):
+            raise RequestError(HTTPStatus.BAD_REQUEST, "glyph ocr_sample_step must be 0 (2), 1, or 2")
+        if options["sttn_input_width"] not in (0, 432) or options["sttn_input_height"] not in (0, 240):
+            raise RequestError(HTTPStatus.BAD_REQUEST, "glyph uses fixed 432x240 model input for both models")
+        unsupported = set(merged) & {"subtitle_area_deviation_pixel", "subtitle_area_deviation_pixel_y",
+                                     "mask_deviation", "sttn_max_load_num", "propainter_max_load_num"}
+        if unsupported:
+            raise RequestError(HTTPStatus.BAD_REQUEST, "glyph uses fixed coverage rules and 80/20 windows; omit: " + ", ".join(sorted(unsupported)))
+    return options
 
 
 def _normalize_area_value(raw_area, field_name="area"):
@@ -2413,7 +2437,7 @@ def _pad_video_duration(video_path, target_duration, timeout=600):
     return path
 
 
-def _mux_audio_onto_video(video_only_path, audio_source_path, dest_path, timeout=600):
+def _mux_audio_onto_video(video_only_path, audio_source_path, dest_path, timeout=600, preserve_timestamps=False):
     """把 `audio_source_path` 的音轨合并到无声视频 `video_only_path` 上。
 
     视频流一律 `-c:v copy`（调用方应保证视频已是目标编码，避免额外一代
@@ -2450,6 +2474,22 @@ def _mux_audio_onto_video(video_only_path, audio_source_path, dest_path, timeout
             "-loglevel", "error",
             str(dest_path),
         ]
+    if preserve_timestamps:
+        starts = []
+        for path in (audio_source_path, video_only_path):
+            probe = subprocess.check_output([
+                FFmpegCLI.instance().ffprobe_path, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=start_time", "-of", "json", str(path),
+            ], timeout=60)
+            starts.append(float(json.loads(probe)["streams"][0].get("start_time", 0)))
+        # Restore the source video's origin even if the silent input was
+        # remuxed with a nonzero origin, retaining original audio timestamps.
+        audio_args = ["-c:a", "copy"] if audio_codec in (None, "aac") else ["-c:a", "aac", "-b:a", "320k"]
+        cmd = [ffmpeg_path, "-y", "-copyts", "-itsoffset", str(starts[0]-starts[1]),
+               "-i", str(video_only_path), "-i", str(audio_source_path),
+               "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "copy",
+               *audio_args,
+               "-avoid_negative_ts", "disabled", "-movflags", "+faststart", "-loglevel", "error", str(dest_path)]
     with open(os.devnull) as devnull:
         subprocess.check_output(cmd, stdin=devnull, timeout=timeout)
     if not Path(dest_path).is_file():
@@ -2662,6 +2702,8 @@ def _start_progress_poller(remover, phase, scale_end, progress_callback, poll_in
 
 def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_callback=None):
     _patch_numpy_compat()
+    if options.get("mask_strategy") == "glyph":
+        return _run_glyph_remover(video_path, area, options, progress_callback), False
     from backend.main import SubtitleRemover, SubtitleDetect
     from backend import config
     options = dict(options)
@@ -3004,6 +3046,45 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
         print(f"WARN: _ensure_h264 failed: {h264_exc}; returning original output")
     print(f"[phase] _run_subtitle_remover: done (total={time.time() - _sr_t0:.1f}s)", flush=True)
     return output_path, fallback_triggered
+
+
+def _run_glyph_remover(video_path, area, options, progress_callback=None):
+    from backend.inpaint.glyph_pipeline import run_glyph_removal, NoGlyphsError
+    from backend.tools.subtitle_detect import SubtitleDetect
+
+    preset = _OCR_PRESETS[options["ocr_preset"]]
+    detector_options = {"det_limit_side_len": options["glyph_ocr_max_side"], "det_limit_type": "max"}
+    if options["ocr_preset"] != "default":
+        detector_options.update({key: preset[key] for key in ("det_db_thresh", "det_db_box_thresh") if key in preset})
+    # Crop-local coordinates: acceptance against the full-frame area happens
+    # after the pipeline adds the band offset, never inside this detector.
+    detector = SubtitleDetect(str(video_path), sub_areas=[], ocr_sample_step=options["ocr_sample_step"] or 2,
+                              bbox_min_inside_ratio=options["bbox_min_inside_ratio"], **detector_options)
+    # SubtitleDetect loads Paddle lazily, so a second model is only loaded when
+    # a short-lived shrink is actually retried. Already-high-res OCR needs none.
+    retry_detector = None
+    if options["glyph_ocr_max_side"] < 960:
+        retry_detector = SubtitleDetect(
+            str(video_path), sub_areas=[], ocr_sample_step=1,
+            bbox_min_inside_ratio=options["bbox_min_inside_ratio"],
+            **{**detector_options, "det_limit_side_len": 960})
+
+    def progress(phase, percent, stage):
+        if progress_callback:
+            progress_callback(phase, percent, stage)
+
+    def mux(silent, source, target):
+        _mux_audio_onto_video(silent, source, target, preserve_timestamps=True)
+
+    try:
+        output = run_glyph_removal(video_path, area, options, detector, progress, mux, retry_detector=retry_detector)
+    except NoGlyphsError as exc:
+        raise RequestError(HTTPStatus.UNPROCESSABLE_ENTITY, str(exc)) from exc
+    audit = json.loads(output.with_suffix(".json").read_text())
+    info = _probe_video_info(output)
+    if info.get("nb_frames") != audit["frames"]:
+        raise RequestError(HTTPStatus.INTERNAL_SERVER_ERROR, "Glyph output failed frame-count validation")
+    return output
 
 
 def _normalize_detect_options(payload):
@@ -3651,6 +3732,14 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                     "deprecated_route_aliases": _DEPRECATED_ROUTE_ALIASES,
                     "deprecated_route_usage": dict(_DEPRECATED_ROUTE_USAGE),
                     "features": {
+                        "mask_strategies": ["rectangle", "glyph"],
+                        "mask_strategy_default": "rectangle",
+                        "glyph_profile": "glyph_v3",
+                        "glyph_ocr_max_side_default": 640,
+                        "glyph_ocr_max_side_range": [640, 1280],
+                        "glyph_adaptive_ocr_retry": True,
+                        "glyph_ocr_retry_max_side": 960,
+                        "glyph_modes": ["sttn", "propainter"],
                         "multiline_auto_strategy": True,
                         "empty_detection_fallback": True,
                         "post_lama_refine_default": False,
@@ -3931,6 +4020,7 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                         "refine": "STTN 修边",
                         "residual": "残字兜底修复",
                         "stitch": "合并片段",
+                        "ocr_retry": "字幕漏框补检",
                         "finalize": "回灌音频",
                         "done": "完成",
                         "error": "出错",
@@ -3948,6 +4038,19 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
 
             download_url = _download_url(self, job_id, output_path.name)
             print(f"INFO: job={job_id} download_url={download_url}")
+            processing = {}
+            if options["mask_strategy"] == "glyph":
+                audit = json.loads(output_path.with_suffix(".json").read_text())
+                processing = {
+                    "profile": audit["profile"], "device": audit["device"],
+                    "frames": audit["frames"], "ocr_frames": audit["ocr_frames"],
+                    "ocr_max_side": audit["ocr_max_side"],
+                    "ocr_retry_count": len(audit["ocr_retry_frames"]),
+                    "ocr_retry_updated_count": len(audit["ocr_retry_updated_frames"]),
+                    "active_mask_frames": audit["active_mask_frames"], "chunks": len(audit["jobs"]),
+                    "masks_sha256": audit["masks_sha256"],
+                    "audit_url": _download_url(self, job_id, output_path.with_suffix(".json").name),
+                }
             self._send_json(
                 HTTPStatus.OK,
                 {
@@ -3962,6 +4065,7 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                     "auto_detected_area": auto_detected_area,
                     "refine_area": list(refine_area) if refine_area is not None else None,
                     "options": options,
+                    **({"processing": processing} if processing else {}),
                     # OCR 检测为空时是否触发了整区 STTN_AUTO 重绘兜底
                     "fallback_triggered": fallback_triggered,
                     "elapsed_seconds": round(time.time() - started_at, 3),

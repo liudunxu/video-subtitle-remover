@@ -84,7 +84,8 @@ class FFmpegVideoWriter:
     接口兼容 cv2.VideoWriter（write/release）。
     """
 
-    def __init__(self, output_path, fps, size, crf=18, preset="fast"):
+    def __init__(self, output_path, fps, size, crf=18, preset="fast", strict=False):
+        self.strict = strict
         w, h = size
         cmd = [
             FFmpegCLI.instance().ffmpeg_path,
@@ -116,7 +117,8 @@ class FFmpegVideoWriter:
         try:
             self._process.stdin.write(frame.tobytes())
         except BrokenPipeError:
-            pass
+            if self.strict:
+                raise RuntimeError('FFmpeg stopped accepting video frames')
 
     def release(self):
         """关闭管道并等待编码完成。"""
@@ -129,3 +131,7 @@ class FFmpegVideoWriter:
         except subprocess.TimeoutExpired:
             self._process.terminate()
             self._process.wait(timeout=5)
+            if self.strict:
+                raise RuntimeError('FFmpeg encoding timed out')
+        if self.strict and self._process.returncode:
+            raise RuntimeError(f'FFmpeg encoding failed with exit code {self._process.returncode}')

@@ -92,6 +92,49 @@ Response conventions (aligned with OmniVoice): every JSON response carries the `
 
 ### Removal: POST /api/remove-subtitle
 
+Opt-in white outlined subtitle profile (2026-10-29): send
+`"options":{"mode":"propainter","mask_strategy":"glyph"}` (also supports `sttn`).
+Omitting `sub_area` keeps automatic area detection; an explicit area is an OCR
+acceptance window, not a rectangular repaint mask. The default strategy remains
+`rectangle`. Colored/moving captions and other fonts are not validated.
+
+`glyph_v3` (2026-10-30) uses real PaddleOCR detection, per-frame glyph/outline
+masks with 5px dilation, disconnected-accent and clipped-stroke recovery, and
+scene-local temporal stabilization. If outlined bright pixels still escape a
+glyph mask, local growth around those pixels repairs coverage without filling
+the entire OCR line or its glyph gaps. This handles letters connected to bright
+skin/clothing while limiting extra repair area. Uniform highlights alone do not
+activate the guard.
+`glyph_ocr_max_side` sets the OCR maximum side (default 640, range 640–1280).
+Try 960 for missed short words on bright backgrounds. This changes OCR resolution
+only; full-video quality/cost at 960 is not yet validated.
+Below a base OCR size of 960, a line shrinking by at least 15% between agreeing
+wider detections within two frames on each side triggers a 960 retry. Retries
+use actual current-frame detections, never copied neighbor boxes, and stay within
+the shot and accepted area. Empty frames, persistent misses and clip edges are
+not recovered by this rule. Base OCR at 960 or above skips retries. The response
+reports retry/update counts; the audit records frame indices.
+Both models use 432×240 inputs and 80-frame windows with 20-frame overlap.
+Inference decodes sequentially like OCR/render, caching resized overlap frames;
+MP4 random seeks can otherwise pair a captioned frame with the next empty mask.
+Mask resizing preserves any nonzero coverage and adds one model-pixel margin.
+ProPainter uses FP32 and zero internal dilation. Original-resolution composition
+fully replaces mask cores and feathers only outside them (sigma 2).
+Scene cuts use mean absolute BGR difference >40 on 96×54 thumbnails. OCR runs
+every two frames with boundary checks (`ocr_sample_step=1` enables every frame;
+only 0/1/2 are supported). A brief caption between identical neighboring layouts
+can still be missed with sampling. `sttn_band_margin` and
+`sttn_reference_length` apply to both models; `sttn_neighbor_stride` is STTN-only.
+
+Incompatible legacy rectangle-dilation/chunk-size options, larger model inputs,
+whole-area fallback, and additional cleanup/refinement/blur return HTTP 400.
+No editable white glyphs returns 422. The multiline preset adjusts detection
+thresholds only. The response's `processing.audit_url` exposes actual device,
+mask hash, cuts, and per-window input/mask hashes. Temporary masks use disk maps
+(about frames × band width × band height × 4 bytes, plus predictions and output),
+cleaned on completion/failure. CUDA is used when enabled/available; other devices
+use CPU. Audio and source A/V offset are preserved; video encoding is CFR.
+
 Two ways to supply the video (pick one):
 
 - `video_url` in a JSON body: HTTP(S) URL, `file://` path, or local path

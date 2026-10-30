@@ -30,6 +30,22 @@ def binary_mask(mask, th=0.1):
 
 # read frame-wise masks
 def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
+    # Explicit per-frame masks are already in model coordinates. Keep legacy
+    # single-mask/path behavior below, including its historical threshold.
+    if isinstance(mpath, (list, tuple)):
+        if len(mpath) != length:
+            raise ValueError('Expected one mask per video frame')
+        flow_masks, masks_dilated = [], []
+        for mask in mpath:
+            mask = np.asarray(mask)
+            if mask.shape != (size[1], size[0]):
+                raise ValueError('Per-frame mask geometry must match model input')
+            binary = mask > 127
+            flow = scipy.ndimage.binary_dilation(binary, iterations=flow_mask_dilates) if flow_mask_dilates > 0 else binary
+            fill = scipy.ndimage.binary_dilation(binary, iterations=mask_dilates) if mask_dilates > 0 else binary
+            flow_masks.append(Image.fromarray(flow.astype(np.uint8)*255))
+            masks_dilated.append(Image.fromarray(fill.astype(np.uint8)*255))
+        return flow_masks, masks_dilated
     masks_img = []
     masks_dilated = []
     flow_masks = []
