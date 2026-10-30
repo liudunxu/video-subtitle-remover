@@ -115,10 +115,10 @@ core gate rejects pale fabric threads in the tested negative case. Both engines
 and OCR retries share this extraction. Audit files identify `profile=glyph_v4`
 and `clipped_symbol_recovery=aligned_strong_white_components`. Validation covers
 three 50-frame My Poet clips near 31/90/119 seconds, not every font or full video.
-The dubbing UI's new removal-area default is full width (`x=0, width=1`), retaining
-`y=0.74, height=0.08`; saved/manual selections are preserved. Publish the frontend
-for that default and deploy the remover for stroke recovery. Existing jobs need
-an explicitly widened selection; callers still need `options.mask_strategy=glyph`.
+The dubbing UI allows users to adjust the removal area. Caller-supplied `sub_area`
+is not automatically widened by default; widen the selection and retry if it
+excludes long subtitle lines. Deploy the remover for stroke recovery and set
+`options.mask_strategy=glyph`; omission keeps the legacy rectangle strategy.
 
 `glyph_ocr_max_side` sets the OCR maximum side (default 640, range 640–1280).
 Try 960 for missed short words on bright backgrounds. This changes OCR resolution
