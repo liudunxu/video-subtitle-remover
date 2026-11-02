@@ -371,6 +371,7 @@ demo*.mp4
 out*.mp4
 test*.py
 !/tests/test_glyph_pipeline.py
+!/tests/test_glyph_context.py
 test_*.mp4
 test*_no_sub*.mp4
 /test/coods/

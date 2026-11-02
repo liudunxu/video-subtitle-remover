@@ -31,6 +31,12 @@ def merge_line_boxes(boxes):
         for i,a in enumerate(boxes):
             for j in range(i+1,len(boxes)):
                 b=boxes[j]
+                heights = (a[3]-a[2], b[3]-b[2])
+                # Tall background detections may overlap a subtitle row without
+                # belonging to it. Merging them hides an otherwise valid line
+                # from downstream short/normal-caption checks.
+                if max(heights) > 2*min(heights):
+                    continue
                 overlap=max(0,min(a[3],b[3])-max(a[2],b[2]))
                 gap=max(0,max(a[0],b[0])-min(a[1],b[1]))
                 if overlap>=.5*min(a[3]-a[2],b[3]-b[2]) and gap<=2*max(a[3]-a[2],b[3]-b[2]):

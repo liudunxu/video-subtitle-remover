@@ -162,6 +162,15 @@ class GlyphMaskTest(unittest.TestCase):
     def test_single_character_boxes_merge_before_glyph_filter(self):
         self.assertEqual(merge_line_boxes([[10, 20, 10, 40], [30, 40, 12, 42]]), [[10, 40, 10, 42]])
 
+    def test_tall_background_box_does_not_swallow_subtitle_line(self):
+        line, background = [120, 320, 90, 130], [30, 45, 60, 240]
+        for boxes in [[line, background], [background, line]]:
+            self.assertEqual(merge_line_boxes(boxes), [background, line])
+        # A separate vertical box must not prevent real fragments merging.
+        self.assertEqual(merge_line_boxes([background, [120, 175, 90, 130],
+                                          [185, 320, 91, 131]]),
+                         [background, [120, 320, 90, 131]])
+
     def test_windows_coverage_overlap_and_cut(self):
         masks = np.zeros((220, 300, 20), np.uint8)
         masks[10:190, 100:140, 5:10] = 255
@@ -394,7 +403,7 @@ class CompositionAndCleanupTest(unittest.TestCase):
             cv2.CAP_PROP_FRAME_WIDTH: 120, cv2.CAP_PROP_FRAME_HEIGHT: 100,
             cv2.CAP_PROP_FPS: 24, cv2.CAP_PROP_FRAME_COUNT: 1,
         }[key]
-        def scan(video, detector, area, band, step, path, progress, count):
+        def scan(video, detector, area, band, step, path, progress, count, local_audit):
             mask = np.zeros((100, 120), np.uint8)
             mask[40:60, 50:70] = 255
             path.write_bytes(mask.tobytes())

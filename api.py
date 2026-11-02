@@ -3734,7 +3734,7 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                     "features": {
                         "mask_strategies": ["rectangle", "glyph"],
                         "mask_strategy_default": "rectangle",
-                        "glyph_profile": "glyph_v4",
+                        "glyph_profile": "glyph_v5",
                         "glyph_ocr_max_side_default": 640,
                         "glyph_ocr_max_side_range": [640, 1280],
                         "glyph_adaptive_ocr_retry": True,

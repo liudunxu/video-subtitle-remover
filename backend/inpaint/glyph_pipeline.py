@@ -8,6 +8,7 @@ import hashlib
 import json
 import shutil
 import tempfile
+from bisect import bisect_left
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -17,6 +18,11 @@ import numpy as np
 from backend.tools.glyph_masks import (
     same_layout, merge_line_boxes, glyph_mask, recover_vertical_border, find_shrunk_lines, box_iou,
     stabilize_masks, build_windows, overlap_weight, blend_prediction, resize_model_mask,
+)
+from backend.tools.glyph_context import (
+    needs_local_ocr, local_ocr_boxes, outlined_local_mask, select_reference,
+    short_text_regions, short_text_mask, photometric_boundaries,
+    subtitle_line_shape, narrow_text_regions,
 )
 
 
@@ -63,26 +69,47 @@ def _accepted_boxes(coords, detector, area, band, width):
     return accepted
 
 
-def _scan(video_path, detector, area, band, step, raw_path, progress, expected_count):
+def _scan(video_path, detector, area, band, step, raw_path, progress, expected_count, local_audit=None):
     """Detect alternate frames; inspect intervening frames at layout/cut changes."""
     by0, by1 = band
     boxes, cuts, cache = [], [0], {}
     previous = previous_thumb = None
     detected_count = 0
+    local_frames, trigger_frames = set(), []
+    local_area = (area[0]-by0, area[1]-by0, area[2], area[3])
+    overlap_mode = False
 
-    def detect(index, frame):
+    def detect(index, frame, force_local=False):
         nonlocal detected_count
         if index not in cache:
             # Detector sees original pixels and applies its own max-side resize.
-            coords = detector.detect_subtitle(frame[by0:by1])
-            cache[index] = _accepted_boxes(coords, detector, area, band, frame.shape[1])
-            detected_count += 1
+            crop = frame[by0:by1]
+            coords = [] if force_local else detector.detect_subtitle(crop)
+            detected_count += int(not force_local)
+            anomaly = needs_local_ocr(coords, local_area)
+            accepted = _accepted_boxes(coords, detector, area, band, frame.shape[1])
+            # Missing wide-band OCR can also hide a subtitle on the first frame.
+            # Probe only a narrow selection, not the full image or a broad area.
+            empty_probe = not force_local and not accepted and area[1]-area[0] <= .15*frame.shape[0]
+            if force_local or anomaly or empty_probe:
+                local = local_ocr_boxes(crop, detector, local_area)
+                detected_count += 1
+                use_local = force_local or anomaly or bool(local)
+                cache[index] = local if use_local else accepted
+                if use_local:
+                    local_frames.add(index)
+                if anomaly or (empty_probe and local):
+                    trigger_frames.append(index)
+            else:
+                cache[index] = accepted
         return cache[index]
 
     def emit(index, frame, candidates, output):
         lines = merge_line_boxes(candidates)
         boxes.append(lines)
-        output.write(glyph_mask(frame[by0:by1], lines).tobytes())
+        crop = frame[by0:by1]
+        mask = outlined_local_mask(crop, lines, local_area) if index in local_frames else glyph_mask(crop, lines)
+        output.write(mask.tobytes())
 
     with raw_path.open('wb') as output:
         count = 0
@@ -91,16 +118,20 @@ def _scan(video_path, detector, area, band, step, raw_path, progress, expected_c
             cut = previous_thumb is not None and np.mean(np.abs(thumb-previous_thumb)) > 40
             if cut:
                 cuts.append(i)
-            sampled = i % step == 0 or cut
+            previous_overlap = overlap_mode
+            if cut:
+                overlap_mode = False
+            sampled = i % step == 0 or cut or overlap_mode
             if sampled:
-                current_boxes = detect(i, frame)
+                current_boxes = detect(i, frame, overlap_mode)
+                overlap_mode = i in local_frames
             if previous is not None and len(boxes) == i-1:
                 # Pending odd frame. Its adjacent even frames must share a shot
                 # and layout; otherwise actually run OCR rather than bridging it.
-                if not cut and sampled and same_layout(cache.get(i-2, []), current_boxes):
+                if not cut and not overlap_mode and not previous_overlap and sampled and same_layout(cache.get(i-2, []), current_boxes):
                     candidates = sorted(set(tuple(b) for b in cache.get(i-2, [])+current_boxes))
                 else:
-                    candidates = detect(i-1, previous)
+                    candidates = detect(i-1, previous, previous_overlap or (overlap_mode and not cut))
                 emit(i-1, previous, candidates, output)
             if sampled:
                 emit(i, frame, current_boxes, output)
@@ -117,12 +148,148 @@ def _scan(video_path, detector, area, band, step, raw_path, progress, expected_c
     if not count:
         raise ValueError('Video has no decodable frames')
     cuts.append(count)
+    if local_audit is not None:
+        local_audit.update(frames=sorted(local_frames), trigger_frames=trigger_frames)
     return boxes, list(zip(cuts, cuts[1:])), detected_count
 
 
-def _retry_shrunk_lines(video_path, boxes, shots, raw, detector, area, band, progress):
+def _retry_narrow_lines(video_path, boxes, shots, raw, detector, area, band, height, fps, progress):
+    """Retry anomalous/empty frames in a row inferred from current-video pixels.
+
+    Existing plausible lines (including short captions) keep their masks. A
+    current-frame confirmation renews the row for one second; it never crosses
+    a shot boundary. No full-resolution frames are cached between passes.
+    """
+    local_area = (area[0]-band[0], area[1]-band[0], area[2], area[3])
+    audit = dict(groups=[], frames=[], confirmed_frames=[], empty_frames=[], regions={},
+                 ocr_calls=0, region_coordinate_space='ocr_band_yxyx')
+    candidates = {i: [b for b in lines if subtitle_line_shape(b, height)
+                     and area[2] <= b[0] < b[1] <= area[3]
+                     and local_area[0] <= b[2] < b[3] <= local_area[1]]
+                  for i, lines in enumerate(boxes)}
+    normal = {i for i, lines in enumerate(boxes)
+              if any(subtitle_line_shape(b, height, min_aspect=.3) for b in lines)}
+    # Avoid even decoding again if there is no supported row or no anomaly.
+    eligible = [(a, b) for a, b in shots
+                if sum(bool(candidates[i]) for i in range(a, b)) >= 2
+                and any(i not in normal for i in range(a, b))]
+    candidates = {i: candidates[i] for a, b in eligible for i in range(a, b) if candidates[i]}
+    if not candidates:
+        return audit
+    anchors = {}
+    last_anchor = max(candidates)
+    last_decoded = -1
+    frames = _read_frames(video_path)
+    try:
+        for i, frame in enumerate(frames):
+            last_decoded = i
+            if i in candidates:
+                crop = frame[band[0]:band[1]]
+                anchors[i] = [b for b in candidates[i]
+                              if np.count_nonzero(outlined_local_mask(crop, [b], local_area)) >= 2*(b[3]-b[2])]
+            if i % 24 == 0:
+                progress('ocr_narrow', 25, f'verify_anchor_frame={i+1}')
+            if i >= last_anchor:
+                break
+    finally:
+        frames.close()
+    if last_decoded < last_anchor:
+        raise RuntimeError('Incomplete decode during narrow OCR anchor verification')
+    audit['groups'] = narrow_text_regions(anchors, shots, local_area)
+    if not audit['groups']:
+        return audit
+    groups = {g['shot']: g for g in audit['groups']}
+    ttl = max(1, round(fps))
+    shot = 0
+    last_confirmed = None
+    last_target = max(g['bounds'][1]-1 for g in groups.values())
+    last_decoded = -1
+    frames = _read_frames(video_path)
+    try:
+        for i, frame in enumerate(frames):
+            last_decoded = i
+            while i >= shots[shot][1]:
+                shot += 1
+                last_confirmed = None
+            group = groups.get(shot)
+            if group is not None:
+                anchor_frames = group['anchor_frames']
+                pos = bisect_left(anchor_frames, i)
+                nearby = anchor_frames[max(0, pos-1):pos+1]
+                nearest = min(abs(i-j) for j in nearby)
+                if nearest == 0:
+                    last_confirmed = i
+                if i not in normal and (nearest <= ttl or (
+                        last_confirmed is not None and i-last_confirmed <= ttl)):
+                    region = group['region']
+                    crop = frame[band[0]:band[1]]
+                    found = merge_line_boxes(local_ocr_boxes(crop, detector, region))
+                    mask = outlined_local_mask(crop, found, region)
+                    boxes[i] = found if mask.any() else []
+                    raw[i] = mask
+                    audit['frames'].append(i)
+                    audit['regions'][i] = region
+                    audit['ocr_calls'] += 1
+                    if mask.any():
+                        last_confirmed = i
+                        audit['confirmed_frames'].append(i)
+                    else:
+                        audit['empty_frames'].append(i)
+            if i % 24 == 0:
+                progress('ocr_narrow', 25, f'frame={i+1}, confirmed={len(audit["confirmed_frames"])}')
+            if i >= last_target:
+                break
+    finally:
+        frames.close()
+    if last_decoded < last_target:
+        raise RuntimeError('Incomplete decode during narrow OCR retry')
+    return audit
+
+
+def _recover_local_gaps(video_path, boxes, shots, raw, area, band, local_frames, regions=None):
+    """Repair isolated OCR blanks only when current outlined pixels agree with both sides.
+
+    Neighbor boxes provide a search region, never replacement mask pixels. This
+    prevents a real blank frame (potential clean reference) inheriting subtitles.
+    """
+    targets = {}
+    for a, b in shots:
+        for i in range(a+1, b-1):
+            if (i in local_frames and i-1 in local_frames and i+1 in local_frames
+                    and not boxes[i] and boxes[i-1] and same_layout(boxes[i-1], boxes[i+1])):
+                targets[i] = merge_line_boxes(boxes[i-1]+boxes[i+1])
+    if not targets:
+        return []
+    local_area = (area[0]-band[0], area[1]-band[0], area[2], area[3])
+    recovered = []
+    last_target = max(targets)
+    last_decoded = -1
+    frames = _read_frames(video_path)
+    try:
+        for i, frame in enumerate(frames):
+            last_decoded = i
+            if i in targets:
+                current = outlined_local_mask(frame[band[0]:band[1]], targets[i], (regions or {}).get(i, local_area))
+                def agrees(other):
+                    union = np.count_nonzero((current > 0) | (other > 0))
+                    return union > 0 and np.count_nonzero((current > 0) & (other > 0))/union >= .75
+                if agrees(raw[i-1]) and agrees(raw[i+1]):
+                    raw[i] = current
+                    boxes[i] = targets[i]
+                    recovered.append(i)
+            if i >= last_target:
+                break
+    finally:
+        frames.close()
+    if last_decoded < last_target:
+        raise RuntimeError('Incomplete decode during local OCR gap recovery')
+    return recovered
+
+
+def _retry_shrunk_lines(video_path, boxes, shots, raw, detector, area, band, progress, local_frames=()):
     """Re-detect selected current frames; never copy adjacent subtitle boxes."""
     targets = find_shrunk_lines(boxes, shots) if detector is not None else {}
+    targets = {i: value for i, value in targets.items() if i not in local_frames}
     retried, updated = [], []
     if not targets:
         return dict(frames=retried, updated_frames=updated)
@@ -158,6 +325,36 @@ def _retry_shrunk_lines(video_path, boxes, shots, raw, detector, area, band, pro
     return dict(frames=retried, updated_frames=updated)
 
 
+def _retry_short_lines(video_path, boxes, shots, raw, detector, area, band, height, fps, excluded, progress):
+    local_area = (area[0]-band[0], area[1]-band[0], area[2], area[3])
+    targets = short_text_regions(boxes, shots, local_area, height, fps, excluded)
+    audit = dict(frames=[], updated_frames=[], regions={}, region_coordinate_space='ocr_band_yxyx')
+    if not targets:
+        return audit
+    frames = _read_frames(video_path)
+    last_decoded = -1
+    last_target = max(targets)
+    try:
+        for i, frame in enumerate(frames):
+            last_decoded = i
+            if i in targets:
+                detected, extra = short_text_mask(frame[band[0]:band[1]], detector, targets[i])
+                audit['frames'].append(i)
+                audit['regions'][i] = targets[i]
+                if np.any((extra > 0) & (raw[i] == 0)):
+                    raw[i] |= extra
+                    boxes[i] = merge_line_boxes(boxes[i]+detected)
+                    audit['updated_frames'].append(i)
+                progress('ocr_short', 29, f'frame={i+1}, updated={len(audit["updated_frames"])}')
+            if i >= last_target:
+                break
+    finally:
+        frames.close()
+    if last_decoded < last_target:
+        raise RuntimeError('Incomplete decode during short subtitle recovery')
+    return audit
+
+
 def _make_model(mode, options):
     import torch
     from backend.tools.model_config import ModelConfig
@@ -187,7 +384,7 @@ def _make_model(mode, options):
     return model, str(device)
 
 
-def _infer(video_path, masks, jobs, band_y, options, folder, progress):
+def _infer(video_path, masks, jobs, band_y, options, folder, progress, local_frames=(), clean_candidates=()):
     model, device = _make_model(options['mode'], options)
     # Frame seeking is not exact for every MP4 (including files with a nonzero
     # start timestamp). OCR/render decode sequentially, so inference must use
@@ -220,15 +417,31 @@ def _infer(video_path, masks, jobs, band_y, options, folder, progress):
                 small_masks.append(resize_model_mask(mask))
             frame_hash = _mask_hash(frames)
             mask_hash = _mask_hash(small_masks)
-            # RAFT needs a pair for a one-frame shot. Duplicate within the shot;
-            # never borrow a frame from across the cut.
-            single_frame = len(frames) == 1 and options['mode'] == 'propainter'
-            if single_frame:
-                frames = frames*2
-                small_masks = small_masks*2
-            predictions = model.inpaint(frames, small_masks)
-            if single_frame:
-                predictions = predictions[:1]
+            reference, reference_audit = None, []
+            if options['mode'] == 'sttn' and any(i in local_frames for i in range(job['start'], job['stop'])):
+                eligible = {i-job['start'] for i in clean_candidates if job['start'] <= i < job['stop']}
+                reference, reference_audit = select_reference(frames, small_masks, eligible)
+            boundaries = [0, len(frames)]
+            if options['mode'] == 'propainter':
+                boundaries = photometric_boundaries(frames, small_masks)
+                predictions = []
+                for a, b in zip(boundaries, boundaries[1:]):
+                    segment, segment_masks = frames[a:b], small_masks[a:b]
+                    if not any(m.any() for m in segment_masks):
+                        predictions.extend(segment)
+                        continue
+                    # RAFT needs a pair; duplicate the same frame, not a neighbor
+                    # across the brightness boundary. No new pixels are composited.
+                    single = b-a == 1
+                    result = model.inpaint(segment*2 if single else segment,
+                                           segment_masks*2 if single else segment_masks)
+                    if len(result) != (2 if single else b-a):
+                        raise RuntimeError('Model returned incomplete segment predictions')
+                    predictions.extend(result[:b-a])
+            elif reference is None:
+                predictions = model.inpaint(frames, small_masks)
+            else:
+                predictions = model.inpaint(frames, small_masks, extra_reference_indices=[reference])
             if len(predictions) != job['stop']-job['start'] or any(p is None for p in predictions):
                 raise RuntimeError('Model returned incomplete predictions')
             predictions = np.stack(predictions)
@@ -240,7 +453,10 @@ def _infer(video_path, masks, jobs, band_y, options, folder, progress):
             if predictions.shape[1:] != (240, 432, 3):
                 raise RuntimeError('Unexpected model output geometry')
             np.save(folder/f'job{number:05}.npy', predictions)
-            records.append(dict(**job, input_sha256=frame_hash, mask_sha256=mask_hash))
+            records.append(dict(**job, input_sha256=frame_hash, mask_sha256=mask_hash,
+                                clean_reference_frame=None if reference is None else job['start']+reference,
+                                reference_candidates=reference_audit,
+                                photometric_cuts=[job['start']+i for i in boundaries[1:-1]]))
             progress(options['mode'], 45+40*(number+1)/len(jobs), f'chunk={number+1}/{len(jobs)}')
     finally:
         source_frames.close()
@@ -316,11 +532,24 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
     output = video_path.with_name(video_path.stem+'_glyph_'+options['mode']+'.mp4')
     with tempfile.TemporaryDirectory(prefix='glyph-', dir=video_path.parent) as tmp, ExitStack() as stack:
         folder = Path(tmp)
+        local_audit = {}
         boxes, shots, ocr_frames = _scan(video_path, detector, area, band,
-                                        options['ocr_sample_step'] or 2, folder/'raw.bin', progress, expected)
+                                        options['ocr_sample_step'] or 2, folder/'raw.bin', progress, expected, local_audit)
+        local_frames = set(local_audit.get('frames', []))
         shape = (len(boxes), band[1]-band[0], width)
         raw = _disk_map(stack, folder/'raw.bin', shape, 'r+')
-        retries = _retry_shrunk_lines(video_path, boxes, shots, raw, retry_detector, area, band, progress)
+        # Recover short captions before narrow-row retries can label their
+        # missed frames as empty/local and exclude them from short recovery.
+        short_retries = _retry_short_lines(video_path, boxes, shots, raw, detector, area, band,
+                                           height, fps, local_frames, progress)
+        narrow_retries = _retry_narrow_lines(video_path, boxes, shots, raw, detector, area, band,
+                                             height, fps, progress)
+        local_frames.update(narrow_retries['frames'])
+        local_audit['frames'] = sorted(local_frames)
+        ocr_frames += narrow_retries['ocr_calls']
+        local_audit['pixel_recovered_frames'] = _recover_local_gaps(
+            video_path, boxes, shots, raw, area, band, local_frames, narrow_retries['regions'])
+        retries = _retry_shrunk_lines(video_path, boxes, shots, raw, retry_detector, area, band, progress, local_frames)
         stable = _disk_map(stack, folder/'stable.bin', shape)
         stabilize_masks(raw, shots, stable)
         progress('mask', 30, 'temporal_stabilization')
@@ -329,7 +558,8 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
         for i, frame in enumerate(_read_frames(video_path)):
             if i >= len(boxes):
                 raise RuntimeError('Frame count changed during border recovery')
-            revised[i] = raw[i] | recover_vertical_border(frame[band[0]:band[1]], boxes[i], stable[i])
+            # Unconstrained recovery would re-admit the background title strokes.
+            revised[i] = raw[i] if i in local_frames else raw[i] | recover_vertical_border(frame[band[0]:band[1]], boxes[i], stable[i])
             decoded += 1
             if i % 24 == 0:
                 progress('mask', 30+10*decoded/len(boxes), 'recover_outline')
@@ -341,17 +571,22 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
         if not jobs:
             raise NoGlyphsError('OCR/glyph detection produced no editable white outlined text; check sub_area or use mask_strategy=rectangle')
         progress('mask', 45, f'ready chunks={len(jobs)}')
-        records, device = _infer(video_path, masks, jobs, band[0], options, folder, progress)
+        clean_candidates = {i for i in local_frames if not boxes[i] and not masks[i].any()}
+        records, device = _infer(video_path, masks, jobs, band[0], options, folder, progress,
+                                 local_frames, clean_candidates)
         silent = folder/'silent.mp4'
         active = _render(video_path, masks, jobs, band[0], folder, silent, fps, (width, height), progress)
         progress('finalize', 98, 'audio_mux')
         mux_audio(silent, video_path, output)
-        audit = dict(profile='glyph_v4', mode=options['mode'], device=device, frames=len(boxes),
+        audit = dict(profile='glyph_v5', mode=options['mode'], device=device, frames=len(boxes),
                      fps=fps, size=[width, height], area=list(area), band=list(band),
                      ocr_frames=ocr_frames, shots=shots, jobs=records, active_mask_frames=active,
                      ocr_max_side=options.get('glyph_ocr_max_side', 640),
                      ocr_retry_max_side=960 if retry_detector is not None else None,
                      ocr_retry_frames=retries['frames'], ocr_retry_updated_frames=retries['updated_frames'],
+                     local_ocr=local_audit, clean_reference_policy='sttn_local_ocr_same_window',
+                     narrow_ocr=narrow_retries,
+                     short_ocr=short_retries, photometric_policy='propainter_coherent_luma_shift',
                      masks_sha256=_mask_hash(masks), model_input_size=[432, 240],
                      chunk_size=80, overlap=20, feather_sigma=2, glyph_dilation=5,
                      frame_decode='sequential', mask_coverage_guard='outlined_pixels_in_ocr_line',

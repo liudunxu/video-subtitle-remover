@@ -171,11 +171,14 @@ class STTNDetInpaint:
         # 返回参考帧索引列表
         return ref_index
 
-    def inpaint(self, frames: List[np.ndarray], masks: List[np.ndarray]):
+    def inpaint(self, frames: List[np.ndarray], masks: List[np.ndarray], extra_reference_indices=()):
         """
         使用STTN完成空洞填充（空洞即被遮罩的区域）
         """
         frame_length = len(frames)
+        extra_reference_indices = sorted(set(extra_reference_indices))
+        if any(not isinstance(i, int) or not 0 <= i < frame_length for i in extra_reference_indices):
+            raise ValueError('Reference index outside the current model window')
         # 对帧进行预处理转换为张量，并进行归一化
         feats = _to_tensors(frames).unsqueeze(0) * 2 - 1
 
@@ -201,6 +204,8 @@ class STTNDetInpaint:
                 neighbor_ids = [i for i in range(max(0, f - self.neighbor_stride), min(frame_length, f + self.neighbor_stride + 1))]
                 # 获取参考帧的索引
                 ref_ids = self.get_ref_index(neighbor_ids, frame_length)
+                if extra_reference_indices:
+                    ref_ids = sorted(set(ref_ids + [i for i in extra_reference_indices if i not in neighbor_ids]))
                 # 通过模型推断特征并传递给解码器以生成完成的帧
                 pred_feat = self.model.infer(
                     feats[0, neighbor_ids + ref_ids, :, :, :], masks_tensor[0, neighbor_ids + ref_ids, :, :, :])

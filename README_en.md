@@ -101,7 +101,61 @@ area can still reject a line under the default full-box containment rule. The
 area is an OCR acceptance window, not a rectangular repaint mask. The default strategy remains
 `rectangle`. Colored/moving captions and other fonts are not validated.
 
-`glyph_v4` (2026-10-30) uses real PaddleOCR detection, per-frame glyph/outline
+`glyph_v5` adds automatic local OCR recovery, without a new option. A tall
+wide-band detection crossing `sub_area` triggers OCR cropped to that selection.
+An empty accepted detection also probes a narrow selection (height <=15% of the
+image); a successful probe activates recovery. Recovery uses per-frame local
+OCR for the remainder of that shot and resets at cuts. It rejects crop-edge,
+oversized and non-horizontal boxes, keeps white components with dark outlines,
+clips masks to the selection, and bypasses unrestricted border/shrink recovery.
+An isolated empty detection is recovered only if both adjacent same-shot boxes
+agree and outlined pixels extracted from the current image have mask IoU >=0.75
+with both neighbors. Neighbor masks are never copied into the blank frame.
+
+For these recovery windows, STTN automatically adds at most one clean reference
+from the existing same-shot, <=80-frame window. Candidates must have no accepted
+local OCR box or mask, retain matching background structure and lose the original
+subtitle pattern. Changing glyph layouts, motion or insufficient evidence cause
+abstention; ordinary interval references remain unchanged. Selection reuses
+432x240 inputs. There is no cross-window search. ProPainter shares local OCR and
+masks but does not receive extra references; rectangle processing is unchanged.
+Audit `local_ocr` records trigger/recovery indices; each job records
+`clean_reference_frame` (null when absent) and `reference_candidates` with local
+indices and rejection reasons. A suitably narrow area is still needed; persistent
+OCR misses, colored subtitles and moving scenes are not guaranteed to recover.
+
+The same `glyph_v5` also includes two automatic fixes, with no additional options:
+
+Line merging keeps OCR boxes separate when their heights differ by more than 2x,
+so a tall background detection cannot swallow a normal subtitle row. Short-glyph
+recovery runs before automatic narrow-row retries; recovered short captions keep
+their masks instead of being replaced by empty narrow detections. The outlined-pixel
+constraints for overlapping background text remain unchanged.
+
+- **Short-glyph retries and upper marks:** at least two aligned short detections
+  within half a second (capped at 15 frames on each side) in the same shot propose
+  an area-clipped OCR crop. If no valid short box is found, retry the same crop
+  once at 2x size and map detections back to source coordinates. Actual current-frame
+  local detections and strong white,
+  dark-outlined body pixels are required; detached marks above the body can then
+  be covered. Neighbor frames supply search locations, never replacement glyphs.
+  Ordinary long captions and the overlap-local path above are excluded. Captions
+  with no short detection anchors remain unrecoverable. Audit `short_ocr` records
+  retries, updates and `[ymin,ymax,xmin,xmax]` regions relative to the OCR band.
+  Only when candidates exist does this add a sequential decode and local OCR.
+- **ProPainter brightness isolation:** within each existing window, split when
+  the absolute median unmasked grayscale change exceeds 6 and at least 75% of
+  valid pixels change by more than 3 in that direction. At least 20% of the input
+  must be unmasked background. This prevents bright flash frames propagating
+  into normal frames while excluding ordinary local motion and subtitle changes.
+  Singleton segments duplicate themselves for optical flow and retain one output;
+  empty-mask segments pass through. Output length/timing and STTN segmentation
+  stay unchanged. Audit `jobs[].photometric_cuts` contains zero-based video indices.
+
+Background blur/distortion can remain; short-clip validation does not establish
+quality across all fonts, movement and exposure transitions.
+
+`glyph_v5` (2026-10-30) uses real PaddleOCR detection, per-frame glyph/outline
 masks with 5px dilation, disconnected-accent and clipped-stroke recovery, and
 scene-local temporal stabilization. If outlined bright pixels still escape a
 glyph mask, local growth around those pixels repairs coverage without filling
@@ -112,7 +166,7 @@ Clipped-symbol recovery searches farther above/below each OCR line, accepting
 only small outlined components crossing the old search boundary, aligned with
 existing glyph columns and containing a substantial strong white core. The white
 core gate rejects pale fabric threads in the tested negative case. Both engines
-and OCR retries share this extraction. Audit files identify `profile=glyph_v4`
+and OCR retries share this extraction. Audit files identify `profile=glyph_v5`
 and `clipped_symbol_recovery=aligned_strong_white_components`. Validation covers
 three 50-frame My Poet clips near 31/90/119 seconds, not every font or full video.
 The dubbing UI allows users to adjust the removal area. Caller-supplied `sub_area`
