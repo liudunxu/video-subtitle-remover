@@ -120,20 +120,63 @@ def latest_digest() -> str:
 
 
 def list_instances(key: str, cols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-    """List instances using the v1 endpoint (v0 /instances/ is deprecated)."""
-    select_cols = urllib.parse.quote(json.dumps(cols or ["id", "label", "actual_status", "cur_state", "status_msg", "ports", "public_ipaddr"]))
-    url = f"{BASE_URL_V1}/instances/?select_cols={select_cols}&limit=50"
-    resp = requests.get(url, headers=_headers(key), timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("instances", []) or []
+    """List every visible instance, failing closed if a page cannot be read."""
+    params = {
+        "select_cols": json.dumps(cols or [
+            "id", "label", "actual_status", "cur_state", "status_msg", "ports", "public_ipaddr",
+        ]),
+        "order_by": json.dumps([{"col": "id", "dir": "asc"}]),
+        "limit": 50,
+    }
+    instances: List[Dict[str, Any]] = []
+    seen_tokens: Set[str] = set()
+    while True:
+        resp = requests.get(
+            f"{BASE_URL_V1}/instances/", headers=_headers(key), params=params.copy(), timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if (
+            not isinstance(data, dict)
+            or data.get("success") is not True
+            or not isinstance(data.get("instances"), list)
+            or "next_token" not in data
+        ):
+            raise RuntimeError("Invalid Vast instance list response; refusing to use an incomplete list.")
+        instances.extend(data["instances"])
+        token = data["next_token"]
+        if token is None or token == "":
+            return instances
+        if not isinstance(token, str) or token in seen_tokens:
+            raise RuntimeError("Invalid or repeated Vast instance page token; refusing to use an incomplete list.")
+        seen_tokens.add(token)
+        params["after_token"] = token
+
+
+def is_project_label(label: Any) -> bool:
+    return isinstance(label, str) and label.startswith(LABEL_PREFIX)
+
+
+def require_project_label(label: str) -> None:
+    if not is_project_label(label):
+        raise ValueError(f"Instance label must start with '{LABEL_PREFIX}'.")
 
 
 def matching_instances(instances: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [i for i in instances if (i.get("label") or "").startswith(LABEL_PREFIX)]
+    return [i for i in instances if is_project_label(i.get("label"))]
 
 
 def destroy_instance(key: str, instance_id: int) -> Dict[str, Any]:
+    # Labels can change after the initial list; check again before deleting.
+    current = get_instance(key, instance_id)
+    if (
+        current is None
+        or str(current.get("id")) != str(instance_id)
+        or not is_project_label(current.get("label"))
+    ):
+        raise ValueError(
+            f"Instance {instance_id} is missing or no longer has the project label; refusing to delete it."
+        )
     resp = requests.delete(
         f"{BASE_URL}/instances/{instance_id}/", headers=_headers(key), timeout=60
     )
@@ -185,6 +228,7 @@ def create_instance(
     disk: int = DEFAULT_DISK,
     env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
+    require_project_label(label)
     body: Dict[str, Any] = {
         "image": image,
         "label": label,
@@ -211,8 +255,13 @@ def get_instance(key: str, instance_id: int) -> Optional[Dict[str, Any]]:
     resp = requests.get(url, headers=_headers(key), timeout=60)
     resp.raise_for_status()
     data = resp.json()
-    instances = data.get("instances") or []
-    return instances[0] if instances else None
+    if (
+        not isinstance(data, dict)
+        or data.get("success") is not True
+        or not isinstance(data.get("instances"), list)
+    ):
+        raise RuntimeError("Invalid Vast instance lookup response.")
+    return next((i for i in data["instances"] if str(i.get("id")) == str(instance_id)), None)
 
 
 def instance_logs(key: str, instance_id: int, tail: str = "800") -> str:
@@ -396,6 +445,7 @@ def cmd_stop(key: str, args: argparse.Namespace) -> int:
         return 0
 
     print(f"Deleting {len(matches)} matching instance(s)...")
+    failed = False
     for i in matches:
         iid = i["id"]
         label = i.get("label", "")
@@ -404,7 +454,8 @@ def cmd_stop(key: str, args: argparse.Namespace) -> int:
         try:
             destroy_instance(key, iid)
             print(f"  Deleted {iid}.")
-        except requests.HTTPError as e:
+        except (requests.RequestException, ValueError, RuntimeError) as e:
+            failed = True
             print(f"  Failed to delete {iid}: {e}", file=sys.stderr)
 
     # Verify
@@ -414,11 +465,19 @@ def cmd_stop(key: str, args: argparse.Namespace) -> int:
         for i in remaining:
             print(f"  {i['id']} {i.get('label')}", file=sys.stderr)
         return 1
+    if failed:
+        print("WARNING: Some instances were not deleted; see errors above.", file=sys.stderr)
+        return 1
     print("All matching instances deleted.")
     return 0
 
 
 def cmd_start(key: str, args: argparse.Namespace) -> int:
+    try:
+        require_project_label(args.label)
+    except ValueError as e:
+        _die(f"Error: {e}")
+
     image = args.image
     if not image:
         digest = latest_digest()
@@ -428,7 +487,17 @@ def cmd_start(key: str, args: argparse.Namespace) -> int:
     # 1. Check existing
     instances = list_instances(key)
     matches = matching_instances(instances)
-    running = [i for i in matches if i.get("actual_status") == "running"]
+    running = []
+    for instance in matches:
+        if instance.get("actual_status") != "running":
+            continue
+        current = get_instance(key, instance["id"])
+        if (
+            current
+            and is_project_label(current.get("label"))
+            and current.get("actual_status") == "running"
+        ):
+            running.append(current)
     if running:
         print("Found existing running instance(s); reusing the first one.")
         for i in running:
@@ -438,7 +507,7 @@ def cmd_start(key: str, args: argparse.Namespace) -> int:
 
     if matches:
         print(
-            f"WARNING: Found {len(matches)} non-running matching instance(s). "
+            f"WARNING: Found {len(matches)} matching instance(s), but none remain running. "
             "Continuing to create a new one."
         )
 

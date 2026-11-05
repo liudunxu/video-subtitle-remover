@@ -346,6 +346,8 @@ python scripts/vast_ai_manager.py stop     # delete all matching instances
 python scripts/vast_ai_manager.py logs <instance_id>
 ```
 
+`start --label` must begin with `video-subtitle-remover-api-`. The manager paginates through instances and rechecks labels before reuse or deletion; `stop` destroys every instance with that prefix, including stopped instances. Labels are the selection boundary, so other services must use a different prefix.
+
 See the full operations runbook (Chinese): [docs/vast_ai_gpu_service_runbook_zh.md](docs/vast_ai_gpu_service_runbook_zh.md).
 
 ## Development & Testing

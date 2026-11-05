@@ -381,6 +381,8 @@ python scripts/vast_ai_manager.py stop     # 删除全部匹配实例
 python scripts/vast_ai_manager.py logs <instance_id>
 ```
 
+`start --label` 的值必须以 `video-subtitle-remover-api-` 开头。脚本分页读取实例，复用或销毁前会再次核对标签；`stop` 会销毁所有匹配该前缀的实例，包括已停止的实例。标签是筛选依据，请勿让其他服务共用此前缀。
+
 详细运维手册见 [docs/vast_ai_gpu_service_runbook_zh.md](docs/vast_ai_gpu_service_runbook_zh.md)。
 
 ## 开发与测试
