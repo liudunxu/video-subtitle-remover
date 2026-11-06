@@ -98,6 +98,7 @@ packages = ["backend", "."]
 
 [tool.hatch.build.targets.wheel.force-include]
 "api.py" = "api.py"
+"async_jobs.py" = "async_jobs.py"
 
 [tool.uv]
 dev-dependencies = [

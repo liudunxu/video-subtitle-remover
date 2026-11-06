@@ -50,7 +50,7 @@ RUN python --version \
 
 WORKDIR /app
 
-COPY requirements.txt pyproject.toml README.md api.py /app/
+COPY requirements.txt pyproject.toml README.md api.py async_jobs.py /app/
 COPY backend/ /app/backend/
 COPY docker/entrypoint-api-gpu.sh /usr/local/bin/vsr-api-gpu-entrypoint
 COPY docker/runtime_code.sh /usr/local/lib/vsr-runtime-code.sh

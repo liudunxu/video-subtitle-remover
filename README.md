@@ -84,6 +84,8 @@ options:
 | `/api/capabilities` | GET | 能力清单：modes / ocr_presets / 特性开关 / 别名使用量 |
 | `/api/status` | GET | 服务状态：版本 / 运行时长 / 工作目录 / 磁盘余量 / 活跃任务数 |
 | `/api/remove-subtitle` | POST | 提交字幕擦除任务（别名 `/api/remove`、`/remove`，别名响应带 `Deprecation` 头） |
+| `/api/jobs/remove-subtitle` | POST | 异步上传并持久登记字幕擦除任务 |
+| `/api/jobs/{job_id}` | GET | 查询异步任务状态和成功后的相对下载地址 |
 | `/api/detect-subtitle-area` | POST | 自动检测字幕区域（别名 `/api/detect`、`/detect-subtitle-area`） |
 | `/api/progress/{job_id}` | GET | 轮询任务进度（phase / percent / stage） |
 | `/download/{job_id}/{filename}` | GET | 下载处理结果 |
@@ -92,7 +94,48 @@ options:
 
 以下示例的服务地址为 `http://127.0.0.1:6006`；访问 Vast.ai 时替换为实例当前的公网 IP 和映射端口，可用 `python scripts/vast_ai_manager.py status` 查询。`GET /health` 中的 `runtime_commit_id` / `runtime_source` 可用于核对线上代码版本。
 
-### 擦除：POST /api/remove-subtitle
+### 异步擦除：POST /api/jobs/remove-subtitle
+
+先部署支持异步接口的 VSR，再部署调用此接口的 DIS。`GET /api/capabilities` 的
+`features.async_jobs=true` 表示支持该契约；旧同步接口继续保留。
+
+客户端使用 multipart 的 `video` 和 `payload` 字段，必须通过 `X-Job-Id` 提供稳定 ID
+（1–64 个字母、数字、下划线或连字符）。服务在完整接收视频、校验请求并将输入和状态
+持久化后返回 HTTP 202；任务排队期间可查询，不需保持 HTTP 请求。例：
+
+```shell
+curl --fail-with-body -sS http://127.0.0.1:6006/api/jobs/remove-subtitle \
+  -H 'X-Job-Id: example-episode-1' \
+  -F 'payload={"sub_area":[900,1000,100,1800],"options":{"mode":"propainter","mask_strategy":"glyph"}}' \
+  -F 'video=@input.mp4;type=video/mp4'
+curl --fail-with-body -sS http://127.0.0.1:6006/api/jobs/example-episode-1
+```
+
+状态为 `receiving`、`queued`、`running`、`succeeded`、`failed` 或 `unknown`。
+成功结果带同源相对 `download_url` 和 `fallback_triggered`；已知 ID 的重复提交会
+核验上传内容与参数，完全一致返回原任务（HTTP 200），不同内容返回 HTTP 409
+`JOB_INPUT_CONFLICT`；上传中的并发重复提交返回 HTTP 409 `JOB_RECEIVING`。
+提交响应丢失时先查同一个 job ID，不得创建新 ID 盲目重试。
+
+`GET /api/capabilities` 顶层的 `job_store_id` 标识当前工作目录，调用方可在提交和查询
+和结果下载请求中携带 `X-Job-Store-Id`；标识不匹配返回 HTTP 409 `JOB_STORE_MISMATCH`。
+`VSR_ASYNC_MAX_PENDING` 默认 16，限制接收、排队及运行中的作业总数；容量不足返回
+HTTP 429 `QUEUE_FULL`，不创建作业。可在 payload 中设置 Unix 秒 `queue_deadline_at`，
+作为最晚启动时间；排队超期返回 `failed` / `QUEUE_EXPIRED`，不会中断已运行任务。
+异步请求体接收总时限由 `VSR_ASYNC_RECEIVE_TIMEOUT_SECONDS` 控制，默认 3600 秒。
+
+VSR 重启会恢复持久化的 `queued` 作业；原处于 `receiving` 的中断作业标记为
+`failed` / `RECEIVE_INTERRUPTED`，原处于 `running` 的作业标记为 `unknown`，
+必须先确认原作业状态，不自动重跑。服务按 job 目录 TTL（默认 6 小时）
+定期回收已完成、失败或未知作业的大文件；上传、排队、执行和下载中的文件不会被清理。
+过期的成功结果返回 `failed` / `RESULT_EXPIRED`（作业已完成，结果不可用，可以发起新的作业），任务身份与指纹作为小型记录保留，
+避免清理后同 ID 被当成新任务。客户端应保存 job ID 和实例地址；作业查询到 404、
+实例不可达或 `unknown` 都不能证明之前没有执行。状态及文件存放在该 VSR 实例的
+工作目录；实例丢失时不能保证跨机器恢复。
+后台清理检查到工作目录所在磁盘可用空间不超过 10% 时输出 `vsr_disk_low` 日志；
+实际通知需要在现有日志监控中配置该事件的告警规则。
+
+### 同步擦除：POST /api/remove-subtitle
 
 两种视频输入方式（二选一）：
 

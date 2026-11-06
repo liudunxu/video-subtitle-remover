@@ -11,12 +11,15 @@ import threading
 import time
 import traceback
 import uuid
+from contextlib import nullcontext
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+
+from async_jobs import ACTIVE_STATUSES, STATE_NAME, AsyncJobs, JobConflict, ResultUncertain, valid_state
 
 
 # Mitigate Paddle CUDNN non-deterministic failures on repeated runs
@@ -33,7 +36,10 @@ MAX_BODY_BYTES = 1024 * 1024
 MAX_UPLOAD_BYTES = int(os.environ.get("VSR_API_MAX_UPLOAD_MB", "2048")) * 1024 * 1024
 MAX_DOWNLOAD_BYTES = int(os.environ.get("VSR_API_MAX_DOWNLOAD_MB", "2048")) * 1024 * 1024
 DOWNLOAD_TIMEOUT_SECONDS = int(os.environ.get("VSR_API_DOWNLOAD_TIMEOUT", "300"))
-PROCESS_LOCK = threading.Lock()
+# Bound how long a partially uploaded async job can hold an admission slot.
+# This is a total receive deadline, including slow clients that keep trickling.
+ASYNC_RECEIVE_TIMEOUT_SECONDS = int(os.environ.get("VSR_ASYNC_RECEIVE_TIMEOUT_SECONDS", "3600"))
+PROCESS_LOCK = threading.RLock()
 # Live progress registry: {job_id: {phase, percent, stage, updated_at}}
 #   phase: "sttn" | "refine" | "residual" | "stitch" | "finalize" | "done" | "error"
 #   percent: 0-100 (within the current phase, except for the very first "sttn"
@@ -63,6 +69,14 @@ _JOB_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 JOB_DIR_TTL_SECONDS = int(os.environ.get("VSR_API_JOB_TTL_SECONDS", str(6 * 3600)))
 _JANITOR_INTERVAL_SECONDS = 600
 _last_janitor_at = 0.0
+_JANITOR_LOCK = threading.Lock()
+# Protect an open result download from the janitor. The lock is held only
+# while opening/closing a file, not throughout a potentially slow transfer.
+_DOWNLOAD_LOCK = threading.Lock()
+_DOWNLOAD_COUNTS: dict = {}
+# Unlike progress records, a synchronous request remains active until its
+# handler returns, including upload, GPU-lock waiting and silent processing.
+_SYNC_ACTIVE_COUNTS: dict = {}
 # Per-job throttle for stdout PROGRESS lines: {job_id: (phase, 10%-bucket)}.
 # We only print on phase change, every 10% within a phase, or on terminal
 # states — keeps the api-server log readable during long removals.
@@ -94,30 +108,94 @@ def _prune_active_jobs():
 
 
 def _sweep_stale_job_dirs():
-    """删除磁盘上超过 JOB_DIR_TTL_SECONDS 且不在活跃注册表内的 job 目录。
-    最多每 _JANITOR_INTERVAL_SECONDS 扫一遍，调用点是 progress 轮询与 POST。"""
+    """Expire artifacts, retaining asynchronous job identities for deduplication."""
     global _last_janitor_at
     now = time.time()
-    if now - _last_janitor_at < _JANITOR_INTERVAL_SECONDS:
-        return
-    _last_janitor_at = now
-    jobs_root = WORK_DIR / "jobs"
-    try:
-        entries = list(jobs_root.iterdir())
-    except OSError:
-        return
-    for entry in entries:
+    with _JANITOR_LOCK:
+        if now - _last_janitor_at < _JANITOR_INTERVAL_SECONDS:
+            return
+        _last_janitor_at = now
         try:
-            if not entry.is_dir():
-                continue
-            with _ACTIVE_JOBS_LOCK:
-                if entry.name in _ACTIVE_JOBS:
-                    continue
-            if now - entry.stat().st_mtime > JOB_DIR_TTL_SECONDS:
-                shutil.rmtree(entry, ignore_errors=True)
-                print(f"INFO: swept stale job dir {entry.name}")
+            entries = list((WORK_DIR / "jobs").iterdir())
         except OSError:
-            continue
+            return
+        # All asynchronous state transitions use manager.lock. Never race an
+        # uploader or worker when deciding whether the job is safe to expire.
+        manager = _ASYNC_MANAGERS.get(WORK_DIR.resolve())
+        for entry in entries:
+            try:
+                with manager.lock if manager is not None else nullcontext():
+                    if not entry.is_dir() or entry.is_symlink():
+                        continue
+                    with _ACTIVE_JOBS_LOCK:
+                        if entry.name in _ACTIVE_JOBS:
+                            continue
+                    state_file = entry / STATE_NAME
+                    if state_file.exists():
+                        if manager is None:
+                            # Without the owning manager we cannot synchronize
+                            # safely with an asynchronous worker or receiver.
+                            continue
+                        with _DOWNLOAD_LOCK:
+                            if _DOWNLOAD_COUNTS.get(entry.name) or _SYNC_ACTIVE_COUNTS.get(entry.name):
+                                continue
+                            state = manager._read(entry.name)
+                            error = state.get("error") if isinstance(state, dict) else None
+                            if (not valid_state(state, entry.name)
+                                    or (isinstance(error, dict) and error.get("code") == "JOB_STATE_UNREADABLE")
+                                    or state["status"] in {"receiving", "queued", "running"}):
+                                continue
+                            if state.get("artifacts_cleaned_at"):
+                                continue
+                            if (not state.get("artifacts_expired_at") and
+                                    now - max(entry.stat().st_mtime, state.get("updated_at", 0)) <= JOB_DIR_TTL_SECONDS):
+                                continue
+                            if not state.get("artifacts_expired_at"):
+                                if state["status"] == "succeeded":
+                                    state.pop("result", None)
+                                    # This job definitely completed; only its
+                                    # retained output expired. A new attempt is
+                                    # safe, while this ID remains a tombstone.
+                                    state.update(status="failed", error={"code": "RESULT_EXPIRED"})
+                                state["artifacts_expired_at"] = now
+                                manager._write(entry.name, state)
+                            for artifact in entry.iterdir():
+                                if artifact.name in {STATE_NAME, ".async-job.lock"}:
+                                    continue
+                                if artifact.is_dir() and not artifact.is_symlink():
+                                    shutil.rmtree(artifact)
+                                else:
+                                    artifact.unlink(missing_ok=True)
+                            # Record completion only after every artifact was
+                            # removed. An interrupted/failed sweep must retry.
+                            state["artifacts_cleaned_at"] = now
+                            manager._write(entry.name, state)
+                            print(f"INFO: swept stale async artifacts {entry.name}")
+                        continue
+                    with _DOWNLOAD_LOCK:
+                        if _DOWNLOAD_COUNTS.get(entry.name) or _SYNC_ACTIVE_COUNTS.get(entry.name):
+                            continue
+                        if now - entry.stat().st_mtime > JOB_DIR_TTL_SECONDS:
+                            shutil.rmtree(entry)
+                            print(f"INFO: swept stale job dir {entry.name}")
+            except (OSError, TypeError, ValueError) as exc:
+                # Keep uncertain artifacts for a later retry and avoid exposing
+                # file paths or exception text in logs.
+                print(f"WARNING: job cleanup failed job={entry.name} error_type={type(exc).__name__}", flush=True)
+
+
+def _janitor_loop(stop):
+    """Clean even when only asynchronous endpoints are being used or idle."""
+    while not stop.wait(_JANITOR_INTERVAL_SECONDS):
+        try:
+            _prune_active_jobs()
+            usage = shutil.disk_usage(str(WORK_DIR))
+            if usage.total and usage.free * 10 <= usage.total:
+                # Structured log for existing log-based alerting; no paths or
+                # user media metadata are included.
+                print(f"WARNING: vsr_disk_low free_bytes={usage.free} total_bytes={usage.total}", flush=True)
+        except Exception as exc:
+            print(f"WARNING: job cleanup failed error_type={type(exc).__name__}", flush=True)
 
 
 def _get_job_progress(job_id):
@@ -624,6 +702,7 @@ def _read_multipart(handler, job_dir):
         "value_chunks": [],
     }
     uploaded_path = None
+    multipart_complete = False
 
     def on_part_begin():
         part["header_name"] = b""
@@ -686,6 +765,10 @@ def _read_multipart(handler, job_dir):
         else:
             payload[key] = _maybe_json_field(value)
 
+    def on_end():
+        nonlocal multipart_complete
+        multipart_complete = True
+
     callbacks = {
         "on_part_begin": on_part_begin,
         "on_header_field": on_header_field,
@@ -694,17 +777,33 @@ def _read_multipart(handler, job_dir):
         "on_headers_finished": on_headers_finished,
         "on_part_data": on_part_data,
         "on_part_end": on_part_end,
+        "on_end": on_end,
     }
     parser = MultipartParser(boundary, callbacks)
     try:
         remaining = body_size
+        receive_deadline = getattr(handler, "_async_receive_deadline", None)
         while remaining > 0:
-            chunk = handler.rfile.read(min(1024 * 1024, remaining))
+            read_size = min(1024 * 1024, remaining)
+            if receive_deadline is not None:
+                budget = receive_deadline - time.monotonic()
+                if budget <= 0:
+                    raise TimeoutError("async upload deadline exceeded")
+                handler.connection.settimeout(budget)
+                # read1 makes at most one underlying socket read, so a client
+                # sending a few bytes at a time cannot reset the total budget.
+                chunk = handler.rfile.read1(read_size)
+            else:
+                chunk = handler.rfile.read(read_size)
             if not chunk:
                 break
             remaining -= len(chunk)
             parser.write(chunk)
         parser.finalize()
+        if remaining or not multipart_complete:
+            raise RequestError(HTTPStatus.BAD_REQUEST, "Incomplete multipart body")
+    except TimeoutError as exc:
+        raise RequestError(HTTPStatus.REQUEST_TIMEOUT, "Async upload timed out") from exc
     except RequestError:
         raise
     except Exception as exc:
@@ -3698,8 +3797,276 @@ def _runtime_version():
     return _RUNTIME_VERSION
 
 
+def _process_removal(payload, job_id, job_dir, started_at, request_id, make_download_url):
+    """Execute the common synchronous/async removal path and return its result."""
+    uploaded_video_path = payload.get("_uploaded_video_path")
+    video_url = payload.get("video_url") or payload.get("url")
+    if uploaded_video_path:
+        source_path = Path(str(uploaded_video_path)).resolve()
+        if not source_path.is_file():
+            raise RequestError(HTTPStatus.BAD_REQUEST, "Uploaded video is missing")
+    elif not isinstance(video_url, str) or not video_url.strip():
+        raise RequestError(HTTPStatus.BAD_REQUEST, "video_url is required")
+    else:
+        source_path = None
+
+    filename_hint = _safe_filename(str(payload.get("filename") or "input.mp4"))
+    area = _normalize_area(payload)
+    options = _normalize_options(payload)
+    refine_area = _normalize_refine_area(payload) if options.get("post_lama_refine") else None
+    if source_path is None:
+        source_path = _stage_video(video_url.strip(), job_dir, filename_hint)
+
+    # 调用方显式传入的 sub_area：按需扩边 + clamp 到帧内。
+    # 不自动扩边（sub_area_margin 默认 0）——STTN_DET 下这个矩形是
+    # OCR 的接受窗口，服务端悄悄放宽会把区域外的水印/台标也擦掉。
+    # 需要放宽的调用方（尤其 sttn_skip_detection / 空检测兜底这类
+    # 矩形即 mask 的路径）显式传 sub_area_margin。
+    if area is not None:
+        geometry = _probe_video_stream_geometry(source_path)
+        if geometry:
+            frame_w, frame_h = int(geometry["width"]), int(geometry["height"])
+            expanded = _expand_sub_area(area, frame_w, frame_h, options["sub_area_margin"])
+            if expanded != list(area):
+                print(
+                    f"INFO: job={job_id} sub_area {list(area)} -> {expanded} "
+                    f"(margin={options['sub_area_margin']}, frame={frame_w}x{frame_h})"
+                )
+            area = tuple(expanded)
+        else:
+            print(
+                f"WARN: job={job_id} cannot probe frame size; "
+                f"sub_area {list(area)} used as-is (no margin/clamp applied)"
+            )
+
+    # 未传 sub_area 时先自动识别字幕区域（默认开启）：
+    # 复用 /api/detect-subtitle-area 的检测逻辑把擦除范围收窄到真实
+    # 字幕带；识别失败或为空时退回全帧处理。
+    auto_detected_area = False
+    if area is None and options.get("auto_detect_area", True):
+        try:
+            detect_options = _normalize_detect_options(payload)
+            # 擦除用途把横向 padding 放宽到 >=96px：自动识别的区域只是
+            # 检测/修边的作用范围，宁宽勿窄——detect 默认的 16px 曾把
+            # 字幕左右边缘的残字裁在区域外（宽区域在 STTN_DET 下几乎
+            # 零代价，mask 仍由检测框驱动；仅影响空检测整区兜底范围）。
+            detect_options["padding_x"] = max(int(detect_options.get("padding_x") or 0), 96)
+            # 准确率优先（擦除前的区域识别，慢几秒值得）：
+            # 全帧扫描（非 HPI 快速路径默认只扫 50%-90% 高度带，
+            # 竖排演职员表这类带外文本会被直接切掉）、多区域并集、
+            # 采样加密到 48 帧。调用方显式传入的值优先。
+            if not detect_options.get("_crop_to_band_explicit"):
+                detect_options["crop_to_band"] = False
+            detect_options["multi_group_union"] = True
+            if not detect_options.get("_sample_count_explicit"):
+                detect_options["sample_count"] = 48
+            with PROCESS_LOCK:
+                area_detect = _run_subtitle_area_detection(source_path, None, detect_options)
+            if area_detect.get("sub_area"):
+                area = tuple(int(v) for v in area_detect["sub_area"])
+                # Sparse area samples can miss longer horizontal lines.
+                # Glyph masks still follow detected strokes, so retain the
+                # detected vertical band but accept text across its width.
+                # Explicit sub_area and the legacy rectangle path stay as-is.
+                if options["mask_strategy"] == "glyph":
+                    frame_w = int(area_detect["video_size"]["width"])
+                    if frame_w > 0:
+                        area = (area[0], area[1], 0, frame_w)
+                auto_detected_area = True
+                print(
+                    f"INFO: job={job_id} auto-detected subtitle area {area} "
+                    f"(confidence={area_detect.get('confidence')}, "
+                    f"frames_sampled={len(area_detect.get('frames_sampled') or [])})"
+                )
+            else:
+                print(f"INFO: job={job_id} auto area detection found nothing; proceeding with full frame")
+        except Exception as detect_exc:
+            print(
+                f"WARN: job={job_id} auto area detection failed "
+                f"({type(detect_exc).__name__}: {detect_exc}); proceeding with full frame"
+            )
+
+    def _job_progress(phase, percent, stage=""):
+        _set_job_progress(job_id, phase, percent, stage)
+        # Also surface progress in the api-server stdout so operators
+        # can see main pass / STTN 修边 pass / done in the log. The
+        # dub web app gets the structured data via /api/progress;
+        # this print is for the server log only. Throttle to phase
+        # changes + 2% steps + terminal states. 2% (50 lines/phase)
+        # is the sweet spot — 10% felt jumpy, 1% (100 lines/phase)
+        # is too noisy in journalctl / docker logs.
+        pct_int = int(round(percent))
+        bucket = pct_int // 2
+        terminal = phase in ("done", "error")
+        with _last_logged_progress_LOCK:
+            last = _last_logged_progress.get(job_id)
+            should_log = (
+                last is None
+                or last[0] != phase
+                or last[1] != bucket
+                or terminal
+            )
+            if should_log:
+                _last_logged_progress[job_id] = (phase, bucket)
+                if terminal:
+                    _last_logged_progress.pop(job_id, None)
+        if should_log:
+            label = {
+                "sttn": "STTN 擦除",
+                "lama_area": "LAMA 擦除",
+                "blur_cover": "模糊覆盖",
+                "lama": "LAMA 擦除",
+                "refine": "STTN 修边",
+                "residual": "残字兜底修复",
+                "stitch": "合并片段",
+                "ocr_retry": "字幕漏框补检",
+                "finalize": "回灌音频",
+                "done": "完成",
+                "error": "出错",
+            }.get(phase, phase)
+            print(
+                f"PROGRESS job={job_id} {label} {pct_int}%{f' stage={stage}' if stage else ''}"
+            )
+
+    with PROCESS_LOCK:
+        output_path, fallback_triggered = _run_subtitle_remover(
+            source_path, area, options, refine_area,
+            progress_callback=_job_progress,
+        )
+    try:
+        return _removal_result(output_path, fallback_triggered, job_id, request_id,
+                               area, auto_detected_area, refine_area, options,
+                               started_at, make_download_url)
+    except Exception as exc:
+        # GPU processing returned; even an incomplete result may already exist.
+        raise ResultUncertain("subtitle output could not be finalized") from exc
+
+
+def _removal_result(output_path, fallback_triggered, job_id, request_id, area,
+                    auto_detected_area, refine_area, options, started_at, make_download_url):
+    _set_job_progress(job_id, "done", 100.0, "completed")
+
+    download_url = make_download_url(job_id, output_path.name)
+    print(f"INFO: job={job_id} download_url={download_url}")
+    processing = {}
+    if options["mask_strategy"] == "glyph":
+        audit = json.loads(output_path.with_suffix(".json").read_text())
+        processing = {
+            "profile": audit["profile"], "device": audit["device"],
+            "frames": audit["frames"], "ocr_frames": audit["ocr_frames"],
+            "ocr_max_side": audit["ocr_max_side"],
+            "ocr_retry_count": len(audit["ocr_retry_frames"]),
+            "ocr_retry_updated_count": len(audit["ocr_retry_updated_frames"]),
+            "active_mask_frames": audit["active_mask_frames"], "chunks": len(audit["jobs"]),
+            "masks_sha256": audit["masks_sha256"],
+            "audit_url": make_download_url(job_id, output_path.with_suffix(".json").name),
+        }
+    return {
+        "url": download_url,
+        "download_url": download_url,
+        "job_id": job_id,
+        "request_id": request_id,
+        "api_schema_version": API_SCHEMA_VERSION,
+        "filename": output_path.name,
+        "area": list(area) if area is not None else None,
+        # 本次 sub_area 是否为自动识别（True）还是调用方传入/全帧（False）
+        "auto_detected_area": auto_detected_area,
+        "refine_area": list(refine_area) if refine_area is not None else None,
+        "options": options,
+        **({"processing": processing} if processing else {}),
+        # OCR 检测为空时是否触发了整区 STTN_AUTO 重绘兜底
+        "fallback_triggered": fallback_triggered,
+        "elapsed_seconds": round(time.time() - started_at, 3),
+    }
+
+
+_ASYNC_MANAGERS = {}
+_ASYNC_MANAGERS_LOCK = threading.Lock()
+
+
+def _async_manager():
+    root = WORK_DIR.resolve()
+    with _ASYNC_MANAGERS_LOCK:
+        manager = _ASYNC_MANAGERS.get(root)
+        if manager is None:
+            def process(payload, job_id, job_dir):
+                return _process_removal(
+                    payload, job_id, job_dir, time.time(), job_id,
+                    lambda current_job, filename: "/download/" + quote(current_job) + "/" + quote(filename),
+                )
+            manager = AsyncJobs(root, process, _get_job_progress, PROCESS_LOCK)
+            _ASYNC_MANAGERS[root] = manager
+            manager.recover()
+        return manager
+
+
 class RemoverAPIHandler(BaseHTTPRequestHandler):
     server_version = "VideoSubtitleRemoverAPI/1.1"
+
+    def _matches_job_store(self, manager):
+        """Do not let a recycled address masquerade as the original store."""
+        expected = self.headers.get("X-Job-Store-Id")
+        if expected is not None and expected != manager.store_id:
+            self.close_connection = True
+            self._send_json(HTTPStatus.CONFLICT, {"error_code": "JOB_STORE_MISMATCH", "error": "job store changed"})
+            return False
+        return True
+
+    def _handle_async_submit(self):
+        job_id = str(self.headers.get("X-Job-Id", "") or "").strip()
+        if not _JOB_ID_RE.fullmatch(job_id):
+            self.close_connection = True
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "X-Job-Id is required and must be valid"})
+            return
+        if not str(self.headers.get("Content-Type", "")).lower().startswith("multipart/form-data"):
+            self.close_connection = True
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "multipart video is required"})
+            return
+        manager = _async_manager()
+        if not self._matches_job_store(manager):
+            return
+        fresh = False
+        try:
+            fresh = manager.reserve(job_id)
+            with tempfile.TemporaryDirectory(prefix="receive-", dir=manager.incoming) as incoming:
+                old_timeout = self.connection.gettimeout()
+                self._async_receive_deadline = time.monotonic() + ASYNC_RECEIVE_TIMEOUT_SECONDS
+                try:
+                    payload = _read_payload(self, Path(incoming))
+                finally:
+                    del self._async_receive_deadline
+                    self.connection.settimeout(old_timeout)
+                source = payload.get("_uploaded_video_path")
+                if not source or not Path(source).is_file() or not Path(source).resolve().is_relative_to(Path(incoming).resolve()):
+                    raise RequestError(HTTPStatus.BAD_REQUEST, "uploaded video is required")
+                _normalize_area(payload)
+                options = _normalize_options(payload)
+                if options.get("post_lama_refine"):
+                    _normalize_refine_area(payload)
+                state, created = manager.accept(job_id, fresh, payload, source)
+        except JobConflict as exc:
+            self.close_connection = True
+            if fresh:
+                manager.abandon_receiving(job_id)
+            status = HTTPStatus.TOO_MANY_REQUESTS if exc.code == "QUEUE_FULL" else HTTPStatus.CONFLICT
+            self._send_json(status, {"error_code": exc.code, "status": exc.status, "error": "job cannot be accepted"})
+            return
+        except RequestError as exc:
+            if fresh:
+                manager.abandon_receiving(job_id)
+            self.close_connection = True
+            self._send_json(exc.status, {"error": exc.message})
+            return
+        except Exception as exc:
+            if fresh:
+                manager.abandon_receiving(job_id)
+            print(f"ERROR: async job acceptance failed job={job_id} error_type={type(exc).__name__}", flush=True)
+            self.close_connection = True
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "job acceptance failed"})
+            return
+        # Once queued, even a client disconnect while receiving this response must
+        # leave the durable state and input untouched.
+        self._send_json(HTTPStatus.ACCEPTED if created else HTTPStatus.OK, state)
 
     def do_GET(self):
         self._request_id = self.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
@@ -3727,11 +4094,13 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "service": "video_subtitle_remover_api",
                     "api_schema_version": API_SCHEMA_VERSION,
+                    "job_store_id": _async_manager().store_id,
                     "modes": ["sttn", "lama", "propainter", "lama_area", "blur_cover"],
                     "ocr_presets": sorted(_OCR_PRESETS.keys()),
                     "deprecated_route_aliases": _DEPRECATED_ROUTE_ALIASES,
                     "deprecated_route_usage": dict(_DEPRECATED_ROUTE_USAGE),
                     "features": {
+                        "async_jobs": True,
                         "mask_strategies": ["rectangle", "glyph"],
                         "mask_strategy_default": "rectangle",
                         "glyph_profile": "glyph_v5",
@@ -3782,6 +4151,8 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                     "api_schema_version": API_SCHEMA_VERSION,
                     "endpoints": {
                         "submit": "POST /api/remove-subtitle",
+                        "async_submit": "POST /api/jobs/remove-subtitle",
+                        "async_status": "GET /api/jobs/{job_id}",
                         "detect": "POST /api/detect-subtitle-area",
                         "download": "GET /download/{job_id}/{filename}",
                         "progress": "GET /api/progress/{job_id}",
@@ -3791,6 +4162,20 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                     },
                 },
             )
+            return
+        if parsed.path.startswith("/api/jobs/"):
+            job_id = parsed.path[len("/api/jobs/"):]
+            if not _JOB_ID_RE.fullmatch(job_id):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid job_id"})
+                return
+            manager = _async_manager()
+            if not self._matches_job_store(manager):
+                return
+            state = manager.public(job_id)
+            if state is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "job_not_found"})
+            else:
+                self._send_json(HTTPStatus.OK, state)
             return
         if parsed.path.startswith("/api/progress/"):
             _prune_active_jobs()
@@ -3813,12 +4198,42 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._request_id = self.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
         parsed = urlparse(self.path)
+        if parsed.path == "/api/jobs/remove-subtitle":
+            self._handle_async_submit()
+            return
         if parsed.path in ("/api/detect-subtitle-area", "/api/detect", "/detect-subtitle-area"):
-            self._handle_detect_subtitle_area()
+            self._run_sync_request(self._handle_detect_subtitle_area)
             return
         if parsed.path not in ("/api/remove-subtitle", "/api/remove", "/remove"):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
+
+        self._run_sync_request(self._handle_sync_removal)
+
+    def _run_sync_request(self, operation):
+        self._protected_sync_jobs = []
+        try:
+            return operation()
+        finally:
+            with _DOWNLOAD_LOCK:
+                for job_id in self._protected_sync_jobs:
+                    _SYNC_ACTIVE_COUNTS[job_id] -= 1
+                    if not _SYNC_ACTIVE_COUNTS[job_id]:
+                        _SYNC_ACTIVE_COUNTS.pop(job_id)
+            del self._protected_sync_jobs
+
+    def _protect_sync_dir(self, job_id, job_dir):
+        """Register and create atomically with respect to the janitor."""
+        with _DOWNLOAD_LOCK:
+            _SYNC_ACTIVE_COUNTS[job_id] = _SYNC_ACTIVE_COUNTS.get(job_id, 0) + 1
+            self._protected_sync_jobs.append(job_id)
+            try:
+                job_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                # Preserve the synchronous API's existing replay behaviour.
+                pass
+
+    def _handle_sync_removal(self):
 
         started_at = time.time()
         _sweep_stale_job_dirs()
@@ -3852,11 +4267,13 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
         job_id = provided_job_id or (uuid.uuid4().hex if is_multipart else "")
         job_dir = WORK_DIR / "jobs" / job_id if job_id else None
         if job_dir is not None:
-            try:
-                job_dir.mkdir(parents=True, exist_ok=False)
-            except FileExistsError:
-                # Caller reused a job_id; reuse the existing directory.
-                pass
+            manager = _async_manager()
+            with manager.lock:
+                if (job_dir / STATE_NAME).exists():
+                    self.close_connection = True
+                    self._send_json(HTTPStatus.CONFLICT, {"error_code": "JOB_ID_IN_USE", "error": "job ID belongs to an async job"})
+                    return
+                self._protect_sync_dir(job_id, job_dir)
         try:
             payload = _read_payload(self, job_dir)
         except RequestError as exc:
@@ -3902,183 +4319,19 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
                 return
             job_id = provided_job_id or uuid.uuid4().hex
             job_dir = WORK_DIR / "jobs" / job_id
-            try:
-                job_dir.mkdir(parents=True, exist_ok=False)
-            except FileExistsError:
-                pass
+            manager = _async_manager()
+            with manager.lock:
+                if (job_dir / STATE_NAME).exists():
+                    self._send_json(HTTPStatus.CONFLICT, {"error_code": "JOB_ID_IN_USE", "error": "job ID belongs to an async job"})
+                    return
+                self._protect_sync_dir(job_id, job_dir)
 
         try:
-            uploaded_video_path = payload.get("_uploaded_video_path")
-            video_url = payload.get("video_url") or payload.get("url")
-            if uploaded_video_path:
-                source_path = Path(str(uploaded_video_path)).resolve()
-                if not source_path.is_file():
-                    raise RequestError(HTTPStatus.BAD_REQUEST, "Uploaded video is missing")
-            elif not isinstance(video_url, str) or not video_url.strip():
-                raise RequestError(HTTPStatus.BAD_REQUEST, "video_url is required")
-            else:
-                source_path = None
-
-            filename_hint = _safe_filename(str(payload.get("filename") or "input.mp4"))
-            area = _normalize_area(payload)
-            options = _normalize_options(payload)
-            refine_area = _normalize_refine_area(payload) if options.get("post_lama_refine") else None
-            if source_path is None:
-                source_path = _stage_video(video_url.strip(), job_dir, filename_hint)
-
-            # 调用方显式传入的 sub_area：按需扩边 + clamp 到帧内。
-            # 不自动扩边（sub_area_margin 默认 0）——STTN_DET 下这个矩形是
-            # OCR 的接受窗口，服务端悄悄放宽会把区域外的水印/台标也擦掉。
-            # 需要放宽的调用方（尤其 sttn_skip_detection / 空检测兜底这类
-            # 矩形即 mask 的路径）显式传 sub_area_margin。
-            if area is not None:
-                geometry = _probe_video_stream_geometry(source_path)
-                if geometry:
-                    frame_w, frame_h = int(geometry["width"]), int(geometry["height"])
-                    expanded = _expand_sub_area(area, frame_w, frame_h, options["sub_area_margin"])
-                    if expanded != list(area):
-                        print(
-                            f"INFO: job={job_id} sub_area {list(area)} -> {expanded} "
-                            f"(margin={options['sub_area_margin']}, frame={frame_w}x{frame_h})"
-                        )
-                    area = tuple(expanded)
-                else:
-                    print(
-                        f"WARN: job={job_id} cannot probe frame size; "
-                        f"sub_area {list(area)} used as-is (no margin/clamp applied)"
-                    )
-
-            # 未传 sub_area 时先自动识别字幕区域（默认开启）：
-            # 复用 /api/detect-subtitle-area 的检测逻辑把擦除范围收窄到真实
-            # 字幕带；识别失败或为空时退回全帧处理。
-            auto_detected_area = False
-            if area is None and options.get("auto_detect_area", True):
-                try:
-                    detect_options = _normalize_detect_options(payload)
-                    # 擦除用途把横向 padding 放宽到 >=96px：自动识别的区域只是
-                    # 检测/修边的作用范围，宁宽勿窄——detect 默认的 16px 曾把
-                    # 字幕左右边缘的残字裁在区域外（宽区域在 STTN_DET 下几乎
-                    # 零代价，mask 仍由检测框驱动；仅影响空检测整区兜底范围）。
-                    detect_options["padding_x"] = max(int(detect_options.get("padding_x") or 0), 96)
-                    # 准确率优先（擦除前的区域识别，慢几秒值得）：
-                    # 全帧扫描（非 HPI 快速路径默认只扫 50%-90% 高度带，
-                    # 竖排演职员表这类带外文本会被直接切掉）、多区域并集、
-                    # 采样加密到 48 帧。调用方显式传入的值优先。
-                    if not detect_options.get("_crop_to_band_explicit"):
-                        detect_options["crop_to_band"] = False
-                    detect_options["multi_group_union"] = True
-                    if not detect_options.get("_sample_count_explicit"):
-                        detect_options["sample_count"] = 48
-                    with PROCESS_LOCK:
-                        area_detect = _run_subtitle_area_detection(source_path, None, detect_options)
-                    if area_detect.get("sub_area"):
-                        area = tuple(int(v) for v in area_detect["sub_area"])
-                        # Sparse area samples can miss longer horizontal lines.
-                        # Glyph masks still follow detected strokes, so retain the
-                        # detected vertical band but accept text across its width.
-                        # Explicit sub_area and the legacy rectangle path stay as-is.
-                        if options["mask_strategy"] == "glyph":
-                            frame_w = int(area_detect["video_size"]["width"])
-                            if frame_w > 0:
-                                area = (area[0], area[1], 0, frame_w)
-                        auto_detected_area = True
-                        print(
-                            f"INFO: job={job_id} auto-detected subtitle area {area} "
-                            f"(confidence={area_detect.get('confidence')}, "
-                            f"frames_sampled={len(area_detect.get('frames_sampled') or [])})"
-                        )
-                    else:
-                        print(f"INFO: job={job_id} auto area detection found nothing; proceeding with full frame")
-                except Exception as detect_exc:
-                    print(
-                        f"WARN: job={job_id} auto area detection failed "
-                        f"({type(detect_exc).__name__}: {detect_exc}); proceeding with full frame"
-                    )
-
-            def _job_progress(phase, percent, stage=""):
-                _set_job_progress(job_id, phase, percent, stage)
-                # Also surface progress in the api-server stdout so operators
-                # can see main pass / STTN 修边 pass / done in the log. The
-                # dub web app gets the structured data via /api/progress;
-                # this print is for the server log only. Throttle to phase
-                # changes + 2% steps + terminal states. 2% (50 lines/phase)
-                # is the sweet spot — 10% felt jumpy, 1% (100 lines/phase)
-                # is too noisy in journalctl / docker logs.
-                pct_int = int(round(percent))
-                bucket = pct_int // 2
-                terminal = phase in ("done", "error")
-                with _last_logged_progress_LOCK:
-                    last = _last_logged_progress.get(job_id)
-                    should_log = (
-                        last is None
-                        or last[0] != phase
-                        or last[1] != bucket
-                        or terminal
-                    )
-                    if should_log:
-                        _last_logged_progress[job_id] = (phase, bucket)
-                        if terminal:
-                            _last_logged_progress.pop(job_id, None)
-                if should_log:
-                    label = {
-                        "sttn": "STTN 擦除",
-                        "lama_area": "LAMA 擦除",
-                        "blur_cover": "模糊覆盖",
-                        "lama": "LAMA 擦除",
-                        "refine": "STTN 修边",
-                        "residual": "残字兜底修复",
-                        "stitch": "合并片段",
-                        "ocr_retry": "字幕漏框补检",
-                        "finalize": "回灌音频",
-                        "done": "完成",
-                        "error": "出错",
-                    }.get(phase, phase)
-                    print(
-                        f"PROGRESS job={job_id} {label} {pct_int}%{f' stage={stage}' if stage else ''}"
-                    )
-
-            with PROCESS_LOCK:
-                output_path, fallback_triggered = _run_subtitle_remover(
-                    source_path, area, options, refine_area,
-                    progress_callback=_job_progress,
-                )
-            _set_job_progress(job_id, "done", 100.0, "completed")
-
-            download_url = _download_url(self, job_id, output_path.name)
-            print(f"INFO: job={job_id} download_url={download_url}")
-            processing = {}
-            if options["mask_strategy"] == "glyph":
-                audit = json.loads(output_path.with_suffix(".json").read_text())
-                processing = {
-                    "profile": audit["profile"], "device": audit["device"],
-                    "frames": audit["frames"], "ocr_frames": audit["ocr_frames"],
-                    "ocr_max_side": audit["ocr_max_side"],
-                    "ocr_retry_count": len(audit["ocr_retry_frames"]),
-                    "ocr_retry_updated_count": len(audit["ocr_retry_updated_frames"]),
-                    "active_mask_frames": audit["active_mask_frames"], "chunks": len(audit["jobs"]),
-                    "masks_sha256": audit["masks_sha256"],
-                    "audit_url": _download_url(self, job_id, output_path.with_suffix(".json").name),
-                }
-            self._send_json(
-                HTTPStatus.OK,
-                {
-                    "url": download_url,
-                    "download_url": download_url,
-                    "job_id": job_id,
-                    "request_id": self._request_id,
-                    "api_schema_version": API_SCHEMA_VERSION,
-                    "filename": output_path.name,
-                    "area": list(area) if area is not None else None,
-                    # 本次 sub_area 是否为自动识别（True）还是调用方传入/全帧（False）
-                    "auto_detected_area": auto_detected_area,
-                    "refine_area": list(refine_area) if refine_area is not None else None,
-                    "options": options,
-                    **({"processing": processing} if processing else {}),
-                    # OCR 检测为空时是否触发了整区 STTN_AUTO 重绘兜底
-                    "fallback_triggered": fallback_triggered,
-                    "elapsed_seconds": round(time.time() - started_at, 3),
-                },
+            result = _process_removal(
+                payload, job_id, job_dir, started_at, self._request_id,
+                lambda current_job, filename: _download_url(self, current_job, filename),
             )
+            self._send_json(HTTPStatus.OK, result)
         except RequestError as exc:
             # Surface the failure in the progress registry so a polling
             # client (e.g. the dub web app's progress poller) sees
@@ -4123,10 +4376,12 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
         started_at = time.time()
         job_id = uuid.uuid4().hex
         job_dir = WORK_DIR / "jobs" / job_id
-        try:
-            job_dir.mkdir(parents=True, exist_ok=False)
-        except FileExistsError:
-            pass
+        manager = _async_manager()
+        with manager.lock:
+            if (job_dir / STATE_NAME).exists():
+                self._send_json(HTTPStatus.CONFLICT, {"error_code": "JOB_ID_IN_USE", "error": "job ID belongs to an async job"})
+                return
+            self._protect_sync_dir(job_id, job_dir)
 
         try:
             payload = _read_payload(self, job_dir)
@@ -4202,6 +4457,12 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
             )
 
     def _handle_download(self, path):
+        # Legacy synchronous clients do not send a store ID. Async clients do,
+        # so an address recycled between status and download cannot serve a
+        # different work directory's file under the same job name.
+        if getattr(self, "headers", {}).get("X-Job-Store-Id") is not None:
+            if not self._matches_job_store(_async_manager()):
+                return
         parts = path.split("/")
         if len(parts) != 4 or not parts[2] or not parts[3]:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
@@ -4213,23 +4474,41 @@ class RemoverAPIHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid job_id"})
             return
 
-        file_path = (WORK_DIR / "jobs" / job_id / filename).resolve()
-        job_root = (WORK_DIR / "jobs" / job_id).resolve()
-        if job_root not in file_path.parents or not file_path.is_file():
+        with _DOWNLOAD_LOCK:
+            file_path = (WORK_DIR / "jobs" / job_id / filename).resolve()
+            job_root = (WORK_DIR / "jobs" / job_id).resolve()
+            if job_root not in file_path.parents:
+                input_file = None
+            else:
+                try:
+                    input_file = file_path.open("rb")
+                    if not file_path.is_file():
+                        input_file.close()
+                        input_file = None
+                except (FileNotFoundError, IsADirectoryError):
+                    input_file = None
+            if input_file is not None:
+                _DOWNLOAD_COUNTS[job_id] = _DOWNLOAD_COUNTS.get(job_id, 0) + 1
+        if input_file is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "file_not_found"})
             return
-
-        content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", content_type)
-        request_id = getattr(self, "_request_id", None)
-        if request_id:
-            self.send_header("X-Request-ID", request_id)
-        self.send_header("Content-Length", str(file_path.stat().st_size))
-        self.send_header("Content-Disposition", f'attachment; filename="{file_path.name}"')
-        self.end_headers()
-        with file_path.open("rb") as input_file:
-            shutil.copyfileobj(input_file, self.wfile)
+        try:
+            with input_file:
+                content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", content_type)
+                request_id = getattr(self, "_request_id", None)
+                if request_id:
+                    self.send_header("X-Request-ID", request_id)
+                self.send_header("Content-Length", str(os.fstat(input_file.fileno()).st_size))
+                self.send_header("Content-Disposition", f'attachment; filename="{file_path.name}"')
+                self.end_headers()
+                shutil.copyfileobj(input_file, self.wfile)
+        finally:
+            with _DOWNLOAD_LOCK:
+                _DOWNLOAD_COUNTS[job_id] -= 1
+                if not _DOWNLOAD_COUNTS[job_id]:
+                    _DOWNLOAD_COUNTS.pop(job_id)
 
     def _send_json(self, status, payload):
         # OmniVoice 风格信封：2xx 自动补 "ok": true，4xx/5xx 补 "ok": false
@@ -4278,7 +4557,11 @@ def main(argv=None):
         pass
 
     WORK_DIR.mkdir(parents=True, exist_ok=True)
-    _sweep_stale_job_dirs()
+    _async_manager()
+    _prune_active_jobs()
+    janitor_stop = threading.Event()
+    janitor = threading.Thread(target=_janitor_loop, args=(janitor_stop,), daemon=True, name="vsr-janitor")
+    janitor.start()
     server = ThreadingHTTPServer((args.host, args.port), RemoverAPIHandler)
     print(f"Serving on http://{args.host}:{args.port}")
     print(f"Work dir: {WORK_DIR}")
@@ -4287,6 +4570,8 @@ def main(argv=None):
     except KeyboardInterrupt:
         pass
     finally:
+        janitor_stop.set()
+        janitor.join(timeout=5)
         server.server_close()
 
 

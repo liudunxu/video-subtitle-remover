@@ -372,6 +372,12 @@ out*.mp4
 test*.py
 !/tests/test_glyph_pipeline.py
 !/tests/test_glyph_context.py
+!/tests/test_async_jobs.py
+!/tests/test_async_queue.py
+!/tests/test_async_cleanup.py
+!/tests/test_async_receive_timeout.py
+!/tests/test_download_store_identity.py
+!/tests/test_sync_cleanup_protection.py
 test_*.mp4
 test*_no_sub*.mp4
 /test/coods/
