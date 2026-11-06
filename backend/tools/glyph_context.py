@@ -237,6 +237,55 @@ def local_ocr_boxes(frame, detector, area):
             and 0 < d-c <= .84*height and b-a > 1.5*(d-c)]
 
 
+def outlined_text_regions(frame, area):
+    """Propose current-frame rows when background lettering confuses local OCR.
+
+    Small aligned white components with dark outlines only propose a crop;
+    actual OCR and outlined_local_mask must still confirm its editable pixels.
+    No neighboring frame, recognized text or fixed subtitle position is used.
+    """
+    ay0, ay1, ax0, ax1 = area
+    crop = frame[ay0:ay1, ax0:ax1]
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    s, v = hsv[:, :, 1], hsv[:, :, 2]
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(((v >= 165) & (s <= 80)).astype('uint8'), 8)
+    parts = []
+    for k in range(1, n):
+        x, y, w, h, size = map(int, stats[k])
+        if h < 12 or h > .65*(ay1-ay0) or size < 8 or w > 1.6*h:
+            continue
+        if x == 0 or y == 0 or x+w >= crop.shape[1] or y+h >= crop.shape[0]:
+            continue
+        pixels = (labels == k).astype('uint8')
+        if np.count_nonzero((v >= 210) & (s <= 55) & (pixels > 0)) < max(3, .25*size):
+            continue
+        ring = (cv2.dilate(pixels, np.ones((5, 5), np.uint8)) > 0) & (pixels == 0)
+        if np.mean(v[ring] < 100) < .6:
+            continue
+        parts.append([x+ax0, x+w+ax0, y+ay0, y+h+ay0])
+    groups = []
+    for part in sorted(parts, key=lambda b: b[3]-b[2], reverse=True):
+        for group in groups:
+            height = float(np.median([b[3]-b[2] for b in group]))
+            center = float(np.median([(b[2]+b[3])/2 for b in group]))
+            if .6 <= (part[3]-part[2])/height <= 1.6 and abs((part[2]+part[3])/2-center) <= .45*height:
+                group.append(part)
+                break
+        else:
+            groups.append([part])
+    regions = []
+    for group in groups:
+        if len(group) < 3:
+            continue
+        height = float(np.median([b[3]-b[2] for b in group]))
+        if max(b[1] for b in group)-min(b[0] for b in group) < 3*height:
+            continue
+        pad = max(12, round(.35*height))
+        regions.append([max(ay0, min(b[2] for b in group)-pad),
+                        min(ay1, max(b[3] for b in group)+pad), ax0, ax1])
+    return regions
+
+
 def outlined_local_mask(frame, boxes, area, radius=5):
     """Keep small white components surrounded by a dark outline, within area."""
     ay0, ay1, ax0, ax1 = area

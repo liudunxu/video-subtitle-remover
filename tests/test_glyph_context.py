@@ -273,6 +273,7 @@ class NarrowOCRTest(unittest.TestCase):
             self.assertEqual(audit['local_ocr']['frames'], [2, 3])
             self.assertEqual(audit['narrow_ocr']['confirmed_frames'], [2])
             self.assertEqual(audit['narrow_ocr']['empty_frames'], [3])
+            self.assertEqual(audit['outline_ocr']['checked_frames'], [])
             self.assertEqual(audit['ocr_frames'], 6)
             hashes.append(audit['masks_sha256'])
         self.assertEqual(hashes[0], hashes[1])

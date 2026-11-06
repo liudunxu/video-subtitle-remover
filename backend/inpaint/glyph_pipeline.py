@@ -22,7 +22,7 @@ from backend.tools.glyph_masks import (
 from backend.tools.glyph_context import (
     needs_local_ocr, local_ocr_boxes, outlined_local_mask, select_reference,
     short_text_regions, short_text_mask, photometric_boundaries,
-    subtitle_line_shape, narrow_text_regions,
+    subtitle_line_shape, narrow_text_regions, outlined_text_regions,
 )
 
 
@@ -355,6 +355,54 @@ def _retry_short_lines(video_path, boxes, shots, raw, detector, area, band, heig
     return audit
 
 
+def _supplement_outline_rows(video_path, masks, detector, area, band, overlap_frames, progress):
+    """Add current-image-confirmed glyphs after the existing mask passes.
+
+    Restrict this to the initial overlap-local path, not every frame later
+    visited by narrow OCR. OR into final masks so a failed/partial retry cannot
+    remove existing coverage or alter anchor selection and stabilization.
+    """
+    audit = dict(checked_frames=[], frames=[], confirmed_frames=[], empty_frames=[],
+                 updated_frames=[], regions={}, added_pixels={}, ocr_calls=0,
+                 region_coordinate_space='ocr_band_yxyx')
+    if not overlap_frames:
+        return audit
+    local_area = (area[0]-band[0], area[1]-band[0], area[2], area[3])
+    last_target, last_decoded = max(overlap_frames), -1
+    frames = _read_frames(video_path)
+    try:
+        for i, frame in enumerate(frames):
+            last_decoded = i
+            if i in overlap_frames:
+                crop = frame[band[0]:band[1]]
+                regions = outlined_text_regions(crop, local_area)
+                audit['checked_frames'].append(i)
+                if regions:
+                    audit['frames'].append(i)
+                    audit['regions'][i] = regions
+                    extra = np.zeros(crop.shape[:2], np.uint8)
+                    for region in regions:
+                        found = local_ocr_boxes(crop, detector, region)
+                        audit['ocr_calls'] += 1
+                        extra |= outlined_local_mask(crop, found, region)
+                    audit['confirmed_frames' if extra.any() else 'empty_frames'].append(i)
+                    added = int(np.count_nonzero((extra > 0) & (masks[i] == 0)))
+                    if added:
+                        masks[i] |= extra
+                        audit['updated_frames'].append(i)
+                        audit['added_pixels'][i] = added
+            if i % 24 == 0:
+                progress('ocr_outline', 40+4*(i+1)/(last_target+1),
+                         f'frame={i+1}, updated={len(audit["updated_frames"])}')
+            if i >= last_target:
+                break
+    finally:
+        frames.close()
+    if last_decoded < last_target:
+        raise RuntimeError('Incomplete decode during outlined row OCR supplement')
+    return audit
+
+
 def _make_model(mode, options):
     import torch
     from backend.tools.model_config import ModelConfig
@@ -536,6 +584,7 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
         boxes, shots, ocr_frames = _scan(video_path, detector, area, band,
                                         options['ocr_sample_step'] or 2, folder/'raw.bin', progress, expected, local_audit)
         local_frames = set(local_audit.get('frames', []))
+        overlap_frames = local_frames.copy()
         shape = (len(boxes), band[1]-band[0], width)
         raw = _disk_map(stack, folder/'raw.bin', shape, 'r+')
         # Recover short captions before narrow-row retries can label their
@@ -567,6 +616,9 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
             raise RuntimeError('Incomplete decode during border recovery')
         masks = _disk_map(stack, folder/'final.bin', shape)
         stabilize_masks(revised, shots, masks, base=stable, original_raw=raw)
+        outline_retries = _supplement_outline_rows(video_path, masks, detector, area, band,
+                                                   overlap_frames, progress)
+        ocr_frames += outline_retries['ocr_calls']
         jobs = build_windows(masks, shots, band[0], options['sttn_band_margin'])
         if not jobs:
             raise NoGlyphsError('OCR/glyph detection produced no editable white outlined text; check sub_area or use mask_strategy=rectangle')
@@ -585,7 +637,7 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
                      ocr_retry_max_side=960 if retry_detector is not None else None,
                      ocr_retry_frames=retries['frames'], ocr_retry_updated_frames=retries['updated_frames'],
                      local_ocr=local_audit, clean_reference_policy='sttn_local_ocr_same_window',
-                     narrow_ocr=narrow_retries,
+                     narrow_ocr=narrow_retries, outline_ocr=outline_retries,
                      short_ocr=short_retries, photometric_policy='propainter_coherent_luma_shift',
                      masks_sha256=_mask_hash(masks), model_input_size=[432, 240],
                      chunk_size=80, overlap=20, feather_sigma=2, glyph_dilation=5,
