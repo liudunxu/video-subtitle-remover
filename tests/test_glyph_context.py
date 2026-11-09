@@ -8,6 +8,8 @@ from copy import deepcopy
 import cv2
 import numpy as np
 
+import api
+from backend.tools.subtitle_detect import SubtitleDetect
 from backend.tools.glyph_context import (
     needs_local_ocr, local_ocr_boxes, outlined_local_mask, select_reference,
     short_text_regions, short_text_mask, photometric_boundaries,
@@ -17,6 +19,73 @@ from backend.inpaint import glyph_pipeline as pipeline
 
 
 class LocalOCRTest(unittest.TestCase):
+    def test_slight_overflow_does_not_lock_later_captions_into_local_masks(self):
+        frame = np.full((1000, 1080, 3), 200, np.uint8)
+        cv2.putText(frame, 'Hello', (80, 490), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 6)
+        cv2.putText(frame, 'Hello', (80, 490), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 2)
+        area, band = (420, 540, 40, 1040), (320, 640)
+        wide, inside = [45, 1043, 130, 180], [70, 1000, 130, 180]
+        for mode in ('sttn', 'propainter'):
+            for strict in (False, True):
+                with self.subTest(mode=mode, strict=strict):
+                    options = {'mask_strategy': 'glyph', 'mode': mode}
+                    if strict:
+                        options['bbox_min_inside_ratio'] = 1.0
+                    detector = Mock(bbox_min_inside_ratio=api._normalize_options(options)['bbox_min_inside_ratio'])
+                    detector._box_inside_ratio.side_effect = SubtitleDetect._box_inside_ratio
+                    wide_results = iter([[wide], [inside], [inside]])
+                    detector.detect_subtitle.side_effect = lambda crop: (
+                        [[5, 995, 30, 80]] if crop.shape[0] == 120 else next(wide_results))
+                    audit = {}
+                    with tempfile.TemporaryDirectory() as folder, patch.object(
+                            pipeline, '_read_frames', return_value=iter([frame]*3)):
+                        path = Path(folder)/'masks'
+                        boxes, _, calls = pipeline._scan('clip', detector, area, band, 1, path, Mock(), 3, audit)
+                        masks = np.fromfile(path, np.uint8).reshape(3, 320, 1080)
+                    self.assertEqual(audit['frames'], [0, 1, 2] if strict else [])
+                    self.assertEqual(audit['trigger_frames'], [0] if strict else [])
+                    self.assertEqual(calls, 4 if strict else 3)
+                    if not strict:
+                        self.assertEqual(boxes, [[wide], [inside], [inside]])
+                        for i, lines in enumerate(boxes):
+                            np.testing.assert_array_equal(masks[i], pipeline.glyph_mask(frame[320:640], lines))
+                            self.assertTrue(masks[i].any())
+
+    def test_glyph_default_still_rejects_substantial_overflow(self):
+        detector = Mock(bbox_min_inside_ratio=api._normalize_options({'mask_strategy': 'glyph'})['bbox_min_inside_ratio'])
+        detector._box_inside_ratio.side_effect = SubtitleDetect._box_inside_ratio
+        area, band = (420, 540, 40, 1040), (320, 640)
+        # 分别检查右侧、左侧及两侧累计越界，同时拒绝超出容差的纵向越界
+        # 和完全落在选区外的检测框。
+        for box, accepted in [([45, 1043, 130, 180], True), ([37, 1035, 130, 180], True),
+                              ([45, 1045, 130, 180], True), ([45, 1046, 130, 180], False),
+                              ([37, 1043, 130, 180], False), ([45, 1035, 99, 150], False),
+                              ([1045, 1070, 130, 180], False)]:
+            with self.subTest(box=box):
+                self.assertEqual(pipeline._accepted_boxes([box], detector, area, band, 1080),
+                                 [box] if accepted else [])
+
+    def test_accepted_tall_overlap_still_uses_background_protection(self):
+        frame = np.full((1000, 1080, 3), 200, np.uint8)
+        cv2.putText(frame, 'Hello', (80, 440), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 6)
+        cv2.putText(frame, 'Hello', (80, 440), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 2)
+        frame[420:440, 900:908] = 255  # 没有描边的背景文字笔画。
+        area, band = (200, 600, 40, 1040), (100, 700)
+        tall = [45, 1035, 99, 500]  # 框内占比为 400/401，但纵向跨越整个选区。
+        detector = Mock(bbox_min_inside_ratio=api._normalize_options({'mask_strategy': 'glyph'})['bbox_min_inside_ratio'])
+        detector._box_inside_ratio.side_effect = SubtitleDetect._box_inside_ratio
+        self.assertEqual(pipeline._accepted_boxes([tall], detector, area, band, 1080), [tall])
+        detector.detect_subtitle.side_effect = [[tall], [[10, 980, 200, 260]]]
+        audit = {}
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+                pipeline, '_read_frames', return_value=iter([frame])):
+            path = Path(folder)/'masks'
+            pipeline._scan('clip', detector, area, band, 1, path, Mock(), 1, audit)
+            mask = np.fromfile(path, np.uint8).reshape(600, 1080)
+        self.assertEqual(audit, dict(frames=[0], trigger_frames=[0]))
+        self.assertTrue(mask[300:360, 80:220].any())
+        self.assertFalse(mask[320:340, 900:908].any())
+
     def test_trigger_requires_tall_overlapping_box(self):
         area = (90, 150, 40, 400)
         self.assertTrue(needs_local_ocr([[30, 410, 40, 200]], area))

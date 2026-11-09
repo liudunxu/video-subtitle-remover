@@ -178,7 +178,7 @@ curl --fail-with-body -sS http://127.0.0.1:6006/api/remove-subtitle \
   -F 'payload={"options":{"mode":"propainter","mask_strategy":"glyph"}}'
 ```
 
-省略 `sub_area` 时先自动检测字幕带，再保持其上下范围、将横向接受范围扩到画面全宽，避免采样区域过窄时丢弃长句；已知字幕位置时，在 `payload` 中传入 `sub_area: [ymin,ymax,xmin,xmax]`。该区域是 OCR 接受范围，字形描边及羽化允许稍微越过检测框。没有写死样本坐标；补全候选按 OCR 行尺寸限制。显式选区仍按调用方设置使用（默认不扩边），选区过窄时默认的整框包含规则仍可能丢掉字幕行。彩色字幕、移动字幕和其它字体尚未验证；旧路径仍为默认值 `mask_strategy="rectangle"`。
+省略 `sub_area` 时先自动检测字幕带，再保持其上下范围、将横向接受范围扩到画面全宽，避免采样区域过窄时丢弃长句；已知字幕位置时，在 `payload` 中传入 `sub_area: [ymin,ymax,xmin,xmax]`。该区域是 OCR 接受范围，字形描边及羽化允许稍微越过检测框。没有写死样本坐标；补全候选按 OCR 行尺寸限制。显式选区仍按调用方设置使用（默认不扩边）；glyph 的 `bbox_min_inside_ratio` 默认 **0.995**，允许检测框至多 0.5% 的面积越界，避免几像素的边缘抖动触发整镜头的严格局部掩膜、漏掉浅背景白字。跨选区的异常大框仍独立触发局部 OCR 和描边约束；显式传入 `1.0` 可恢复整框包含规则。旧 rectangle 路径及独立字幕区域检测接口仍默认 `1.0`。彩色字幕、移动字幕和其它字体尚未验证；旧路径仍为默认值 `mask_strategy="rectangle"`。
 
 `glyph_v5`（2026-10-30）使用 PaddleOCR 文字检测（最长边 640）、默认隔帧采样和边界补检、同一行检测框合并、白色字形与描边提取及原分辨率 5px 膨胀。额外恢复 OCR 框附近的独立音符/小笔画；若框内仍有未覆盖的亮色描边像素，只在这些漏笔画周围补全掩膜，不把整行及字间背景改成矩形重绘。亮色皮肤、衣服与文字粘连时优先覆盖文字边缘，局部修复面积可能略增。保留上下边界笔画恢复、镜头内 ±2 帧且掩膜 IoU≥0.75 才传播。切镜依据 96×54 BGR 缩略图相邻帧平均绝对差 >40。字幕换句时若框位置完全不变，隔帧采样仍可能漏掉极短字幕；需要更密检测可传 `ocr_sample_step=1`。
 
@@ -316,7 +316,7 @@ curl --fail --location "$(jq -er '.download_url' result.json)" -o output.mp4
 | `sttn_input_width` / `sttn_input_height` | 0（用 env/默认 432×240） | STTN_DET 模型输入尺寸；本次 1080p 竖屏推荐显式传 864×240（纹理略好、耗时约 +12%）；864×480 收益有限、耗时约 +78%。须为 432/240 的整数倍且 ≤864×480，非法值回退默认 |
 | `sttn_band_margin` | 80 | STTN_DET 裁剪带上下文余量 px；增大可提供更多周边纹理，但不保证更清晰；传 0 才沿用 `VSR_STTN_BAND_MARGIN`（未设置时 40） |
 | `ocr_preset` | `default` | 检测灵敏度：`default` / `fast` / `turbo` / `fuzzy` / `ultra` / `multiline` / `aggressive`。`multiline` 检测到 3 行及以上字幕时自动对多行帧启用 STTN 修边 + 残字兜底 |
-| `bbox_min_inside_ratio` | 1.0 | OCR 检测框与字幕区域的交集面积占比下限；1.0 = 完全落在区域内才保留，调小（如 0.6）可保留压在区域边缘的检测框 |
+| `bbox_min_inside_ratio` | glyph：0.995；其余：1.0 | OCR 检测框与字幕区域的交集面积占比下限；glyph 默认容忍最多 0.5% 面积越界，显式传入 1.0 则要求完全落在区域内；独立区域检测接口仍默认 1.0 |
 | `ocr_sample_step` | 0 | OCR 采样间隔；0 = 按帧率自适应，1 = 逐帧检测（最慢但最不易漏），最大 30 |
 | `empty_detection_full_inpaint` | false | STTN OCR 检测不到字幕时：false = 返回 422；true = 整区每帧 STTN_AUTO 重绘。响应里的 `fallback_triggered` 标记是否触发了整区重绘兜底 |
 | `auto_detect_area` | true | 未传 `sub_area` 时先自动识别字幕区域再擦除（识别失败/为空退回全帧；传了 `sub_area` 或设为 `false` 则不触发） |

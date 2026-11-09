@@ -60,6 +60,24 @@ class GlyphOptionsTest(unittest.TestCase):
         self.assertIs(run.call_args.kwargs['retry_detector'], retry)
         retry.detect_subtitle.assert_not_called()
 
+    def test_area_tolerance_defaults_and_explicit_overrides_reach_both_detectors(self):
+        for mode in ('sttn', 'propainter'):
+            for supplied, expected in [(None, .995), (1.0, 1.0), (.9, .9), (0, 0)]:
+                with self.subTest(mode=mode, supplied=supplied):
+                    raw = {'mode': mode, 'mask_strategy': 'glyph'}
+                    if supplied is not None:
+                        raw['bbox_min_inside_ratio'] = supplied
+                    options = api._normalize_options({'options': raw})
+                    with patch('backend.tools.subtitle_detect.SubtitleDetect') as detector, patch.object(
+                            pipeline, 'run_glyph_removal', side_effect=pipeline.NoGlyphsError('empty')):
+                        with self.assertRaises(api.RequestError):
+                            api._run_glyph_remover(Path('in.mp4'), None, options)
+                    self.assertEqual([call.kwargs['bbox_min_inside_ratio'] for call in detector.call_args_list],
+                                     [expected, expected])
+        self.assertEqual(api._normalize_options({})['bbox_min_inside_ratio'], 1.0)
+        self.assertEqual(api._normalize_options({'mask_strategy': 'rectangle'})['bbox_min_inside_ratio'], 1.0)
+        self.assertEqual(api._normalize_detect_options({'mask_strategy': 'glyph'})['bbox_min_inside_ratio'], 1.0)
+
     def test_empty_glyphs_are_http_422(self):
         options = api._normalize_options({'mask_strategy': 'glyph'})
         with patch('backend.tools.subtitle_detect.SubtitleDetect'), patch.object(

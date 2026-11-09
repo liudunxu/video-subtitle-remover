@@ -396,6 +396,7 @@ def _normalize_options(payload):
         "residual_dark_nbhd_radius",
     }}}
     mode = str(merged.get("mode") or merged.get("inpaint_mode") or "sttn").strip().lower().replace("-", "_")
+    mask_strategy = str(merged.get("mask_strategy") or "rectangle").strip().lower()
     explicit_post_lama_refine = "post_lama_refine" in merged
     explicit_auto_residual_cleanup = "auto_residual_cleanup" in merged
     post_lama_refine = _to_bool(merged.get("post_lama_refine", False))
@@ -417,7 +418,7 @@ def _normalize_options(payload):
         raise RequestError(HTTPStatus.BAD_REQUEST, "mode must be sttn, lama, propainter, lama_area, or blur_cover")
     options = {
         "mode": mode,
-        "mask_strategy": str(merged.get("mask_strategy") or "rectangle").strip().lower(),
+        "mask_strategy": mask_strategy,
         "glyph_ocr_max_side": _bounded_int(merged.get("glyph_ocr_max_side"), "glyph_ocr_max_side", 640, 640, 1280),
         "subtitle_area_deviation_pixel": _bounded_int(
             merged.get("subtitle_area_deviation_pixel", merged.get("mask_deviation")),
@@ -466,9 +467,12 @@ def _normalize_options(payload):
         "post_refine_inpaint_radius": _bounded_int(merged.get("post_refine_inpaint_radius"), "post_refine_inpaint_radius", 4, 1, 12),
         "post_refine_feather": _bounded_int(merged.get("post_refine_feather"), "post_refine_feather", 3, 0, 12),
         "ocr_preset": _normalize_ocr_preset_name(merged.get("ocr_preset")),
-        # 检测框与字幕区域交集面积占比下限：1.0 = 完全落在区域内（旧行为），
-        # 调小可放宽跨边界的检测框（如字幕正好压在区域边缘）。
-        "bbox_min_inside_ratio": _bounded_float(merged.get("bbox_min_inside_ratio"), "bbox_min_inside_ratio", 1.0, 0.0, 1.0),
+        # glyph 允许检测框轻微越界，避免正常字幕因空检测补检而让整个镜头
+        # 进入严格局部掩膜路径。背景大字越界仍会独立触发局部 OCR。
+        "bbox_min_inside_ratio": _bounded_float(
+            merged.get("bbox_min_inside_ratio"), "bbox_min_inside_ratio",
+            0.995 if mask_strategy == "glyph" else 1.0, 0.0, 1.0,
+        ),
         # OCR 采样间隔：0 = 按帧率自适应（旧行为），1 = 逐帧，最大 30。
         "ocr_sample_step": _bounded_int(merged.get("ocr_sample_step"), "ocr_sample_step", 0, 0, 30),
         # 检测不到字幕时的兜底：True = 整区每帧 STTN_AUTO 重绘（旧行为），
