@@ -108,7 +108,7 @@ def _prune_active_jobs():
 
 
 def _sweep_stale_job_dirs():
-    """Expire artifacts, retaining asynchronous job identities for deduplication."""
+    """回收到期的作业目录；运行、下载和状态不可信的作业保留。"""
     global _last_janitor_at
     now = time.time()
     with _JANITOR_LOCK:
@@ -139,23 +139,22 @@ def _sweep_stale_job_dirs():
                         with _DOWNLOAD_LOCK:
                             if _DOWNLOAD_COUNTS.get(entry.name) or _SYNC_ACTIVE_COUNTS.get(entry.name):
                                 continue
+                            # 终态可能已写入，但 worker 尚未释放作业锁并退出。
+                            if entry.name in manager.scheduled or entry.name in manager.inflight:
+                                continue
                             state = manager._read(entry.name)
                             error = state.get("error") if isinstance(state, dict) else None
                             if (not valid_state(state, entry.name)
                                     or (isinstance(error, dict) and error.get("code") == "JOB_STATE_UNREADABLE")
                                     or state["status"] in {"receiving", "queued", "running"}):
                                 continue
-                            if state.get("artifacts_cleaned_at"):
-                                continue
-                            if (not state.get("artifacts_expired_at") and
+                            if (not state.get("artifacts_expired_at") and not state.get("artifacts_cleaned_at") and
                                     now - max(entry.stat().st_mtime, state.get("updated_at", 0)) <= JOB_DIR_TTL_SECONDS):
                                 continue
                             if not state.get("artifacts_expired_at"):
                                 if state["status"] == "succeeded":
                                     state.pop("result", None)
-                                    # This job definitely completed; only its
-                                    # retained output expired. A new attempt is
-                                    # safe, while this ID remains a tombstone.
+                                    # 清理中途失败时保留明确的过期状态供下次重试。
                                     state.update(status="failed", error={"code": "RESULT_EXPIRED"})
                                 state["artifacts_expired_at"] = now
                                 manager._write(entry.name, state)
@@ -166,11 +165,9 @@ def _sweep_stale_job_dirs():
                                     shutil.rmtree(artifact)
                                 else:
                                     artifact.unlink(missing_ok=True)
-                            # Record completion only after every artifact was
-                            # removed. An interrupted/failed sweep must retry.
-                            state["artifacts_cleaned_at"] = now
-                            manager._write(entry.name, state)
-                            print(f"INFO: swept stale async artifacts {entry.name}")
+                            # 等大文件清理完成后再删除状态和锁文件，失败时可重试。
+                            shutil.rmtree(entry)
+                            print(f"INFO: swept stale async job {entry.name}")
                         continue
                     with _DOWNLOAD_LOCK:
                         if _DOWNLOAD_COUNTS.get(entry.name) or _SYNC_ACTIVE_COUNTS.get(entry.name):

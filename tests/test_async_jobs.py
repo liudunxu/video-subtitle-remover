@@ -310,7 +310,7 @@ manager.reserve("job")
             manager.public("retry")
             wait_status(manager, "retry", "succeeded")
 
-    def test_janitor_retains_in_progress_and_unknown_jobs(self):
+    def test_janitor_retains_in_progress_and_unreadable_jobs(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             manager = AsyncJobs(root, finished_processor, lambda _: None, threading.RLock())
@@ -333,9 +333,10 @@ manager.reserve("job")
                  patch.object(api, "_ASYNC_MANAGERS", {root.resolve(): manager}), \
                  patch.object(api, "_ACTIVE_JOBS", {}):
                 api._sweep_stale_job_dirs()
-            for job_id in ("queue", "receiving", "running", "unknown", "broken"):
+            for job_id in ("queue", "receiving", "running", "broken"):
                 self.assertTrue((root / "jobs" / job_id).exists())
-            self.assertEqual(manager.public("done")["error"]["code"], "RESULT_EXPIRED")
+            self.assertIsNone(manager.public("unknown"))
+            self.assertIsNone(manager.public("done"))
 
 
 if __name__ == "__main__":

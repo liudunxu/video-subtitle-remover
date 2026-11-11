@@ -1,4 +1,4 @@
-"""Retention must bound artifact storage without losing job identity."""
+"""Retention removes expired jobs without touching active work or downloads."""
 import io
 import json
 import os
@@ -32,7 +32,7 @@ def _make_job(manager, job_id, status):
     return directory
 
 
-def test_cleanup_keeps_tombstones_and_active_jobs():
+def test_cleanup_removes_expired_jobs_and_keeps_active_jobs():
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
         manager = AsyncJobs(root, lambda *_: None, lambda _: None, threading.RLock())
@@ -49,20 +49,13 @@ def test_cleanup_keeps_tombstones_and_active_jobs():
             api._sweep_stale_job_dirs()
         for name in ("success", "failure", "unknown"):
             directory = manager.jobs / name
-            assert (directory / STATE_NAME).exists()
-            assert not (directory / "source.mp4").exists()
-            assert not (directory / "output.mp4").exists()
-            assert not (directory / "intermediate").exists()
-            assert manager._read(name)["fingerprint"] == "stable-hash"
-        assert manager.public("success")["error"]["code"] == "RESULT_EXPIRED"
-        assert manager.public("success")["status"] == "failed"
-        assert manager.public("unknown")["error"]["code"] == "PROCESS_INTERRUPTED"
-        assert manager.public("failure")["status"] == "failed"
+            assert not directory.exists()
+            assert manager.public(name) is None
         for name in ("queued", "running", "receiving"):
             assert (manager.jobs / name / "source.mp4").exists()
         assert not legacy.exists()
-        # A second submission must still encounter the saved identity.
-        assert manager.reserve("success") is False
+        # 作业过期后不再保留去重身份。
+        assert manager.reserve("success") is True
 
 
 def test_download_in_progress_is_not_cleaned():
@@ -99,32 +92,28 @@ def test_download_in_progress_is_not_cleaned():
             assert handler.wfile.getvalue() == b"output"
             with patch.object(api, "_last_janitor_at", 0):
                 api._sweep_stale_job_dirs()
-            assert not (directory / "output.mp4").exists()
-            assert manager.public("job")["error"]["code"] == "RESULT_EXPIRED"
+            assert not directory.exists()
+            assert manager.public("job") is None
 
 
-def test_cleaned_tombstone_does_not_rescan_artifacts_or_log_repeatedly(capsys):
+def test_cleanup_removes_previously_cleaned_tombstone(capsys):
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
         manager = AsyncJobs(root, lambda *_: None, lambda _: None, threading.RLock())
-        directory = _make_job(manager, "job", "succeeded")
+        directory = _make_job(manager, "job", "failed")
+        state = manager._read("job")
+        state["artifacts_expired_at"] = 1
+        state["artifacts_cleaned_at"] = 1
+        manager._write("job", state)
         with patch.object(api, "WORK_DIR", root), patch.object(api, "_ASYNC_MANAGERS", {root.resolve(): manager}), \
              patch.object(api, "_ACTIVE_JOBS", {}), patch.object(api, "_DOWNLOAD_COUNTS", {}):
             with patch.object(api, "_last_janitor_at", 0):
                 api._sweep_stale_job_dirs()
-            assert manager._read("job")["artifacts_cleaned_at"]
-            assert "swept stale async artifacts job" in capsys.readouterr().out
-            calls = []
-            original = Path.iterdir
-            def track(path):
-                if path == directory:
-                    calls.append(path)
-                return original(path)
-            with patch.object(api, "_last_janitor_at", 0), patch.object(Path, "iterdir", track):
+            assert not directory.exists()
+            assert "swept stale async job job" in capsys.readouterr().out
+            with patch.object(api, "_last_janitor_at", 0):
                 api._sweep_stale_job_dirs()
-            assert not calls
-            assert "swept stale async artifacts job" not in capsys.readouterr().out
-            assert manager.reserve("job") is False
+            assert "swept stale async job job" not in capsys.readouterr().out
         manager.owner_file.close()
 
 
@@ -149,8 +138,26 @@ def test_cleanup_retries_after_partial_artifact_removal(capsys):
             assert "job cleanup failed" in capsys.readouterr().out
             with patch.object(api, "_last_janitor_at", 0):
                 api._sweep_stale_job_dirs()
-            assert not (directory / "output.mp4").exists()
-            assert manager._read("job")["artifacts_cleaned_at"]
+            assert not directory.exists()
+        manager.owner_file.close()
+
+
+def test_terminal_job_is_not_cleaned_until_worker_releases_it():
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        manager = AsyncJobs(root, lambda *_: None, lambda _: None, threading.RLock())
+        directory = _make_job(manager, "job", "succeeded")
+        with patch.object(api, "WORK_DIR", root), patch.object(api, "_ASYNC_MANAGERS", {root.resolve(): manager}), \
+             patch.object(api, "_ACTIVE_JOBS", {}), patch.object(api, "_DOWNLOAD_COUNTS", {}):
+            for active in (manager.scheduled, manager.inflight):
+                active.add("job")
+                with patch.object(api, "_last_janitor_at", 0):
+                    api._sweep_stale_job_dirs()
+                assert (directory / STATE_NAME).exists()
+                active.remove("job")
+            with patch.object(api, "_last_janitor_at", 0):
+                api._sweep_stale_job_dirs()
+            assert not directory.exists()
         manager.owner_file.close()
 
 
