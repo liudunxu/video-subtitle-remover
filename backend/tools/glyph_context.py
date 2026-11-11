@@ -8,6 +8,62 @@ def subtitle_line_shape(box, frame_height, min_aspect=2):
     return 10 <= height <= .08*frame_height and width >= min_aspect*height
 
 
+def matches_text_row(box, row):
+    """仅比较行高和纵向位置，允许同一行正常换句或变成单字。"""
+    height = row[3]-row[2]
+    return (.65*height <= box[3]-box[2] <= 1.5*height and
+            abs((box[2]+box[3]-row[2]-row[3])/2) <= .45*height)
+
+
+def missing_bilingual_rows(boxes, shots, area, frame_height, fps, excluded=()):
+    """同镜头双行字幕缺一行时提出补检目标，邻帧不提供替换掩膜。"""
+    ay0, ay1, ax0, ax1 = area
+    if ay1-ay0 <= .15*frame_height:
+        return {}
+    excluded = set(excluded)
+    radius = max(1, min(15, round(fps*.5)))
+    targets = {}
+    for start, stop in shots:
+        groups = []
+        for i in range(start, stop):
+            if i in excluded:
+                continue
+            for box in boxes[i]:
+                x0, x1, y0, y1 = box
+                if not (subtitle_line_shape(box, frame_height, min_aspect=.3) and
+                        ax0 <= x0 < x1 <= ax1 and ay0 <= y0 < y1 <= ay1):
+                    continue
+                height = y1-y0
+                for group in groups:
+                    old = np.median([b for _, b in group], axis=0)
+                    old_height = old[3]-old[2]
+                    if (abs((y0+y1-old[2]-old[3])/2) < .4*min(height, old_height)
+                            and .65 < height/old_height < 1.5):
+                        group.append((i, box))
+                        break
+                else:
+                    groups.append([(i, box)])
+        supported = [g for g in groups if len({i for i, _ in g}) >= 3]
+        if len(supported) != 2:
+            continue
+        rows = [np.median([b for _, b in g], axis=0).tolist() for g in supported]
+        # 同一行上下抖动不能当成双语两行；多行或行位不明确时保持原流程。
+        if abs(sum(rows[0][2:])/2-sum(rows[1][2:])/2) < 1.8*max(b[3]-b[2] for b in rows):
+            continue
+        for i in range(start, stop):
+            if i in excluded or not boxes[i]:
+                continue
+            for k, row in enumerate(rows):
+                if any(matches_text_row(b, row) for b in boxes[i]):
+                    continue
+                if not any(matches_text_row(b, rows[1-k]) for b in boxes[i]):
+                    continue
+                nearby = [(j, b) for j, b in supported[k] if abs(j-i) <= radius]
+                if len({j for j, _ in nearby}) >= 3:
+                    targets.setdefault(i, []).append(np.median([b for _, b in nearby], axis=0).tolist())
+    return targets
+
+
 def narrow_text_regions(anchors, shots, area):
     """Derive one row per shot from pixel-verified repeated horizontal lines.
 

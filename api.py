@@ -3160,8 +3160,8 @@ def _run_glyph_remover(video_path, area, options, progress_callback=None):
     # after the pipeline adds the band offset, never inside this detector.
     detector = SubtitleDetect(str(video_path), sub_areas=[], ocr_sample_step=options["ocr_sample_step"] or 2,
                               bbox_min_inside_ratio=options["bbox_min_inside_ratio"], **detector_options)
-    # SubtitleDetect loads Paddle lazily, so a second model is only loaded when
-    # a short-lived shrink is actually retried. Already-high-res OCR needs none.
+    # 检测器按需加载 Paddle；缩框或双语缺行触发时才使用 960 补检。
+    # 主检测分辨率已达 960 时直接复用，不再加载第二个检测器。
     retry_detector = None
     if options["glyph_ocr_max_side"] < 960:
         retry_detector = SubtitleDetect(

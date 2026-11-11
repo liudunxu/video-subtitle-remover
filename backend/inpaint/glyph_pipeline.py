@@ -25,6 +25,7 @@ from backend.tools.glyph_context import (
     needs_local_ocr, local_ocr_boxes, outlined_local_mask, select_reference,
     short_text_regions, short_text_mask, photometric_boundaries,
     subtitle_line_shape, narrow_text_regions, outlined_text_regions,
+    missing_bilingual_rows, matches_text_row,
 )
 
 
@@ -357,6 +358,50 @@ def _retry_short_lines(video_path, boxes, shots, raw, detector, area, band, heig
     return audit
 
 
+def _supplement_bilingual_rows(video_path, masks, boxes, shots, detector, area, band,
+                               height, fps, excluded, progress):
+    """对缺失行做当前帧高分辨率 OCR，只向最终掩膜添加确认的字形。"""
+    local = (area[0]-band[0], area[1]-band[0], area[2], area[3])
+    targets = missing_bilingual_rows(boxes, shots, local, height, fps, excluded)
+    audit = dict(frames=[], confirmed_frames=[], empty_frames=[], updated_frames=[],
+                 expected_rows=targets, added_pixels={}, ocr_calls=0,
+                 row_coordinate_space='ocr_band_xxyy')
+    if not targets:
+        return audit
+    last_target, last_decoded = max(targets), -1
+    frames = _read_frames(video_path)
+    try:
+        for i, frame in enumerate(frames):
+            last_decoded = i
+            if i in targets:
+                crop = frame[band[0]:band[1]]
+                coords = detector.detect_subtitle(crop)
+                accepted = _accepted_boxes(coords, detector, area, band, frame.shape[1])
+                found = [b for b in accepted if any(matches_text_row(b, row) for row in targets[i])]
+                extra = glyph_mask(crop, found)
+                # 新增像素限制在调用方选区内；原有掩膜（含选区外像素）保持不变。
+                extra[:local[0]] = 0
+                extra[local[1]:] = 0
+                extra[:, :local[2]] = 0
+                extra[:, local[3]:] = 0
+                added = int(np.count_nonzero((extra > 0) & (masks[i] == 0)))
+                masks[i] |= extra
+                audit['frames'].append(i)
+                audit['ocr_calls'] += 1
+                audit['confirmed_frames' if extra.any() else 'empty_frames'].append(i)
+                if added:
+                    audit['updated_frames'].append(i)
+                    audit['added_pixels'][i] = added
+                progress('ocr_bilingual', 44, f'frame={i+1}, updated={len(audit["updated_frames"])}')
+            if i >= last_target:
+                break
+    finally:
+        frames.close()
+    if last_decoded < last_target:
+        raise RuntimeError('Incomplete decode during bilingual row recovery')
+    return audit
+
+
 def _supplement_outline_rows(video_path, masks, detector, area, band, overlap_frames, progress):
     """Add current-image-confirmed glyphs after the existing mask passes.
 
@@ -621,6 +666,11 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
         outline_retries = _supplement_outline_rows(video_path, masks, detector, area, band,
                                                    overlap_frames, progress)
         ocr_frames += outline_retries['ocr_calls']
+        # 两种模型共用补检；已恢复字形不回写检测框，也不传播到邻帧。
+        bilingual_retries = _supplement_bilingual_rows(video_path, masks, boxes, shots,
+            retry_detector if retry_detector is not None else detector, area, band,
+            height, fps, local_frames, progress)
+        ocr_frames += bilingual_retries['ocr_calls']
         # 在所有补全结束后保护背景标题，避免后续稳定或描边恢复重新带入误擦。
         title_guard = protect_background_titles(video_path, masks, boxes, shots, area, band, height,
                                                 detector, retry_detector, local_frames, _read_frames, progress)
@@ -645,6 +695,7 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
                      local_ocr=local_audit, clean_reference_policy='sttn_local_ocr_same_window',
                      narrow_ocr=narrow_retries, outline_ocr=outline_retries,
                      background_title_guard=title_guard,
+                     bilingual_ocr=bilingual_retries,
                      short_ocr=short_retries, photometric_policy='propainter_coherent_luma_shift',
                      masks_sha256=_mask_hash(masks), model_input_size=[432, 240],
                      chunk_size=80, overlap=20, feather_sigma=2, glyph_dilation=5,
