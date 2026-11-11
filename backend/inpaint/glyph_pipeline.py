@@ -15,6 +15,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from backend.tools.glyph_title_guard import protect_background_titles
+
 from backend.tools.glyph_masks import (
     same_layout, merge_line_boxes, glyph_mask, recover_vertical_border, find_shrunk_lines, box_iou,
     stabilize_masks, build_windows, overlap_weight, blend_prediction, resize_model_mask,
@@ -619,6 +621,10 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
         outline_retries = _supplement_outline_rows(video_path, masks, detector, area, band,
                                                    overlap_frames, progress)
         ocr_frames += outline_retries['ocr_calls']
+        # 在所有补全结束后保护背景标题，避免后续稳定或描边恢复重新带入误擦。
+        title_guard = protect_background_titles(video_path, masks, boxes, shots, area, band, height,
+                                                detector, retry_detector, local_frames, _read_frames, progress)
+        ocr_frames += title_guard['ocr_calls']
         jobs = build_windows(masks, shots, band[0], options['sttn_band_margin'])
         if not jobs:
             raise NoGlyphsError('OCR/glyph detection produced no editable white outlined text; check sub_area or use mask_strategy=rectangle')
@@ -638,6 +644,7 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
                      ocr_retry_frames=retries['frames'], ocr_retry_updated_frames=retries['updated_frames'],
                      local_ocr=local_audit, clean_reference_policy='sttn_local_ocr_same_window',
                      narrow_ocr=narrow_retries, outline_ocr=outline_retries,
+                     background_title_guard=title_guard,
                      short_ocr=short_retries, photometric_policy='propainter_coherent_luma_shift',
                      masks_sha256=_mask_hash(masks), model_input_size=[432, 240],
                      chunk_size=80, overlap=20, feather_sigma=2, glyph_dilation=5,

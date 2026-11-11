@@ -373,6 +373,7 @@ test*.py
 !/tests/test_glyph_pipeline.py
 !/tests/test_glyph_context.py
 !/tests/test_glyph_outline_rows.py
+!/tests/test_glyph_title_guard.py
 !/tests/test_async_jobs.py
 !/tests/test_async_queue.py
 !/tests/test_async_cleanup.py
