@@ -9,7 +9,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import api
 import async_jobs
@@ -32,6 +32,41 @@ def wait_status(manager, job_id, expected, timeout=3):
 
 
 class AsyncJobsTest(unittest.TestCase):
+    def test_empty_glyphs_complete_async_job_but_detector_errors_fail(self):
+        with tempfile.TemporaryDirectory() as temp:
+            def processor(payload, job_id, job_dir):
+                return api._process_removal(payload, job_id, job_dir, time.time(), job_id,
+                                            lambda job, filename: f'/download/{job}/{filename}')
+
+            manager = AsyncJobs(temp, processor, lambda _: None, threading.RLock())
+            for job_id, detector_error in (('empty', False), ('detector_error', True)):
+                with self.subTest(job=job_id):
+                    upload = Path(temp)/f'{job_id}.mp4'
+                    subprocess.run([
+                        'ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=black:s=64x64:r=5',
+                        '-f', 'lavfi', '-i', 'sine=frequency=440', '-t', '1',
+                        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', str(upload),
+                    ], check=True)
+                    original = upload.read_bytes()
+                    detector = Mock(bbox_min_inside_ratio=.995)
+                    detector.detect_subtitle.return_value = []
+                    if detector_error:
+                        detector.detect_subtitle.side_effect = RuntimeError('detector failed')
+                    with patch('backend.tools.subtitle_detect.SubtitleDetect', return_value=detector):
+                        manager.reserve(job_id)
+                        manager.accept(job_id, True, {'sub_area': [0, 64, 0, 64],
+                            'options': {'mode': 'propainter', 'mask_strategy': 'glyph'}}, upload)
+                        state = wait_status(manager, job_id, 'failed' if detector_error else 'succeeded', timeout=10)
+                    if detector_error:
+                        self.assertEqual(state['error']['code'], 'REMOVAL_FAILED')
+                    else:
+                        self.assertEqual(state['download_url'], f'/download/{job_id}/source_glyph_propainter.mp4')
+                        output = manager.jobs/job_id/'source_glyph_propainter.mp4'
+                        self.assertEqual(output.read_bytes(), original)
+                        audit = json.loads(output.with_suffix('.json').read_text())
+                        self.assertEqual(audit['skipped_reason'], 'no_editable_glyphs')
+            manager.owner_file.close()
+
     def test_crash_during_reservation_never_publishes_a_partial_job(self):
         script = '''
 import os, sys, threading

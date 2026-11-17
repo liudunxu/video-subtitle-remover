@@ -1,5 +1,7 @@
 import json
+import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -41,8 +43,8 @@ class GlyphOptionsTest(unittest.TestCase):
     def test_requested_ocr_size_reaches_detector(self):
         options = api._normalize_options({'options': {'mask_strategy': 'glyph', 'glyph_ocr_max_side': 960}})
         with patch('backend.tools.subtitle_detect.SubtitleDetect') as detector, patch.object(
-                pipeline, 'run_glyph_removal', side_effect=pipeline.NoGlyphsError('empty')):
-            with self.assertRaises(api.RequestError):
+                pipeline, 'run_glyph_removal', side_effect=RuntimeError('processing failed')):
+            with self.assertRaisesRegex(RuntimeError, 'processing failed'):
                 api._run_glyph_remover(Path('in.mp4'), None, options)
         self.assertEqual(detector.call_args.kwargs['det_limit_side_len'], 960)
         detector.assert_called_once()  # Already-high-res OCR needs no retry detector.
@@ -53,8 +55,8 @@ class GlyphOptionsTest(unittest.TestCase):
         options = api._normalize_options({'mask_strategy': 'glyph'})
         primary, retry = Mock(), Mock()
         with patch('backend.tools.subtitle_detect.SubtitleDetect', side_effect=[primary, retry]) as detector, patch.object(
-                pipeline, 'run_glyph_removal', side_effect=pipeline.NoGlyphsError('empty')) as run:
-            with self.assertRaises(api.RequestError):
+                pipeline, 'run_glyph_removal', side_effect=RuntimeError('processing failed')) as run:
+            with self.assertRaisesRegex(RuntimeError, 'processing failed'):
                 api._run_glyph_remover(Path('in.mp4'), None, options)
         self.assertEqual([call.kwargs['det_limit_side_len'] for call in detector.call_args_list], [640, 960])
         self.assertIs(run.call_args.kwargs['retry_detector'], retry)
@@ -69,8 +71,8 @@ class GlyphOptionsTest(unittest.TestCase):
                         raw['bbox_min_inside_ratio'] = supplied
                     options = api._normalize_options({'options': raw})
                     with patch('backend.tools.subtitle_detect.SubtitleDetect') as detector, patch.object(
-                            pipeline, 'run_glyph_removal', side_effect=pipeline.NoGlyphsError('empty')):
-                        with self.assertRaises(api.RequestError):
+                            pipeline, 'run_glyph_removal', side_effect=RuntimeError('processing failed')):
+                        with self.assertRaisesRegex(RuntimeError, 'processing failed'):
                             api._run_glyph_remover(Path('in.mp4'), None, options)
                     self.assertEqual([call.kwargs['bbox_min_inside_ratio'] for call in detector.call_args_list],
                                      [expected, expected])
@@ -78,13 +80,37 @@ class GlyphOptionsTest(unittest.TestCase):
         self.assertEqual(api._normalize_options({'mask_strategy': 'rectangle'})['bbox_min_inside_ratio'], 1.0)
         self.assertEqual(api._normalize_detect_options({'mask_strategy': 'glyph'})['bbox_min_inside_ratio'], 1.0)
 
-    def test_empty_glyphs_are_http_422(self):
-        options = api._normalize_options({'mask_strategy': 'glyph'})
-        with patch('backend.tools.subtitle_detect.SubtitleDetect'), patch.object(
-                pipeline, 'run_glyph_removal', side_effect=pipeline.NoGlyphsError('empty')):
-            with self.assertRaises(api.RequestError) as exc:
-                api._run_glyph_remover(Path('in.mp4'), None, options)
-        self.assertEqual(exc.exception.status, 422)
+    def test_empty_glyphs_return_original_video_and_audit_for_both_models(self):
+        for mode in ('sttn', 'propainter'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                source = Path(temp)/'source.mp4'
+                subprocess.run([
+                    'ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=black:s=64x64:r=5',
+                    '-f', 'lavfi', '-i', 'sine=frequency=440', '-t', '1',
+                    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', str(source),
+                ], check=True)
+                detector = Mock(bbox_min_inside_ratio=.995)
+                detector.detect_subtitle.return_value = []
+                with patch('backend.tools.subtitle_detect.SubtitleDetect', return_value=detector), \
+                        patch.object(pipeline, '_infer') as infer, \
+                        patch.object(pipeline, '_render') as render:
+                    result = api._process_removal(
+                        {'_uploaded_video_path': str(source), 'sub_area': [0, 64, 0, 64],
+                         'options': {'mode': mode, 'mask_strategy': 'glyph'}},
+                        'job', Path(temp), time.time(), 'request',
+                        lambda job, filename: f'/download/{job}/{filename}')
+                output = Path(temp)/result['filename']
+                self.assertEqual(output.read_bytes(), source.read_bytes())
+                self.assertEqual(result['processing']['active_mask_frames'], 0)
+                self.assertEqual(result['processing']['chunks'], 0)
+                self.assertEqual(result['processing']['skipped_reason'], 'no_editable_glyphs')
+                audit = json.loads(output.with_suffix('.json').read_text())
+                self.assertEqual(audit['frames'], 5)
+                self.assertEqual(audit['jobs'], [])
+                self.assertEqual(audit['skipped_reason'], 'no_editable_glyphs')
+                self.assertFalse(result['fallback_triggered'])
+                infer.assert_not_called()
+                render.assert_not_called()
 
 
 class GlyphMaskTest(unittest.TestCase):

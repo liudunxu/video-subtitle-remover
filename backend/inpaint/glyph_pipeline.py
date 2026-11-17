@@ -29,10 +29,6 @@ from backend.tools.glyph_context import (
 )
 
 
-class NoGlyphsError(ValueError):
-    pass
-
-
 def _read_frames(path):
     cap = cv2.VideoCapture(str(path))
     try:
@@ -676,16 +672,21 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
                                                 detector, retry_detector, local_frames, _read_frames, progress)
         ocr_frames += title_guard['ocr_calls']
         jobs = build_windows(masks, shots, band[0], options['sttn_band_margin'])
-        if not jobs:
-            raise NoGlyphsError('OCR/glyph detection produced no editable white outlined text; check sub_area or use mask_strategy=rectangle')
         progress('mask', 45, f'ready chunks={len(jobs)}')
-        clean_candidates = {i for i in local_frames if not boxes[i] and not masks[i].any()}
-        records, device = _infer(video_path, masks, jobs, band[0], options, folder, progress,
-                                 local_frames, clean_candidates)
-        silent = folder/'silent.mp4'
-        active = _render(video_path, masks, jobs, band[0], folder, silent, fps, (width, height), progress)
-        progress('finalize', 98, 'audio_mux')
-        mux_audio(silent, video_path, output)
+        if jobs:
+            clean_candidates = {i for i in local_frames if not boxes[i] and not masks[i].any()}
+            records, device = _infer(video_path, masks, jobs, band[0], options, folder, progress,
+                                     local_frames, clean_candidates)
+            silent = folder/'silent.mp4'
+            active = _render(video_path, masks, jobs, band[0], folder, silent, fps, (width, height), progress)
+            progress('finalize', 98, 'audio_mux')
+            mux_audio(silent, video_path, output)
+        else:
+            # 空掩膜不需要推理或转码，原样保留视频和音轨。
+            output = video_path.with_name(video_path.stem+'_glyph_'+options['mode']+video_path.suffix)
+            progress('finalize', 98, 'no_editable_glyphs')
+            shutil.copyfile(video_path, output)
+            records, device, active = [], 'none', 0
         audit = dict(profile='glyph_v5', mode=options['mode'], device=device, frames=len(boxes),
                      fps=fps, size=[width, height], area=list(area), band=list(band),
                      ocr_frames=ocr_frames, shots=shots, jobs=records, active_mask_frames=active,
@@ -704,6 +705,8 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
                      model_mask_resize='area_nonzero_then_1px_dilation', feather_policy='opaque_core',
                      scene_metric='mean absolute BGR difference at 96x54 > 40',
                      precision='fp32', post_processing=False)
+        if not jobs:
+            audit['skipped_reason'] = 'no_editable_glyphs'
         output.with_suffix('.json').write_text(json.dumps(audit, indent=2))
     progress('finalize', 100, 'complete')
     return output

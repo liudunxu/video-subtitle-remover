@@ -3149,7 +3149,7 @@ def _run_subtitle_remover(video_path, area, options, refine_area=None, progress_
 
 
 def _run_glyph_remover(video_path, area, options, progress_callback=None):
-    from backend.inpaint.glyph_pipeline import run_glyph_removal, NoGlyphsError
+    from backend.inpaint.glyph_pipeline import run_glyph_removal
     from backend.tools.subtitle_detect import SubtitleDetect
 
     preset = _OCR_PRESETS[options["ocr_preset"]]
@@ -3176,10 +3176,7 @@ def _run_glyph_remover(video_path, area, options, progress_callback=None):
     def mux(silent, source, target):
         _mux_audio_onto_video(silent, source, target, preserve_timestamps=True)
 
-    try:
-        output = run_glyph_removal(video_path, area, options, detector, progress, mux, retry_detector=retry_detector)
-    except NoGlyphsError as exc:
-        raise RequestError(HTTPStatus.UNPROCESSABLE_ENTITY, str(exc)) from exc
+    output = run_glyph_removal(video_path, area, options, detector, progress, mux, retry_detector=retry_detector)
     audit = json.loads(output.with_suffix(".json").read_text())
     info = _probe_video_info(output)
     if info.get("nb_frames") != audit["frames"]:
@@ -3962,6 +3959,8 @@ def _removal_result(output_path, fallback_triggered, job_id, request_id, area,
             "masks_sha256": audit["masks_sha256"],
             "audit_url": make_download_url(job_id, output_path.with_suffix(".json").name),
         }
+        if audit.get("skipped_reason"):
+            processing["skipped_reason"] = audit["skipped_reason"]
     return {
         "url": download_url,
         "download_url": download_url,

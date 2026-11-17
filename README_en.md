@@ -204,7 +204,10 @@ settings; it does not guarantee a fixed file size.
 
 Incompatible legacy rectangle-dilation/chunk-size options, larger model inputs,
 whole-area fallback, and additional cleanup/refinement/blur return HTTP 400.
-No editable white glyphs returns 422. The multiline preset adjusts detection
+When no editable glyphs are found, the original video and audio are returned unchanged;
+the audit and synchronous response's `processing.skipped_reason` report
+`no_editable_glyphs`. Empty detection may also mean missed subtitles or an incorrect
+selection. The multiline preset adjusts detection
 thresholds only. The response's `processing.audit_url` exposes actual device,
 mask hash, cuts, and per-window input/mask hashes. Temporary masks use disk maps
 (about frames × band width × band height × 4 bytes, plus predictions and output),
