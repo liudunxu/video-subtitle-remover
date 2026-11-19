@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 
 from backend.tools.glyph_title_guard import protect_background_titles
+from backend.tools.glyph_fade import supplement_fading_glyphs
 
 from backend.tools.glyph_masks import (
     same_layout, merge_line_boxes, glyph_mask, recover_vertical_border, find_shrunk_lines, box_iou,
@@ -667,6 +668,9 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
             retry_detector if retry_detector is not None else detector, area, band,
             height, fps, local_frames, progress)
         ocr_frames += bilingual_retries['ocr_calls']
+        # 有框但淡字掩膜骤减时验证当前笔画；两模型共用，补齐结果不再向邻帧传播。
+        fade_recovery = supplement_fading_glyphs(video_path, masks, boxes, shots,
+            area, band, height, fps, local_frames, _read_frames, progress)
         # 在所有补全结束后保护背景标题，避免后续稳定或描边恢复重新带入误擦。
         title_guard = protect_background_titles(video_path, masks, boxes, shots, area, band, height,
                                                 detector, retry_detector, local_frames, _read_frames, progress)
@@ -697,6 +701,7 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
                      narrow_ocr=narrow_retries, outline_ocr=outline_retries,
                      background_title_guard=title_guard,
                      bilingual_ocr=bilingual_retries,
+                     fade_recovery=fade_recovery,
                      short_ocr=short_retries, photometric_policy='propainter_coherent_luma_shift',
                      masks_sha256=_mask_hash(masks), model_input_size=[432, 240],
                      chunk_size=80, overlap=20, feather_sigma=2, glyph_dilation=5,

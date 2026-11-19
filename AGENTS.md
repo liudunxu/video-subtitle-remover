@@ -162,6 +162,8 @@ Operation rules:
 
 ## 8. VSR API / 算法层行为说明（2026-10-14 更新）
 
+- **Glyph v5 短暂淡出补齐（2026-11-19）**：`glyph_fade.py` 在双语补检后、背景大字保护前补齐有框但掩膜骤减的正常横排字幕。仅同镜头前四分之一秒（最多 8 帧）至少三帧同位置依据；用已有强白字形约束当前帧的局部明暗排列，验证整行及主要字形仍存在，再提取当前笔画并有限膨胀，不复制邻帧掩膜。排除局部描边帧、缺框、背景大框、换字/移位不匹配、过期依据和切镜；只 OR 原选区内新增像素，不回写框或传播，不使用补齐结果续期。两模型共用，无新开关/版本号，审计 `fade_recovery`。无目标不解码，有目标一次顺序解码，仅缓存近期行裁剪，不新增 OCR。不能据此宣称已支持无框的转场拖影、长期半透明或所有动画字幕。新增注释使用中文。
+
 These notes cover behavior that changed in the OCR-sensitivity / vertical-video quality pass. Keep them in sync when touching the corresponding code.
 
 - **Glyph v5 双行背景大字保护（2026-11-11）**：`glyph_title_guard.py` 在最终掩膜完成后、`build_windows` 前执行，STTN/ProPainter 共用。仅高于画面 15% 的选区；从已解码帧的已有框、掩膜和白色像素学习两条分离字幕行（每行至少三帧），不使用实验坐标。当前宽带 OCR 确认两行异常大字、无正常字号白字，再逐行实际高分辨率局部 OCR 排除真实字幕；同镜头连续至少三帧通过才清空最终掩膜。局部描边帧排除，窄选区/无大框不新增解码，不缓存全片源帧；检查失败不留下部分掩膜修改。审计 `background_title_guard` 记录候选、否决、保护、行位和 OCR 调用。仍为 `glyph_v5`，不加开关，不改旧 rectangle；淡入帧可能仍误擦。双语缺行补检先于本保护步骤执行。新增注释使用中文。
