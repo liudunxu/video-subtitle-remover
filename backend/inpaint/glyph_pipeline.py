@@ -16,7 +16,9 @@ import cv2
 import numpy as np
 
 from backend.tools.glyph_title_guard import protect_background_titles
+from backend.tools.glyph_opening_title import protect_opening_title
 from backend.tools.glyph_fade import supplement_fading_glyphs
+from backend.tools.glyph_transition import supplement_transition_glyphs
 
 from backend.tools.glyph_masks import (
     same_layout, merge_line_boxes, glyph_mask, recover_vertical_border, find_shrunk_lines, box_iou,
@@ -671,10 +673,20 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
         # 有框但淡字掩膜骤减时验证当前笔画；两模型共用，补齐结果不再向邻帧传播。
         fade_recovery = supplement_fading_glyphs(video_path, masks, boxes, shots,
             area, band, height, fps, local_frames, _read_frames, progress)
+        # 仅在背景位移和当前帧拖影均有依据时，跨切镜补齐字幕。
+        transition_recovery = supplement_transition_glyphs(video_path, masks, boxes, shots,
+            area, band, height, fps, local_frames, _read_frames, progress)
         # 在所有补全结束后保护背景标题，避免后续稳定或描边恢复重新带入误擦。
         title_guard = protect_background_titles(video_path, masks, boxes, shots, area, band, height,
                                                 detector, retry_detector, local_frames, _read_frames, progress)
         ocr_frames += title_guard['ocr_calls']
+        # 片头还没有可学习的字幕行时，单独核实静止片名与当前帧字幕。
+        protected_recovery = set(local_frames)
+        for recovery in (short_retries, retries, outline_retries, bilingual_retries, fade_recovery, transition_recovery):
+            protected_recovery.update(recovery.get('updated_frames', []))
+        opening_title_guard = protect_opening_title(video_path, masks, boxes, shots, area, band, height, fps,
+            retry_detector if retry_detector is not None else detector, protected_recovery, _read_frames, progress)
+        ocr_frames += opening_title_guard['ocr_calls']
         jobs = build_windows(masks, shots, band[0], options['sttn_band_margin'])
         progress('mask', 45, f'ready chunks={len(jobs)}')
         if jobs:
@@ -700,8 +712,10 @@ def run_glyph_removal(video_path, area, options, detector, progress, mux_audio, 
                      local_ocr=local_audit, clean_reference_policy='sttn_local_ocr_same_window',
                      narrow_ocr=narrow_retries, outline_ocr=outline_retries,
                      background_title_guard=title_guard,
+                     opening_title_guard=opening_title_guard,
                      bilingual_ocr=bilingual_retries,
                      fade_recovery=fade_recovery,
+                     transition_recovery=transition_recovery,
                      short_ocr=short_retries, photometric_policy='propainter_coherent_luma_shift',
                      masks_sha256=_mask_hash(masks), model_input_size=[432, 240],
                      chunk_size=80, overlap=20, feather_sigma=2, glyph_dilation=5,
