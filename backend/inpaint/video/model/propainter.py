@@ -147,7 +147,9 @@ class BidirectionalPropagation(nn.Module):
                 else:
                     flow_prop = flows_for_prop[:, flow_idx[i], :, :, :]
                     flow_check = flows_for_check[:, flow_idx[i], :, :, :]
-                    flow_vaild_mask = fbConsistencyCheck(flow_prop, flow_check)
+                    # 像素传播收紧容差，减少错位颜色的直接填入；特征传播保留原阈值。
+                    flow_vaild_mask = fbConsistencyCheck(
+                        flow_prop, flow_check, alpha2=0.5 if self.learnable else 0.1)
                     feat_warped = flow_warp(feat_prop, flow_prop.permute(0, 2, 3, 1), interpolation)
 
                     if self.learnable:
